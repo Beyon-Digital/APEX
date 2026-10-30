@@ -25,6 +25,34 @@ remains Python 3.11+.
 
 ---
 
+## Native paper sessions and authored backtests
+
+The native IDE's **Run Paper** control starts a Python worker and dispatches
+quote-sampled bars into the authored `on_bar` callback. It does not dispatch
+`on_tick`. Stop controls terminate the backend session and close its paper
+position. Active sessions remain visible across workspace tabs and can be
+stopped after a webview reload.
+
+- Live sessions require exactly one symbol subscription using `M1`, `M5`, or
+  `M15`. Execution is hard-wired to the `paper` adapter.
+- `long` enters a fixed-size position; `flat` exits it. Repeated entry signals
+  are ignored while held. Short signals fail explicitly. The native run
+  command accepts `params_json`; `quantity` defaults to 1.
+- Live bars use sampled quotes, with volume unavailable. Duplicate, backward,
+  stale, and implausibly future timestamps are rejected. A session stops after
+  90 seconds without fresh data, or after 30 minutes in total.
+- Backtests execute the actual Python callbacks, rather than inferring a model
+  from source text. They support one long/flat signal per bar and use the
+  requested fixed trade size. Signals fill at that bar's close with configured
+  slippage and commission; liquidation costs are included in final equity.
+- The worker populates `sma` and simple rolling-mean `rsi` indicator caches
+  before each bar callback. Other indicators can be implemented in strategy
+  code. Indicator warmup returns `NaN`.
+- Each callback has a 15-second timeout. Callback and protocol errors fail the
+  run and are shown in the IDE.
+
+---
+
 ## Module: `apex_sdk`
 
 ### Exports
