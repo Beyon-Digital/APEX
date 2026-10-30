@@ -19,6 +19,19 @@ pub type TickStream = mpsc::Receiver<Tick>;
 /// Port trait for market data feeds
 #[async_trait]
 pub trait MarketDataPort: Send + Sync {
+    /// Whether this feed can subscribe now (for example, after authentication).
+    fn subscription_ready(&self) -> bool {
+        true
+    }
+    /// Whether a symbol belongs to this feed's instrument namespace.
+    fn supports_symbol(&self, _symbol: &Symbol) -> bool {
+        true
+    }
+    /// Source priority when several feeds stream the same symbol: a higher value
+    /// wins while it is delivering ticks. Free fallback feeds use 0.
+    fn priority(&self) -> u8 {
+        1
+    }
     /// Subscribe to real-time tick data for the given symbols
     async fn subscribe(&self, symbols: &[Symbol]) -> Result<TickStream>;
     /// Unsubscribe from tick data for the given symbols
