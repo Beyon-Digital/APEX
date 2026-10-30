@@ -1,4 +1,4 @@
-import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto } from './types';
+import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto } from './types';
 
 const IS_TAURI = typeof window !== 'undefined' && '__TAURI__' in window;
 
@@ -51,6 +51,39 @@ let mockNotebooks: NotebookDocumentDto[] = [
   },
 ];
 let mockTrainingCounter = 0;
+// Browser mock: vault starts unlocked so web-mode specs are not gated.
+let mockVaultStatus: VaultStatusDto['status'] = 'unlocked';
+const mockAdapterConfigs = new Map<string, AdapterConfigDto>();
+const mockLive: LiveStatusDto = { armed: false, orders_today: 0, max_orders_per_day: 50, max_qty_per_order: 1000, halted: false };
+const mockConfirmations = new Map<string, string>();
+const MOCK_MASTER: SymbolSearchResultDto[] = [
+  { symbol: 'RELIANCE.NS', name: 'Reliance Industries', exchange: 'NSE', source: 'local' },
+  { symbol: 'TCS.NS', name: 'Tata Consultancy Services', exchange: 'NSE', source: 'local' },
+  { symbol: 'INFY.NS', name: 'Infosys', exchange: 'NSE', source: 'local' },
+  { symbol: 'HDFCBANK.NS', name: 'HDFC Bank', exchange: 'NSE', source: 'local' },
+  { symbol: 'SBIN.NS', name: 'State Bank of India', exchange: 'NSE', source: 'local' },
+  { symbol: 'AAPL', name: 'Apple Inc.', exchange: 'NASDAQ', source: 'local' },
+  { symbol: 'MSFT', name: 'Microsoft Corporation', exchange: 'NASDAQ', source: 'local' },
+  { symbol: 'GOOGL', name: 'Alphabet Inc.', exchange: 'NASDAQ', source: 'local' },
+  { symbol: 'TSLA', name: 'Tesla, Inc.', exchange: 'NASDAQ', source: 'local' },
+  { symbol: 'BTC-USD', name: 'Bitcoin USD', exchange: 'CCC', source: 'local' },
+];
+const MOCK_ADAPTER_SCHEMAS: AdapterSchemaDto[] = [
+  { adapter_id: 'zerodha', display_name: 'Zerodha Kite', category: 'broker', description: 'Indian equities and derivatives. Create a Kite Connect app, then log in daily to get an access token.', fields: [
+    { key: 'api_key', label: 'API key', kind: 'secret', required: true, help: 'From the Kite Connect developer console.' },
+    { key: 'api_secret', label: 'API secret', kind: 'secret', required: true, help: 'Used once per login to exchange the request token.' },
+    { key: 'redirect_url', label: 'Redirect URL', kind: 'text', required: false, help: 'Must match the redirect URL registered on your Kite Connect app.' },
+  ] },
+  { adapter_id: 'binance', display_name: 'Binance', category: 'broker', description: 'Crypto spot trading and market data.', fields: [
+    { key: 'api_key', label: 'API key', kind: 'secret', required: false, help: 'Required for order execution.' },
+    { key: 'api_secret', label: 'API secret', kind: 'secret', required: false, help: '' },
+    { key: 'testnet', label: 'Use testnet', kind: 'toggle', required: false, help: 'Route orders to the Binance testnet.' },
+    { key: 'market_data_feed', label: 'Stream public market data', kind: 'toggle', required: false, help: 'Opens a live Binance price feed for matching watchlist symbols.' },
+  ] },
+  { adapter_id: 'llm:copilot', display_name: 'Copilot (OpenRouter)', category: 'llm', description: 'API key for this inference provider.', fields: [
+    { key: 'api_key', label: 'API key', kind: 'secret', required: false, help: '' },
+  ] },
+];
 let mockBrokerConnections: BrokerConnectionDto[] = [
   {
     broker_id: 'paper',
@@ -141,7 +174,7 @@ let mockAppSettings: AppSettingsDto = {
     pool_size: 4,
     available_backends: ['sqlite', 'timescale'],
   },
-  appearance: { theme: 'dark', density: 'comfortable' },
+  appearance: { theme: 'terminal', density: 'compact' },
   llm: {
     active: 'openrouter',
     providers: [
@@ -218,28 +251,39 @@ function buildMockBacktestResult(request: StrategyBacktestRequestDto): StrategyB
     timeframe,
     bars_analyzed: 180,
     metrics: {
-      total_return: 12_850,
-      total_return_pct: 12.85,
+      total_return: 1_723.5,
+      total_return_pct: 1_723.5 / baseEquity * 100,
       annualized_return_pct: 18.42,
       sharpe_ratio: 1.34,
       max_drawdown: 4_250,
       max_drawdown_pct: 4.25,
-      total_trades: 9,
-      winning_trades: 6,
-      losing_trades: 3,
-      win_rate: 66.67,
-      profit_factor: 1.92,
-      avg_trade_pnl: 1427.78,
-      avg_win: 2650,
-      avg_loss: 1015,
-      max_consecutive_wins: 3,
-      max_consecutive_losses: 1,
-      final_equity: baseEquity + 12_850,
+      total_trades: 2,
+      winning_trades: 2,
+      losing_trades: 0,
+      win_rate: 100,
+      profit_factor: null,
+      avg_trade_pnl: 861.75,
+      avg_win: 861.75,
+      avg_loss: 0,
+      max_consecutive_wins: 2,
+      max_consecutive_losses: 0,
+      final_equity: baseEquity + 1_723.5,
     },
     trades: [
       {
         symbol,
         side: 'Buy',
+        entry_time: new Date(now - 1000 * 60 * 60 * 24 * 20).toISOString(),
+        entry_price: 2430.25,
+        exit_time: null,
+        exit_price: null,
+        quantity: request.quantity ?? 10,
+        pnl: 0,
+        commission: 7.3,
+      },
+      {
+        symbol,
+        side: 'Sell',
         entry_time: new Date(now - 1000 * 60 * 60 * 24 * 20).toISOString(),
         entry_price: 2430.25,
         exit_time: new Date(now - 1000 * 60 * 60 * 24 * 15).toISOString(),
@@ -250,7 +294,7 @@ function buildMockBacktestResult(request: StrategyBacktestRequestDto): StrategyB
       },
       {
         symbol,
-        side: 'Buy',
+        side: 'Sell',
         entry_time: new Date(now - 1000 * 60 * 60 * 24 * 10).toISOString(),
         entry_price: 2498.6,
         exit_time: new Date(now - 1000 * 60 * 60 * 24 * 4).toISOString(),
@@ -304,18 +348,88 @@ function cloneNotebook(doc: NotebookDocumentDto): NotebookDocumentDto {
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   if (IS_TAURI) {
     const { invoke: tauriInvoke } = await import('@tauri-apps/api/core');
-    return tauriInvoke<T>(cmd, args);
+    try {
+      return await tauriInvoke<T>(cmd, args);
+    } catch (error) {
+      // Rust command errors arrive as strings; keep their actionable message.
+      throw error instanceof Error ? error : new Error(typeof error === 'string' ? error : String(error));
+    }
   }
   
+  if (cmd === 'vault_status') return { status: mockVaultStatus } as any;
+  if (cmd === 'vault_init' || cmd === 'vault_unlock') { mockVaultStatus = 'unlocked'; return { status: mockVaultStatus } as any; }
+  if (cmd === 'vault_lock') { mockVaultStatus = 'locked'; return { status: mockVaultStatus } as any; }
+  if (cmd === 'vault_change_passphrase') return { status: mockVaultStatus } as any;
+  if (cmd === 'import_env_credentials') return { source: '.env', imported: [] } as any;
+  if (cmd === 'list_adapter_schemas') return MOCK_ADAPTER_SCHEMAS as any;
+  if (cmd === 'get_adapter_configs') {
+    return MOCK_ADAPTER_SCHEMAS.map((schema) => mockAdapterConfigs.get(schema.adapter_id)
+      ?? { adapter_id: schema.adapter_id, enabled: true, settings: {}, secrets_configured: [] }) as any;
+  }
+  if (cmd === 'save_adapter_config') {
+    const request = args?.request as SaveAdapterConfigRequest;
+    const previous = mockAdapterConfigs.get(request.adapter_id);
+    const secrets = new Set(previous?.secrets_configured ?? []);
+    Object.entries(request.secrets).forEach(([key, value]) => { if (value.trim()) secrets.add(key); });
+    request.clear_secrets.forEach((key) => secrets.delete(key));
+    const saved: AdapterConfigDto = { adapter_id: request.adapter_id, enabled: request.enabled, settings: { ...(previous?.settings ?? {}), ...request.settings }, secrets_configured: [...secrets].sort() };
+    mockAdapterConfigs.set(request.adapter_id, saved);
+    return saved as any;
+  }
+  if (cmd === 'set_adapter_enabled') {
+    const id = args?.adapterId as string;
+    const current = mockAdapterConfigs.get(id) ?? { adapter_id: id, enabled: true, settings: {}, secrets_configured: [] };
+    const updated = { ...current, enabled: Boolean(args?.enabled) };
+    mockAdapterConfigs.set(id, updated);
+    return updated as any;
+  }
+  if (cmd === 'delete_adapter_config') { mockAdapterConfigs.delete(args?.adapterId as string); return undefined as any; }
+  if (cmd === 'test_adapter_connection') {
+    const id = args?.adapterId as string;
+    const configured = (mockAdapterConfigs.get(id)?.secrets_configured.length ?? 0) > 0;
+    return { adapter_id: id, ok: configured, message: configured ? 'Credentials stored (web mock).' : 'No credentials stored.' } as any;
+  }
+  if (cmd === 'zerodha_login_url') return 'https://kite.zerodha.com/connect/login?v=3&api_key=mock' as any;
+  if (cmd === 'get_live_status') return { ...mockLive } as any;
+  if (cmd === 'set_live_armed') { mockLive.armed = Boolean(args?.armed); return { ...mockLive } as any; }
+  if (cmd === 'kill_switch') { mockLive.armed = false; mockLive.halted = true; return { cancelled: [], failed: [] } as any; }
+  if (cmd === 'preview_order') {
+    const req = args?.request as NewOrderRequestDto;
+    const live = req.broker_id !== 'paper';
+    const warnings = live && !mockLive.armed ? ['Live trading is not armed.'] : [];
+    const ref = req.price ?? req.stop_price ?? 150.2;
+    let confirmation: string | null = null;
+    if (live && warnings.length === 0) {
+      confirmation = Math.random().toString(36).slice(2);
+      mockConfirmations.set(confirmation, req.broker_id);
+    }
+    return { broker_id: req.broker_id, live, estimated_value: ref * req.quantity, confirmation_id: confirmation, expires_in_secs: live ? 60 : 0, warnings } as any;
+  }
+  if (cmd === 'search_symbols') {
+    const q = String(args?.query ?? '').trim().toUpperCase();
+    if (!q) return [] as any;
+    return MOCK_MASTER.filter((r) => r.symbol.toUpperCase().includes(q) || r.name.toUpperCase().includes(q)).slice(0, 12) as any;
+  }
+  if (cmd === 'unsubscribe_symbols') return undefined as any;
+  if (cmd === 'get_holdings') return [] as any;
   if (cmd === 'get_quote') {
     const sym = (args as any).symbol;
     return { symbol: sym, bid: 150, ask: 150.5, last: 150.2, open: 149, high: 151, low: 148, volume: 1000, change_pct: 0.5, vwap: 150, updated_at: new Date().toISOString() } as any;
   }
   if (cmd === 'place_order') {
     const req = (args?.request as NewOrderRequestDto);
-    const order: OrderDto = { id: Math.random().toString(), symbol: req.symbol, side: req.side, order_type: req.order_type, quantity: req.quantity, price: req.price, stop_price: req.stop_price, status: 'Filled', filled_qty: req.quantity, avg_price: 150.2, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), broker_id: req.broker_id, source: 'mock' };
+    if (req.broker_id !== 'paper') {
+      const confirmation = args?.confirmationId as string | undefined;
+      if (!mockLive.armed) throw new Error('Live trading is not armed. Arm it in the Live panel before sending live orders.');
+      if (!confirmation || mockConfirmations.get(confirmation) !== req.broker_id) throw new Error('Order was not confirmed. Review and confirm it first.');
+      mockConfirmations.delete(confirmation);
+      mockLive.orders_today += 1;
+    }
+    const isMarket = req.order_type.toLowerCase() === 'market';
+    const order: OrderDto = { id: Math.random().toString(), symbol: req.symbol, side: req.side, order_type: req.order_type, quantity: req.quantity, price: req.price, stop_price: req.stop_price, status: isMarket ? 'Filled' : 'Open', filled_qty: isMarket ? req.quantity : 0, avg_price: isMarket ? 150.2 : 0, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), broker_id: req.broker_id, source: 'mock' };
     mockOrders.push(order);
-    
+    if (!isMarket) return order.id as any;
+
     let p = mockPositions.find(x => x.symbol === req.symbol);
     if (!p) {
         p = { symbol: req.symbol, quantity: 0, avg_price: 150.2, side: req.side, pnl: Math.random()*100, pnl_pct: Math.random(), broker_id: req.broker_id };
@@ -325,7 +439,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     return order.id as any;
   }
   if (cmd === 'get_positions') return [...mockPositions] as any;
-  if (cmd === 'get_open_orders') return [...mockOrders] as any;
+  if (cmd === 'get_open_orders') return mockOrders.filter((order) => ['New', 'Pending', 'Open', 'PartiallyFilled'].includes(order.status)) as any;
   if (cmd === 'get_account_balance') {
     const brokerId = (args?.brokerId as string) || 'paper';
     const broker = mockBrokerConnections.find((connection) => connection.broker_id === brokerId);
@@ -715,7 +829,13 @@ function buildMockGraph(): GraphDto {
 
 export async function getQuote(s: string): Promise<QuoteDto> { return invoke<QuoteDto>('get_quote', { symbol: s }); }
 export async function subscribeSymbols(s: string[]): Promise<void> { return invoke<void>('subscribe_symbols', { symbols: s }); }
-export async function placeOrder(r: NewOrderRequestDto): Promise<string> { return invoke<string>('place_order', { request: r }); }
+export async function unsubscribeSymbols(s: string[]): Promise<void> { return invoke<void>('unsubscribe_symbols', { symbols: s }); }
+export async function searchSymbols(query: string): Promise<SymbolSearchResultDto[]> { return invoke<SymbolSearchResultDto[]>('search_symbols', { query }); }
+export async function placeOrder(r: NewOrderRequestDto, confirmationId?: string | null): Promise<string> {
+  return invoke<string>('place_order', { request: r, confirmationId: confirmationId ?? null });
+}
+export async function previewOrder(r: NewOrderRequestDto): Promise<OrderPreviewDto> { return invoke<OrderPreviewDto>('preview_order', { request: r }); }
+export async function getHoldings(brokerId: string): Promise<PositionDto[]> { return invoke<PositionDto[]>('get_holdings', { brokerId }); }
 export async function cancelOrder(o: string, b: string): Promise<void> { return invoke<void>('cancel_order', { orderId: o, brokerId: b }); }
 export async function getPositions(): Promise<PositionDto[]> { return invoke<PositionDto[]>('get_positions'); }
 export async function getOpenOrders(): Promise<OrderDto[]> { return invoke<OrderDto[]>('get_open_orders'); }
@@ -827,3 +947,37 @@ export async function getQuantStats(symbol: string, timeframe?: string, window?:
 export async function getRegression(xSymbol: string, ySymbol: string, timeframe?: string): Promise<RegressionDto> {
   return invoke<RegressionDto>('get_regression', { xSymbol, ySymbol, timeframe });
 }
+
+export async function stopStrategyFile(path: string): Promise<void> { return invoke<void>('stop_strategy_file', { path }); }
+
+export async function listStrategySessions(): Promise<string[]> { return invoke<string[]>('list_strategy_sessions'); }
+
+// Credential vault
+export async function vaultStatus(): Promise<VaultStatusDto> { return invoke<VaultStatusDto>('vault_status'); }
+export async function vaultInit(passphrase: string): Promise<VaultStatusDto> { return invoke<VaultStatusDto>('vault_init', { passphrase }); }
+export async function vaultUnlock(passphrase: string): Promise<VaultStatusDto> { return invoke<VaultStatusDto>('vault_unlock', { passphrase }); }
+export async function vaultLock(): Promise<VaultStatusDto> { return invoke<VaultStatusDto>('vault_lock'); }
+export async function vaultChangePassphrase(oldPassphrase: string, newPassphrase: string): Promise<VaultStatusDto> {
+  return invoke<VaultStatusDto>('vault_change_passphrase', { oldPassphrase, newPassphrase });
+}
+export async function importEnvCredentials(): Promise<EnvImportResultDto> { return invoke<EnvImportResultDto>('import_env_credentials'); }
+
+// Adapter configuration
+export async function listAdapterSchemas(): Promise<AdapterSchemaDto[]> { return invoke<AdapterSchemaDto[]>('list_adapter_schemas'); }
+export async function getAdapterConfigs(): Promise<AdapterConfigDto[]> { return invoke<AdapterConfigDto[]>('get_adapter_configs'); }
+export async function saveAdapterConfig(request: SaveAdapterConfigRequest): Promise<AdapterConfigDto> {
+  return invoke<AdapterConfigDto>('save_adapter_config', { request });
+}
+export async function setAdapterEnabled(adapterId: string, enabled: boolean): Promise<AdapterConfigDto> {
+  return invoke<AdapterConfigDto>('set_adapter_enabled', { adapterId, enabled });
+}
+export async function deleteAdapterConfig(adapterId: string): Promise<void> { return invoke<void>('delete_adapter_config', { adapterId }); }
+export async function testAdapterConnection(adapterId: string): Promise<AdapterTestResultDto> {
+  return invoke<AdapterTestResultDto>('test_adapter_connection', { adapterId });
+}
+export async function zerodhaLoginUrl(): Promise<string> { return invoke<string>('zerodha_login_url'); }
+
+// Live trading safeguards
+export async function getLiveStatus(): Promise<LiveStatusDto> { return invoke<LiveStatusDto>('get_live_status'); }
+export async function setLiveArmed(armed: boolean): Promise<LiveStatusDto> { return invoke<LiveStatusDto>('set_live_armed', { armed }); }
+export async function killSwitch(): Promise<KillSwitchResultDto> { return invoke<KillSwitchResultDto>('kill_switch'); }

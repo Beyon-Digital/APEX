@@ -4,6 +4,7 @@ import { PnlValue } from '../common/PnlValue';
 import { formatPrice } from '../../lib/format';
 import { useBrokerStore } from '../../stores/brokerStore';
 import { useMarketStore } from '../../stores/marketStore';
+import { LiveControls } from '../trading/LiveControls';
 
 const FEED_STALE_MS = 15_000;
 
@@ -53,6 +54,8 @@ export const StatusBar: React.FC = () => {
         )}
       </div>
       <div className="flex items-center gap-3 text-text-muted">
+        <LiveControls />
+        <span>•</span>
         <span className="inline-flex items-center gap-1.5" data-testid="feed-status">
           <span className={`inline-block h-1.5 w-1.5 rounded-full ${feedLive ? 'bg-bull' : 'bg-warning'}`} />
           <span className="uppercase tracking-wider text-[10px]">Feed {feedLive ? 'Live' : 'Stale'}</span>

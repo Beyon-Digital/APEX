@@ -31,6 +31,7 @@ export interface OrderDto {
   price: number | null;
   stop_price: number | null;
   status: string;
+  rejection_reason?: string | null;
   filled_qty: number;
   avg_price: number;
   created_at: string;
@@ -165,6 +166,8 @@ export interface NewOrderRequestDto {
   stop_price: number | null;
   broker_id: string;
   tag: string | null;
+  /** Broker margin product (Zerodha: CNC/MIS/NRML); broker default when omitted. */
+  product?: string | null;
 }
 
 export interface AccountBalanceDto {
@@ -215,7 +218,7 @@ export interface BacktestMetricsDto {
   winning_trades: number;
   losing_trades: number;
   win_rate: number;
-  profit_factor: number;
+  profit_factor: number | null;
   avg_trade_pnl: number;
   avg_win: number;
   avg_loss: number;
@@ -553,4 +556,91 @@ export interface RegressionDto {
   residuals: SeriesPointDto[];
   scatter: [number, number][];
   fit_line: [number, number][];
+}
+
+// ── Credential vault & adapter configuration ─────────────────────────
+
+export type VaultStatus = 'uninitialized' | 'locked' | 'unlocked';
+
+export interface VaultStatusDto {
+  status: VaultStatus;
+}
+
+export type AdapterFieldKind = 'text' | 'secret' | 'toggle';
+
+export interface AdapterFieldDto {
+  key: string;
+  label: string;
+  kind: AdapterFieldKind;
+  required: boolean;
+  help: string;
+}
+
+export interface AdapterSchemaDto {
+  adapter_id: string;
+  display_name: string;
+  /** "broker" | "data" | "llm" */
+  category: string;
+  description: string;
+  fields: AdapterFieldDto[];
+}
+
+export interface AdapterConfigDto {
+  adapter_id: string;
+  enabled: boolean;
+  settings: Record<string, string>;
+  /** Names of secret fields that have a stored value (values are never returned). */
+  secrets_configured: string[];
+}
+
+export interface SaveAdapterConfigRequest {
+  adapter_id: string;
+  enabled: boolean;
+  settings: Record<string, string>;
+  /** Only secrets being set or replaced; omitted fields keep their stored value. */
+  secrets: Record<string, string>;
+  clear_secrets: string[];
+}
+
+export interface AdapterTestResultDto {
+  adapter_id: string;
+  ok: boolean;
+  message: string;
+}
+
+export interface EnvImportResultDto {
+  source: string;
+  imported: string[];
+}
+
+// ── Live trading safeguards ──────────────────────────────────────────
+
+export interface LiveStatusDto {
+  armed: boolean;
+  orders_today: number;
+  max_orders_per_day: number;
+  max_qty_per_order: number;
+  halted: boolean;
+}
+
+export interface OrderPreviewDto {
+  broker_id: string;
+  live: boolean;
+  estimated_value: number | null;
+  confirmation_id: string | null;
+  expires_in_secs: number;
+  warnings: string[];
+}
+
+export interface KillSwitchResultDto {
+  cancelled: string[];
+  failed: string[];
+}
+
+export interface SymbolSearchResultDto {
+  symbol: string;
+  name: string;
+  exchange: string;
+  /** "zerodha" | "yahoo" | "local" */
+  source: string;
 }

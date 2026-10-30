@@ -3,7 +3,8 @@ import { useMarketStore } from '../stores/marketStore';
 import { useOrderStore } from '../stores/orderStore';
 import { useRiskStore } from '../stores/riskStore';
 import { useBrokerStore } from '../stores/brokerStore';
-import { getQuote, subscribeSymbols, getPositions, getOpenOrders, getRiskStatus, getAccountBalance, listBrokerConnections } from './tauri';
+import { useLiveStore } from '../stores/liveStore';
+import { getQuote, subscribeSymbols, unsubscribeSymbols, getPositions, getOpenOrders, getRiskStatus, getAccountBalance, listBrokerConnections, getLiveStatus } from './tauri';
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -22,15 +23,28 @@ export function useDataSync() {
   const setRiskStatus = useRiskStore((s) => s.setStatus);
   const setBrokerConnections = useBrokerStore((s) => s.setConnections);
   const activeBrokerId = useBrokerStore((s) => s.activeBrokerId);
-  const subscribedRef = useRef(false);
+  const setLiveStatus = useLiveStore((s) => s.setStatus);
+  const subscribedRef = useRef<Set<string>>(new Set());
 
-  // Subscribe to market data on first mount
+  // Keep backend subscriptions in step with the watchlist: new symbols are
+  // subscribed as they are added, removed ones are released.
   useEffect(() => {
-    if (subscribedRef.current) return;
-    subscribedRef.current = true;
-    subscribeSymbols(watchlist).catch((err) =>
-      console.warn('[DataSync] subscribe failed:', err)
-    );
+    const subscribed = subscribedRef.current;
+    const wanted = new Set(watchlist);
+    const added = watchlist.filter((symbol) => !subscribed.has(symbol));
+    const removed = [...subscribed].filter((symbol) => !wanted.has(symbol));
+    if (added.length > 0) {
+      added.forEach((symbol) => subscribed.add(symbol));
+      subscribeSymbols(added).catch((err) => {
+        // Let the next watchlist change (or reload) retry these symbols.
+        added.forEach((symbol) => subscribed.delete(symbol));
+        console.warn('[DataSync] subscribe failed:', err);
+      });
+    }
+    if (removed.length > 0) {
+      removed.forEach((symbol) => subscribed.delete(symbol));
+      unsubscribeSymbols(removed).catch((err) => console.warn('[DataSync] unsubscribe failed:', err));
+    }
   }, [watchlist]);
 
   // Poll quotes
@@ -52,6 +66,21 @@ export function useDataSync() {
     const id = setInterval(poll, POLL_INTERVAL_MS);
     return () => clearInterval(id);
   }, [watchlist, updateQuote]);
+
+  // Poll live-trading safeguards (armed state, daily order budget, halt).
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const status = await getLiveStatus();
+        if (status && typeof status.armed === 'boolean') setLiveStatus(status);
+      } catch {
+        // Backend not ready — skip.
+      }
+    };
+    poll();
+    const id = setInterval(poll, POLL_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [setLiveStatus]);
 
   // Poll broker readiness and account balance for the active execution broker.
   useEffect(() => {

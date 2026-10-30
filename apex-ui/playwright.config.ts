@@ -21,13 +21,28 @@ export default defineConfig({
     baseURL: 'http://localhost:1420',
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
     trace: 'on-first-retry',
+    /* The app defaults to the tiled workspace. Most specs were written for the
+       one-panel-at-a-time focus view, so seed it; tiles.spec.ts overrides this. */
+    storageState: {
+      cookies: [],
+      origins: [
+        {
+          origin: 'http://localhost:1420',
+          localStorage: [
+            { name: 'workspace-storage', value: JSON.stringify({ state: { viewMode: 'focus' }, version: 0 }) },
+          ],
+        },
+      ],
+    },
   },
 
   /* Configure projects for major browsers */
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      // PW_CHANNEL=chrome runs against an installed Google Chrome instead of
+      // Playwright's downloaded Chromium.
+      use: { ...devices['Desktop Chrome'], ...(process.env.PW_CHANNEL ? { channel: process.env.PW_CHANNEL } : {}) },
     },
   ],
 

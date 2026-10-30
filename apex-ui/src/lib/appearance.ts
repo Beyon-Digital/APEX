@@ -3,8 +3,10 @@ import { getAppSettings } from './tauri';
 /** Apply theme + density to <html> data attributes (tokens.css hooks). */
 export function applyAppearance(theme?: string, density?: string) {
   const el = document.documentElement;
-  el.dataset.theme = theme === 'light' ? 'light' : 'dark';
-  el.dataset.density = density === 'compact' ? 'compact' : 'comfortable';
+  const resolved = theme === 'light' ? 'light' : theme === 'dark' ? 'dark' : 'terminal';
+  el.dataset.theme = resolved;
+  // The terminal theme is built for dense screens, so it defaults to compact.
+  el.dataset.density = density === 'comfortable' ? 'comfortable' : 'compact';
 }
 
 /** Load persisted appearance from settings and apply it. */

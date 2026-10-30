@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { PRESETS, placeTile, type PanelId, type TileItem } from '../components/workspace/panels';
 
 interface WorkspaceLayout {
   name: string;
@@ -16,6 +17,17 @@ interface WorkspaceState {
   commandTab: string | null;
   /** Copilot dock visibility — toggled by pill, :COPILOT command, or header controls */
   copilotOpen: boolean;
+  /** "tiles" shows a draggable multi-panel grid; "focus" shows one panel at a time. */
+  viewMode: 'tiles' | 'focus';
+  tiles: TileItem[];
+  /** Panel the user just asked for (tab click / command); the grid highlights it. */
+  highlightedTile: PanelId | null;
+  setViewMode: (mode: 'tiles' | 'focus') => void;
+  setTiles: (tiles: TileItem[]) => void;
+  applyPreset: (name: string) => void;
+  ensureTile: (id: PanelId) => void;
+  removeTile: (id: PanelId) => void;
+  setHighlightedTile: (id: PanelId | null) => void;
   saveLayout: (name: string, config: Record<string, unknown>) => void;
   loadLayout: (name: string) => WorkspaceLayout | undefined;
   deleteLayout: (name: string) => void;
@@ -33,6 +45,25 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       commandSymbol: null,
       commandTab: null,
       copilotOpen: false,
+      viewMode: 'tiles',
+      tiles: PRESETS.trading.tiles,
+      highlightedTile: null,
+
+      setViewMode: (mode) => set({ viewMode: mode }),
+      setTiles: (tiles) => set({ tiles }),
+      applyPreset: (name) => {
+        const preset = PRESETS[name];
+        if (preset) set({ tiles: preset.tiles.map((t) => ({ ...t })) });
+      },
+      ensureTile: (id) => {
+        set((state) =>
+          state.tiles.some((t) => t.i === id)
+            ? { highlightedTile: id }
+            : { tiles: [...state.tiles, placeTile(state.tiles, id)], highlightedTile: id },
+        );
+      },
+      removeTile: (id) => set((state) => ({ tiles: state.tiles.filter((t) => t.i !== id) })),
+      setHighlightedTile: (id) => set({ highlightedTile: id }),
 
       saveLayout: (name: string, config: Record<string, unknown>) => {
         set((state) => {
@@ -82,6 +113,8 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       partialize: (state) => ({
         layouts: state.layouts,
         currentLayout: state.currentLayout,
+        viewMode: state.viewMode,
+        tiles: state.tiles,
       }),
     }
   )

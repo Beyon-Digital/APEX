@@ -1,10 +1,10 @@
+import { AdapterManager } from '../settings/AdapterManager';
 import React, { useCallback, useEffect, useState } from 'react';
 import { Watchlist } from '../trading/Watchlist';
 import { DataBrowser } from '../trading/DataBrowser';
 import { OrderEntry } from '../trading/OrderEntry';
 import { PositionsPanel } from '../trading/PositionsPanel';
 import { CandleChart } from '../charts/CandleChart';
-import { StrategyIDE } from '../strategy/StrategyIDE';
 import { MLWorkbench } from '../ml/MLWorkbench';
 import { HealthMonitor } from '../monitor/HealthMonitor';
 import { AutomationsPanel } from '../monitor/AutomationsPanel';
@@ -25,20 +25,26 @@ import { useMarketStore } from '../../stores/marketStore';
 import { useBrokerStore } from '../../stores/brokerStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { VALID_TABS, type CenterTab } from './workspaceTabs';
+import { TiledWorkspace } from './TiledWorkspace';
+import type { PanelId, TileItem } from './panels';
+
+// The locally bundled code editor is sizeable; load it when the strategy
+// workspace is first opened while keeping it mounted across tab changes.
+const StrategyIDE = React.lazy(() => import('../strategy/StrategyIDE').then((module) => ({ default: module.StrategyIDE })));
 
 type AlertCondition = 'price_above' | 'price_below';
 
 const CENTER_TABS: { id: CenterTab; label: string }[] = [
   { id: 'chart', label: 'Chart' },
   { id: 'market', label: 'Market' },
+  { id: 'strategy', label: 'Strategy IDE' },
+  { id: 'backtest', label: 'Backtest' },
   { id: 'blotter', label: 'Blotter' },
   { id: 'book', label: 'Book' },
   { id: 'news', label: 'News' },
   { id: 'scanner', label: 'Scanner' },
   { id: 'graph', label: 'Graph' },
   { id: 'analytics', label: 'Analytics' },
-  { id: 'backtest', label: 'Backtest' },
-  { id: 'strategy', label: 'Strategy IDE' },
   { id: 'ml', label: 'ML Workbench' },
   { id: 'data', label: 'Stored Data' },
   { id: 'automations', label: 'Automations' },
@@ -171,6 +177,9 @@ export const Workspace: React.FC = () => {
   const [saveConfirmation, setSaveConfirmation] = useState(false);
   const [loadConfirmation, setLoadConfirmation] = useState(false);
   const [centerTab, setCenterTab] = useState<CenterTab>('chart');
+  const researchView = centerTab === 'strategy' || centerTab === 'backtest';
+  const [strategyOpened, setStrategyOpened] = useState(false);
+  useEffect(() => { if (centerTab === 'strategy') setStrategyOpened(true); }, [centerTab]);
   const [brokerTokens, setBrokerTokens] = useState<Record<string, string>>({});
   const [brokerActionError, setBrokerActionError] = useState<string | null>(null);
   const [brokerBusyId, setBrokerBusyId] = useState<string | null>(null);
@@ -181,6 +190,10 @@ export const Workspace: React.FC = () => {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsSuccess, setSettingsSuccess] = useState<string | null>(null);
 
+  const viewMode = useWorkspaceStore((s) => s.viewMode);
+  const setViewMode = useWorkspaceStore((s) => s.setViewMode);
+  const ensureTile = useWorkspaceStore((s) => s.ensureTile);
+  const setTiles = useWorkspaceStore((s) => s.setTiles);
   const saveLayout = useWorkspaceStore((s) => s.saveLayout);
   const loadLayout = useWorkspaceStore((s) => s.loadLayout);
   const layouts = useWorkspaceStore((s) => s.layouts);
@@ -188,6 +201,12 @@ export const Workspace: React.FC = () => {
   const setBrokerConnections = useBrokerStore((s) => s.setConnections);
   const activeBrokerId = useBrokerStore((s) => s.activeBrokerId);
   const setActiveBrokerId = useBrokerStore((s) => s.setActiveBrokerId);
+
+  // In tiles mode a tab opens (or highlights) its panel instead of replacing the view.
+  const selectTab = useCallback((tab: CenterTab) => {
+    setCenterTab(tab);
+    if (useWorkspaceStore.getState().viewMode === 'tiles') ensureTile(tab);
+  }, [ensureTile]);
 
   // React to CommandBar dispatches
   const commandSymbol = useWorkspaceStore((s) => s.commandSymbol);
@@ -209,10 +228,10 @@ export const Workspace: React.FC = () => {
     if (commandTab === 'copilot') {
       setCopilotOpen(true);
     } else if ((VALID_TABS as readonly string[]).includes(commandTab)) {
-      setCenterTab(commandTab as CenterTab);
+      selectTab(commandTab as CenterTab);
     }
     setCommandTab(null);
-  }, [commandTab, setCommandTab, setCopilotOpen]);
+  }, [commandTab, selectTab, setCommandTab, setCopilotOpen]);
 
   const refreshBrokerConnections = useCallback(async () => {
     try {
@@ -371,7 +390,7 @@ export const Workspace: React.FC = () => {
 
   const handleSaveLayout = () => {
     if (layoutName.trim()) {
-      saveLayout(layoutName.trim(), { selectedSymbol, timestamp: Date.now() });
+      saveLayout(layoutName.trim(), { selectedSymbol, viewMode, tiles: useWorkspaceStore.getState().tiles, timestamp: Date.now() });
       setLayoutName('');
       setShowSaveDialog(false);
       setSaveConfirmation(true);
@@ -384,9 +403,46 @@ export const Workspace: React.FC = () => {
     if (layout?.config?.selectedSymbol) {
       setSelectedSymbol(layout.config.selectedSymbol as string);
     }
+    const savedTiles = layout?.config?.tiles;
+    if (Array.isArray(savedTiles) && savedTiles.length > 0) {
+      setTiles(savedTiles as TileItem[]);
+    }
+    if (layout?.config?.viewMode === 'tiles' || layout?.config?.viewMode === 'focus') {
+      setViewMode(layout.config.viewMode);
+    }
     setShowLoadDialog(false);
     setLoadConfirmation(true);
     setTimeout(() => setLoadConfirmation(false), 3000);
+  };
+
+  const renderPanel = (id: PanelId): React.ReactNode => {
+    switch (id) {
+      case 'watchlist': return <Watchlist onSelectSymbol={setSelectedSymbol} selectedSymbol={selectedSymbol} />;
+      case 'chart': return <CandleChart symbol={selectedSymbol} />;
+      case 'orders': return <OrderEntry defaultSymbol={selectedSymbol} />;
+      case 'positions': return <PositionsPanel />;
+      case 'alerts': return <div className="h-full overflow-y-auto p-2"><AlertConsole /></div>;
+      case 'blotter': return <OrderBlotter />;
+      case 'book': return <OrderBookPanel defaultSymbol={selectedSymbol} />;
+      case 'news': return <NewsPanel />;
+      case 'scanner': return <ScannerPanel />;
+      case 'graph': return <GraphPanel />;
+      case 'analytics': return <AnalyticsPanel defaultSymbol={selectedSymbol} />;
+      case 'backtest': return <BacktestPanel defaultSymbol={selectedSymbol} />;
+      case 'market': return <MarketOverview />;
+      case 'automations': return <AutomationsPanel />;
+      case 'data': return <DataBrowser defaultSymbol={selectedSymbol} />;
+      case 'notebook': return <NotebookEditor />;
+      case 'ml': return <MLWorkbench />;
+      case 'health': return <HealthMonitor />;
+      case 'strategy':
+        return (
+          <React.Suspense fallback={<div className="p-4 text-xs text-text-muted">Loading strategy workspace…</div>}>
+            <StrategyIDE defaultSymbol={selectedSymbol} />
+          </React.Suspense>
+        );
+      default: return null;
+    }
   };
 
   return (
@@ -521,6 +577,7 @@ export const Workspace: React.FC = () => {
                         className="px-2 py-1.5 text-sm bg-surface-0 border border-[var(--border-color)] rounded"
                         data-testid="settings-theme"
                       >
+                        <option value="terminal">Terminal (amber)</option>
                         <option value="dark">Dark</option>
                         <option value="light">Light</option>
                       </select>
@@ -563,6 +620,8 @@ export const Workspace: React.FC = () => {
                   </label>
                 </div>
               </div>
+
+              <AdapterManager />
 
               <div data-testid="broker-settings-section">
                 <div className="mb-2 flex items-center justify-between">
@@ -1155,47 +1214,57 @@ export const Workspace: React.FC = () => {
         </div>
       )}
 
-      {/* Main Workspace Grid */}
-      <div className="flex-1 grid grid-cols-12 gap-1 p-1 bg-surface-0" data-testid="workspace-panel">
+      <nav aria-label="Workspace sections" className="flex shrink-0 gap-1 overflow-x-auto whitespace-nowrap border-b border-[var(--border-color)] bg-surface-1 px-2 py-1">
+        {CENTER_TABS.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => selectTab(tab.id)}
+            aria-current={centerTab === tab.id ? 'page' : undefined}
+            data-testid={`tab-${tab.id}`}
+            className={`shrink-0 rounded px-3 py-1.5 text-xs transition-colors ${
+              centerTab === tab.id
+                ? 'bg-accent/15 text-accent shadow-[inset_0_-2px_0_0_var(--color-accent)]'
+                : 'text-text-muted hover:bg-surface-2 hover:text-text-primary'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+        <button
+          type="button"
+          onClick={() => setViewMode(viewMode === 'tiles' ? 'focus' : 'tiles')}
+          aria-pressed={viewMode === 'tiles'}
+          title={viewMode === 'tiles' ? 'Switch to single-panel focus view' : 'Switch to tiled multi-panel view'}
+          data-testid="view-mode-toggle"
+          className="ml-auto shrink-0 border border-[var(--border-color)] px-3 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-accent"
+        >
+          {viewMode === 'tiles' ? 'Tiles ▦' : 'Focus ▭'}
+        </button>
+      </nav>
+
+      {viewMode === 'tiles' && <TiledWorkspace renderPanel={renderPanel} selectedSymbol={selectedSymbol} />}
+
+      {/* Main Workspace Grid (focus mode) */}
+      {viewMode === 'focus' && (
+      <div className="flex-1 min-h-0 grid grid-cols-12 gap-1 p-1 bg-surface-0" data-testid="workspace-panel">
         {/* Left: Watchlist */}
-        <div className="col-span-3 bg-surface-1 rounded-lg overflow-hidden border border-[var(--border-color)]">
+        <div className={`${researchView ? 'hidden' : centerTab === 'chart' ? 'col-span-2' : 'col-span-3'} bg-surface-1 rounded-lg overflow-hidden border border-[var(--border-color)]`}>
           <Watchlist onSelectSymbol={setSelectedSymbol} selectedSymbol={selectedSymbol} />
         </div>
 
-        {/* Center: Tab-switchable Chart/OrderEntry or StrategyIDE */}
-        <div className="col-span-6 flex flex-col gap-1">
-          {/* Center tab bar */}
-          <div className="flex gap-1 flex-wrap bg-surface-1 rounded-lg border border-[var(--border-color)] px-2 py-1">
-            {CENTER_TABS.map((tab) => (
-              <button
-                key={tab.id}
-                onClick={() => setCenterTab(tab.id)}
-                data-testid={`tab-${tab.id}`}
-                className={`px-3 py-1 text-[11px] font-mono uppercase tracking-wider rounded transition-colors ${
-                  centerTab === tab.id
-                    ? 'bg-accent/15 text-accent shadow-[inset_0_-2px_0_0_var(--color-accent)]'
-                    : 'text-text-muted hover:text-text-primary hover:bg-surface-2'
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
+        {/* Center: chart, research, or other workspace sections */}
+        <div className={`${researchView ? 'col-span-12' : centerTab === 'chart' ? 'col-span-7' : 'col-span-6'} flex min-h-0 min-w-0 flex-col gap-1`}>
+          <div className={centerTab === 'strategy' ? 'flex flex-1 min-h-0 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden' : 'hidden'}>
+            {(strategyOpened || centerTab === 'strategy') && <ErrorBoundary label="Strategy IDE"><React.Suspense fallback={<div className="p-4 text-xs text-text-muted">Loading strategy workspace…</div>}><StrategyIDE defaultSymbol={selectedSymbol} /></React.Suspense></ErrorBoundary>}
           </div>
-
           <ErrorBoundary key={centerTab} label={CENTER_TABS.find((t) => t.id === centerTab)?.label ?? 'Panel'}>
           {centerTab === 'chart' ? (
-            <>
-              <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
-                <CandleChart symbol={selectedSymbol} />
-              </div>
-              <div className="h-48 bg-surface-1 rounded-lg border border-[var(--border-color)]">
-                <OrderEntry defaultSymbol={selectedSymbol} />
-              </div>
-            </>
-          ) : centerTab === 'strategy' ? (
-            <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
-              <StrategyIDE defaultSymbol={selectedSymbol} />
+            <div className="flex-1 min-h-0 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
+              <CandleChart symbol={selectedSymbol} />
             </div>
+          ) : centerTab === 'strategy' ? (
+            null
           ) : centerTab === 'ml' ? (
             <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
               <MLWorkbench />
@@ -1252,16 +1321,22 @@ export const Workspace: React.FC = () => {
           </ErrorBoundary>
         </div>
 
-        {/* Right: Positions & Alerts */}
-        <div className="col-span-3 flex flex-col gap-1">
-          <div className="flex-1 bg-surface-1 rounded-lg overflow-hidden border border-[var(--border-color)]">
+        {/* Right: order ticket beside the chart, then positions and alerts */}
+        <div className={`${researchView ? 'hidden' : 'col-span-3 flex'} min-h-0 flex-col gap-1`}>
+          {centerTab === 'chart' && (
+            <div className="h-[min(24rem,55%)] shrink-0 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
+              <OrderEntry defaultSymbol={selectedSymbol} />
+            </div>
+          )}
+          <div className="flex-1 min-h-0 bg-surface-1 rounded-lg overflow-hidden border border-[var(--border-color)]">
             <PositionsPanel />
           </div>
-          <div className="h-52 bg-surface-1 rounded-lg border border-[var(--border-color)] p-3 overflow-y-auto">
+          <div className={`${centerTab === 'chart' ? 'h-[min(10rem,20%)]' : 'h-52'} shrink-0 bg-surface-1 rounded-lg border border-[var(--border-color)] p-3 overflow-y-auto`}>
             <AlertConsole />
           </div>
         </div>
       </div>
+      )}
     </div>
   );
 };
