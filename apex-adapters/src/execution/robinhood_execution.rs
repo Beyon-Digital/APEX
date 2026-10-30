@@ -332,6 +332,7 @@ impl ExecutionPort for RobinhoodExecutionAdapter {
             updated_at: Utc::now(),
             broker_id: "robinhood".to_string(),
             source: "api".to_string(),
+            rejection_reason: None,
         })
     }
 

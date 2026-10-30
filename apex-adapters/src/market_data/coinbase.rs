@@ -49,7 +49,9 @@ impl CoinbaseAdapter {
 
         Self {
             client,
-            status: Arc::new(RwLock::new(AdapterHealth::Healthy)),
+            status: Arc::new(RwLock::new(AdapterHealth::Degraded(
+                "Waiting for a supported symbol".into(),
+            ))),
             subscribed_symbols: Arc::new(RwLock::new(Vec::new())),
             api_key,
             api_secret,
@@ -62,6 +64,16 @@ impl CoinbaseAdapter {
         symbol.0.replace('/', "-").to_uppercase()
     }
 
+    fn supports_pair(symbol: &Symbol) -> bool {
+        let raw = Self::format_symbol(symbol);
+        let Some((base, quote)) = raw.split_once('-') else {
+            return false;
+        };
+        !base.is_empty()
+            && base.chars().all(|c| c.is_ascii_alphanumeric())
+            && ["USD", "USDT", "USDC", "BTC", "ETH", "EUR", "GBP"].contains(&quote)
+    }
+
     /// Convert Coinbase Pro symbol to APEX format (e.g., "BTC-USD" -> "BTC/USD")
     fn parse_symbol(coinbase_symbol: &str) -> Symbol {
         Symbol(coinbase_symbol.replace('-', "/"))
@@ -69,8 +81,9 @@ impl CoinbaseAdapter {
 
     /// Parse Coinbase Pro trade message into Tick
     fn parse_trade_message(msg: &CoinbaseTradeMessage) -> Result<Tick> {
-        let time = DateTime::from_timestamp_millis(msg.time)
-            .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+        let time = DateTime::parse_from_rfc3339(&msg.time)
+            .map_err(|e| anyhow!("Invalid timestamp: {}", e))?
+            .with_timezone(&Utc);
 
         Ok(Tick {
             time,
@@ -216,7 +229,11 @@ impl Default for CoinbaseAdapter {
 
 #[async_trait]
 impl MarketDataPort for CoinbaseAdapter {
+    fn supports_symbol(&self, symbol: &Symbol) -> bool {
+        Self::supports_pair(symbol)
+    }
     async fn subscribe(&self, symbols: &[Symbol]) -> Result<TickStream> {
+        *self.status.write().await = AdapterHealth::Degraded("Connecting".into());
         let (tx, rx) = mpsc::channel(1024);
         let status = self.status.clone();
         let symbols: Vec<Symbol> = symbols.to_vec();
@@ -257,6 +274,8 @@ impl MarketDataPort for CoinbaseAdapter {
                         .is_err()
                     {
                         error!("Failed to send subscription message");
+                        *status.write().await =
+                            AdapterHealth::Unhealthy("Failed to send subscription message".into());
                         return;
                     }
 
@@ -267,13 +286,23 @@ impl MarketDataPort for CoinbaseAdapter {
                                 match message {
                                     Some(Ok(Message::Text(text))) => {
                                         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                                            if data.get("type").and_then(|t| t.as_str()) == Some("error") {
+                                                let message = data.get("message").and_then(|m| m.as_str()).unwrap_or("Subscription rejected");
+                                                error!("Coinbase subscription rejected: {}", message);
+                                                *status.write().await = AdapterHealth::Unhealthy(format!("Subscription rejected: {}", message));
+                                                break;
+                                            }
                                             if data.get("type").and_then(|t| t.as_str()) == Some("match") {
                                                 if let Ok(trade_msg) = serde_json::from_str::<CoinbaseTradeMessage>(&text) {
                                                     match Self::parse_trade_message(&trade_msg) {
                                                         Ok(tick) => {
-                                                            if tx.send(tick).await.is_err() {
-                                                                info!("Tick stream closed, stopping WebSocket");
-                                                                break;
+                                                            for original in symbols.iter().filter(|s| Self::format_symbol(s) == trade_msg.product_id) {
+                                                                let mut mapped = tick.clone();
+                                                                mapped.symbol = original.clone();
+                                                                if tx.send(mapped).await.is_err() {
+                                                                    info!("Tick stream closed, stopping WebSocket");
+                                                                    return;
+                                                                }
                                                             }
                                                             *status.write().await = AdapterHealth::Healthy;
                                                         }
@@ -292,6 +321,7 @@ impl MarketDataPort for CoinbaseAdapter {
                                     }
                                     Some(Ok(Message::Close(_))) => {
                                         info!("Coinbase WebSocket closed");
+                                        *status.write().await = AdapterHealth::Degraded("Connection closed; retry on next subscription".into());
                                         break;
                                     }
                                     Some(Err(e)) => {
@@ -301,6 +331,7 @@ impl MarketDataPort for CoinbaseAdapter {
                                     }
                                     None => {
                                         info!("WebSocket stream ended");
+                                        *status.write().await = AdapterHealth::Degraded("Connection ended; retry on next subscription".into());
                                         break;
                                     }
                                     Some(Ok(_)) => {}
@@ -376,13 +407,26 @@ struct CoinbaseTradeMessage {
     #[serde(rename = "sequence")]
     sequence: u64,
     #[serde(rename = "time")]
-    time: i64,
+    time: String,
     #[serde(rename = "product_id")]
     product_id: String,
-    #[serde(rename = "price")]
+    #[serde(rename = "price", deserialize_with = "deserialize_number")]
     price: f64,
-    #[serde(rename = "size")]
+    #[serde(rename = "size", deserialize_with = "deserialize_number")]
     size: f64,
+}
+
+fn deserialize_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Numeric {
+        Number(f64),
+        String(String),
+    }
+    match Numeric::deserialize(d)? {
+        Numeric::Number(n) => Ok(n),
+        Numeric::String(s) => s.parse().map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -409,6 +453,19 @@ struct CoinbaseTicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routes_only_crypto_pairs_and_parses_exchange_trade() {
+        let adapter = CoinbaseAdapter::new();
+        assert!(adapter.supports_symbol(&Symbol("BTC-USD".into())));
+        assert!(adapter.supports_symbol(&Symbol("ETH/USDT".into())));
+        assert!(!adapter.supports_symbol(&Symbol("AAPL".into())));
+        assert!(!adapter.supports_symbol(&Symbol("RELIANCE.NS".into())));
+        let trade: CoinbaseTradeMessage = serde_json::from_str(r#"{"type":"match","trade_id":1,"sequence":2,"time":"2024-03-09T16:00:00.000000Z","product_id":"BTC-USD","price":"64500.50","size":"0.001"}"#).unwrap();
+        let tick = CoinbaseAdapter::parse_trade_message(&trade).unwrap();
+        assert_eq!(tick.last, 64500.5);
+        assert_eq!(tick.time.to_rfc3339(), "2024-03-09T16:00:00+00:00");
+    }
 
     #[test]
     fn test_adapter_id() {
@@ -459,6 +516,9 @@ mod tests {
     #[test]
     fn test_health_default() {
         let adapter = CoinbaseAdapter::new();
-        assert_eq!(adapter.health(), AdapterHealth::Healthy);
+        assert_eq!(
+            adapter.health(),
+            AdapterHealth::Degraded("Waiting for a supported symbol".into())
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -26,6 +26,8 @@ pub struct PaperState {
     pub positions: HashMap<String, Position>,
     pub realized_pnl: f64,
     pub order_counter: u64,
+    /// Stop-limit orders stay triggered until filled or cancelled.
+    pub triggered_stops: HashSet<String>,
 }
 
 impl PaperState {
@@ -37,6 +39,7 @@ impl PaperState {
             positions: HashMap::new(),
             realized_pnl: 0.0,
             order_counter: 0,
+            triggered_stops: HashSet::new(),
         }
     }
 }
@@ -82,8 +85,80 @@ impl PaperTradingAdapter {
 
     /// Update the quote cache (called by the market data aggregator)
     pub fn update_quote(&self, quote: &Quote) {
-        self.quote_cache
-            .insert(quote.symbol.0.clone(), quote.clone());
+        if !Self::fresh_quote(quote) {
+            return;
+        }
+        let mut entry = self
+            .quote_cache
+            .entry(quote.symbol.0.clone())
+            .or_insert_with(|| quote.clone());
+        if quote.updated_at > entry.updated_at {
+            *entry = quote.clone();
+        }
+    }
+
+    fn fresh_quote(quote: &Quote) -> bool {
+        let age = Utc::now()
+            .signed_duration_since(quote.updated_at)
+            .num_seconds();
+        (-5..=60).contains(&age) && quote.last.is_finite() && quote.last > 0.0
+    }
+
+    fn stop_crossed(order: &Order, price: f64) -> bool {
+        match (order.side.clone(), order.stop_price) {
+            (OrderSide::Buy, Some(stop)) => price >= stop,
+            (OrderSide::Sell, Some(stop)) => price <= stop,
+            _ => false,
+        }
+    }
+
+    fn limit_crossed(order: &Order, price: f64) -> bool {
+        match (order.side.clone(), order.price) {
+            (OrderSide::Buy, Some(limit)) => price <= limit,
+            (OrderSide::Sell, Some(limit)) => price >= limit,
+            _ => false,
+        }
+    }
+
+    fn pending_price(&self, order: &Order, quote: &Quote, stop_triggered: bool) -> Option<f64> {
+        let eligible = match &order.order_type {
+            OrderType::Limit => Self::limit_crossed(order, quote.last),
+            OrderType::Stop => Self::stop_crossed(order, quote.last),
+            OrderType::StopLimit => stop_triggered && Self::limit_crossed(order, quote.last),
+            _ => false,
+        };
+        if !eligible {
+            return None;
+        }
+        let slipped = self.calculate_fill_price(quote.last, &order.side);
+        Some(
+            if matches!(&order.order_type, OrderType::Limit | OrderType::StopLimit) {
+                let limit = order.price?;
+                match &order.side {
+                    OrderSide::Buy => slipped.min(limit),
+                    OrderSide::Sell => slipped.max(limit),
+                }
+            } else {
+                slipped
+            },
+        )
+    }
+
+    fn marked_position(&self, position: &Position) -> Position {
+        let mut marked = position.clone();
+        if let Some(quote) = self.quote_cache.get(&position.symbol.0) {
+            let change = match position.side {
+                OrderSide::Buy => quote.last - position.avg_price,
+                OrderSide::Sell => position.avg_price - quote.last,
+            };
+            marked.pnl = change * position.quantity;
+            marked.pnl_pct = if position.avg_price > 0.0 {
+                change / position.avg_price * 100.0
+            } else {
+                0.0
+            };
+        }
+        marked
     }
 
     /// Get the quote cache (for external access)
@@ -114,23 +189,40 @@ impl PaperTradingAdapter {
             .map(|q| q.clone())
             .ok_or_else(|| anyhow!("No quote available for symbol {}", symbol_key))?;
 
+        if !Self::fresh_quote(&quote) {
+            return Err(anyhow!(
+                "No fresh market price for {}; paper order was not placed",
+                symbol_key
+            ));
+        }
         let fill_price = self.calculate_fill_price(quote.last, &request.side);
+        let mut state = self.state.write().await;
+        self.fill_locked(&mut state, order_id, request, fill_price)
+    }
+
+    fn fill_locked(
+        &self,
+        state: &mut PaperState,
+        order_id: &str,
+        request: &NewOrderRequest,
+        fill_price: f64,
+    ) -> Result<()> {
         let trade_value = fill_price * request.quantity;
         let commission = self.calculate_commission(trade_value);
 
-        let mut state = self.state.write().await;
-
         // Check sufficient funds for buy
         if request.side == OrderSide::Buy && (trade_value + commission) > state.cash {
-            if let Some(order) = state.orders.get_mut(order_id) {
-                order.status = OrderStatus::Rejected;
-                order.updated_at = Utc::now();
-            }
-            return Err(anyhow!(
+            let reason = format!(
                 "Insufficient funds: need {:.2}, have {:.2}",
                 trade_value + commission,
                 state.cash
-            ));
+            );
+            if let Some(order) = state.orders.get_mut(order_id) {
+                order.status = OrderStatus::Rejected;
+                order.updated_at = Utc::now();
+                order.rejection_reason = Some(reason.clone());
+            }
+            return Err(anyhow!(reason));
         }
 
         // Execute the fill
@@ -143,6 +235,9 @@ impl PaperTradingAdapter {
             }
         }
 
+        // Fees are realized expenses on both entry and exit.
+        state.realized_pnl -= commission;
+
         // Update order status
         if let Some(order) = state.orders.get_mut(order_id) {
             order.status = OrderStatus::Filled;
@@ -152,7 +247,8 @@ impl PaperTradingAdapter {
         }
 
         // Update position
-        self.update_position(&mut state, request, fill_price);
+        self.update_position(state, request, fill_price);
+        state.triggered_stops.remove(order_id);
 
         Ok(())
     }
@@ -249,6 +345,28 @@ impl Default for PaperTradingAdapter {
 #[async_trait]
 impl ExecutionPort for PaperTradingAdapter {
     async fn place_order(&self, request: &NewOrderRequest) -> Result<OrderId> {
+        if !request.quantity.is_finite() || request.quantity <= 0.0 {
+            return Err(anyhow!("Quantity must be positive"));
+        }
+        let valid_price = |p: Option<f64>| p.is_some_and(|v| v.is_finite() && v > 0.0);
+        match &request.order_type {
+            OrderType::Market => {}
+            OrderType::Limit if !valid_price(request.price) => {
+                return Err(anyhow!("Limit price must be positive"))
+            }
+            OrderType::Stop if !valid_price(request.stop_price) => {
+                return Err(anyhow!("Stop price must be positive"))
+            }
+            OrderType::StopLimit
+                if !valid_price(request.stop_price) || !valid_price(request.price) =>
+            {
+                return Err(anyhow!("Stop and limit prices must be positive"))
+            }
+            OrderType::TrailingStop => {
+                return Err(anyhow!("Paper trailing stop orders are not supported"))
+            }
+            _ => {}
+        }
         let mut state = self.state.write().await;
         state.order_counter += 1;
         let order_id = format!("PAPER-{}", Uuid::new_v4());
@@ -261,27 +379,28 @@ impl ExecutionPort for PaperTradingAdapter {
             quantity: request.quantity,
             price: request.price,
             stop_price: request.stop_price,
-            status: OrderStatus::Pending,
+            status: if request.order_type == OrderType::Market {
+                OrderStatus::Pending
+            } else {
+                OrderStatus::Open
+            },
             filled_qty: 0.0,
             avg_price: 0.0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             broker_id: "paper".into(),
             source: request.tag.clone().unwrap_or_else(|| "manual".into()),
+            rejection_reason: None,
         };
 
         state.orders.insert(order_id.clone(), order);
         drop(state); // Release write lock before fill
 
-        // For market orders, fill immediately
         if request.order_type == OrderType::Market {
-            self.fill_market_order(&order_id, request).await?;
-        } else {
-            // For limit/stop orders, mark as Open (waiting for price trigger)
-            let mut state = self.state.write().await;
-            if let Some(order) = state.orders.get_mut(&order_id) {
-                order.status = OrderStatus::Open;
-                order.updated_at = Utc::now();
+            if let Err(error) = self.fill_market_order(&order_id, request).await {
+                // A rejected submission must not leave a phantom pending order.
+                self.state.write().await.orders.remove(&order_id);
+                return Err(error);
             }
         }
 
@@ -299,6 +418,7 @@ impl ExecutionPort for PaperTradingAdapter {
             OrderStatus::Pending | OrderStatus::Open => {
                 order.status = OrderStatus::Cancelled;
                 order.updated_at = Utc::now();
+                state.triggered_stops.remove(&order_id.0);
                 Ok(())
             }
             _ => Err(anyhow!("Cannot cancel order in {:?} status", order.status)),
@@ -306,6 +426,14 @@ impl ExecutionPort for PaperTradingAdapter {
     }
 
     async fn modify_order(&self, order_id: &OrderId, params: &ModifyParams) -> Result<()> {
+        if params.quantity.is_some_and(|q| !q.is_finite() || q <= 0.0)
+            || params.price.is_some_and(|p| !p.is_finite() || p <= 0.0)
+            || params
+                .stop_price
+                .is_some_and(|p| !p.is_finite() || p <= 0.0)
+        {
+            return Err(anyhow!("Quantity and prices must be positive"));
+        }
         let mut state = self.state.write().await;
         let order = state
             .orders
@@ -341,12 +469,20 @@ impl ExecutionPort for PaperTradingAdapter {
 
     async fn get_positions(&self) -> Result<Vec<Position>> {
         let state = self.state.read().await;
-        Ok(state.positions.values().cloned().collect())
+        Ok(state
+            .positions
+            .values()
+            .map(|p| self.marked_position(p))
+            .collect())
     }
 
     async fn get_account_balance(&self) -> Result<AccountBalance> {
         let state = self.state.read().await;
-        let unrealized_pnl: f64 = state.positions.values().map(|p| p.pnl).sum();
+        let unrealized_pnl: f64 = state
+            .positions
+            .values()
+            .map(|p| self.marked_position(p).pnl)
+            .sum();
         let positions_value: f64 = state
             .positions
             .values()
@@ -364,6 +500,99 @@ impl ExecutionPort for PaperTradingAdapter {
         })
     }
 
+    async fn eligible_orders(&self, quote: &Quote) -> Result<Vec<(Order, f64)>> {
+        if !Self::fresh_quote(quote) {
+            return Ok(Vec::new());
+        }
+        if self
+            .quote_cache
+            .get(&quote.symbol.0)
+            .is_some_and(|q| q.updated_at > quote.updated_at)
+        {
+            return Ok(Vec::new());
+        }
+        self.update_quote(quote);
+        let mut state = self.state.write().await;
+        let mut orders: Vec<Order> = state
+            .orders
+            .values()
+            .filter(|o| o.symbol == quote.symbol && o.status == OrderStatus::Open)
+            .cloned()
+            .collect();
+        orders.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.0.cmp(&b.id.0))
+        });
+        let mut eligible = Vec::new();
+        for order in orders {
+            if order.order_type == OrderType::StopLimit && Self::stop_crossed(&order, quote.last) {
+                state.triggered_stops.insert(order.id.0.clone());
+            }
+            let triggered = state.triggered_stops.contains(&order.id.0);
+            if let Some(price) = self.pending_price(&order, quote, triggered) {
+                eligible.push((order, price));
+            }
+        }
+        Ok(eligible)
+    }
+
+    async fn resolve_order(
+        &self,
+        id: &OrderId,
+        quote: &Quote,
+        rejection_reason: Option<&str>,
+    ) -> Result<Option<Order>> {
+        if !Self::fresh_quote(quote)
+            || self
+                .quote_cache
+                .get(&quote.symbol.0)
+                .is_some_and(|q| q.updated_at > quote.updated_at)
+        {
+            return Ok(None);
+        }
+        let mut state = self.state.write().await;
+        let Some(order) = state.orders.get(&id.0).cloned() else {
+            return Ok(None);
+        };
+        if order.symbol != quote.symbol || order.status != OrderStatus::Open {
+            return Ok(None);
+        }
+        let Some(price) = self.pending_price(&order, quote, state.triggered_stops.contains(&id.0))
+        else {
+            return Ok(None);
+        };
+        if let Some(reason) = rejection_reason {
+            let order = state.orders.get_mut(&id.0).unwrap();
+            order.status = OrderStatus::Rejected;
+            order.updated_at = Utc::now();
+            order.rejection_reason = Some(reason.to_owned());
+        } else {
+            let request = NewOrderRequest {
+                symbol: order.symbol.clone(),
+                side: order.side.clone(),
+                order_type: order.order_type.clone(),
+                quantity: order.quantity,
+                price: order.price,
+                stop_price: order.stop_price,
+                tag: Some(order.source.clone()),
+                broker_params: None,
+            };
+            // A resting order can become unaffordable while it waits. Mark it
+            // rejected and publish that status rather than silently dropping it.
+            let _ = self.fill_locked(&mut state, &id.0, &request, price);
+        }
+        state.triggered_stops.remove(&id.0);
+        Ok(state.orders.get(&id.0).cloned())
+    }
+
+    fn latest_quote(&self, symbol: &Symbol) -> Option<Quote> {
+        self.quote_cache
+            .get(&symbol.0)
+            .map(|q| q.clone())
+            .filter(Self::fresh_quote)
+    }
+
     fn broker_id(&self) -> &'static str {
         "paper"
     }
@@ -374,7 +603,6 @@ impl ExecutionPort for PaperTradingAdapter {
             OrderType::Limit,
             OrderType::Stop,
             OrderType::StopLimit,
-            OrderType::TrailingStop,
         ]
     }
 
@@ -424,6 +652,7 @@ mod tests {
             price: None,
             stop_price: None,
             tag: None,
+            broker_params: None,
         };
 
         let order_id = adapter.place_order(&request).await.unwrap();
@@ -451,6 +680,7 @@ mod tests {
             price: None,
             stop_price: None,
             tag: None,
+            broker_params: None,
         };
         adapter.place_order(&buy_req).await.unwrap();
 
@@ -462,6 +692,7 @@ mod tests {
             price: None,
             stop_price: None,
             tag: None,
+            broker_params: None,
         };
         adapter.place_order(&sell_req).await.unwrap();
 
@@ -482,6 +713,7 @@ mod tests {
             price: None,
             stop_price: None,
             tag: None,
+            broker_params: None,
         };
         adapter.place_order(&request).await.unwrap();
 
@@ -491,56 +723,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_open_limit_order() {
+    async fn invalid_and_unsupported_paper_orders_fail_without_creating_orders() {
         let adapter = PaperTradingAdapter::new();
-        adapter.update_quote(&create_test_quote("AAPL", 150.0));
-
-        let request = NewOrderRequest {
-            symbol: Symbol("AAPL".into()),
-            side: OrderSide::Buy,
-            order_type: OrderType::Limit,
-            quantity: 10.0,
-            price: Some(140.0),
-            stop_price: None,
-            tag: None,
-        };
-
-        let order_id = adapter.place_order(&request).await.unwrap();
-        let order = adapter.get_order_status(&order_id).await.unwrap();
-        assert_eq!(order.status, OrderStatus::Open);
-
-        adapter.cancel_order(&order_id).await.unwrap();
-        let order = adapter.get_order_status(&order_id).await.unwrap();
-        assert_eq!(order.status, OrderStatus::Cancelled);
+        for order_type in [
+            OrderType::Limit,
+            OrderType::Stop,
+            OrderType::StopLimit,
+            OrderType::TrailingStop,
+        ] {
+            let request = NewOrderRequest {
+                symbol: Symbol("AAPL".into()),
+                side: OrderSide::Buy,
+                order_type,
+                quantity: 10.0,
+                price: None,
+                stop_price: None,
+                tag: None,
+                broker_params: None,
+            };
+            assert!(adapter.place_order(&request).await.is_err());
+        }
+        assert!(adapter.state.read().await.orders.is_empty());
+        assert!(!adapter
+            .supported_order_types()
+            .contains(&OrderType::TrailingStop));
     }
 
     #[tokio::test]
-    async fn test_modify_order() {
+    async fn previously_open_paper_order_can_still_be_cancelled() {
         let adapter = PaperTradingAdapter::new();
-        adapter.update_quote(&create_test_quote("AAPL", 150.0));
-
-        let request = NewOrderRequest {
+        let now = Utc::now();
+        let order = Order {
+            id: OrderId("legacy-open".into()),
             symbol: Symbol("AAPL".into()),
             side: OrderSide::Buy,
             order_type: OrderType::Limit,
-            quantity: 10.0,
-            price: Some(140.0),
+            quantity: 1.0,
+            price: Some(100.0),
+            stop_price: None,
+            status: OrderStatus::Open,
+            filled_qty: 0.0,
+            avg_price: 0.0,
+            created_at: now,
+            updated_at: now,
+            broker_id: "paper".into(),
+            source: "manual".into(),
+            rejection_reason: None,
+        };
+        let id = order.id.clone();
+        adapter
+            .state
+            .write()
+            .await
+            .orders
+            .insert(id.0.clone(), order);
+        adapter.cancel_order(&id).await.unwrap();
+        assert_eq!(
+            adapter.get_order_status(&id).await.unwrap().status,
+            OrderStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn market_orders_require_fresh_quotes_and_leave_no_phantom_orders() {
+        let adapter = PaperTradingAdapter::new();
+        let request = NewOrderRequest {
+            symbol: Symbol("AAPL".into()),
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            quantity: 1.0,
+            price: None,
             stop_price: None,
             tag: None,
+            broker_params: None,
         };
-
-        let order_id = adapter.place_order(&request).await.unwrap();
-
-        let modify = ModifyParams {
-            quantity: Some(20.0),
-            price: Some(145.0),
-            stop_price: None,
-        };
-        adapter.modify_order(&order_id, &modify).await.unwrap();
-
-        let order = adapter.get_order_status(&order_id).await.unwrap();
-        assert_eq!(order.quantity, 20.0);
-        assert_eq!(order.price, Some(145.0));
+        for offset in [-65, 10] {
+            let mut quote = create_test_quote("AAPL", 150.0);
+            quote.updated_at = Utc::now() + chrono::Duration::seconds(offset);
+            adapter.update_quote(&quote);
+            assert!(adapter.place_order(&request).await.is_err());
+            assert!(adapter.state.read().await.orders.is_empty());
+        }
+        adapter.update_quote(&create_test_quote("AAPL", 150.0));
+        assert!(adapter.place_order(&request).await.is_ok());
     }
 
     #[tokio::test]
@@ -556,6 +821,7 @@ mod tests {
             price: None,
             stop_price: None,
             tag: None,
+            broker_params: None,
         };
 
         let order_id = adapter.place_order(&request).await.unwrap();
@@ -576,6 +842,7 @@ mod tests {
             price: None,
             stop_price: None,
             tag: None,
+            broker_params: None,
         };
 
         let result = adapter.place_order(&request).await;

@@ -274,6 +274,7 @@ impl CoinbaseExecutionAdapter {
             updated_at: Utc::now(),
             broker_id: broker_id.to_string(),
             source: "coinbase".into(),
+            rejection_reason: None,
         }
     }
 }

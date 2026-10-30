@@ -1,287 +1,187 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Result};
 use apex_core::{
     domain::models::*,
     ports::market_data::{AdapterHealth, MarketDataPort, TickStream},
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use reqwest::Client;
-use serde::Deserialize;
-use std::sync::{Arc, RwLock};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
+
+use super::zerodha_ticker::{quote_from_rest, TickerHub};
+use crate::kite::instruments::{Instrument, InstrumentMaster};
+use crate::kite::{is_explicit_indian_symbol, parse_kite_time, parse_symbol, Bucket, KiteSession};
 
 /// Zerodha Kite market data adapter
 ///
-/// Provides real-time and historical market data from Zerodha Kite Connect API
+/// Real-time ticks come from the KiteTicker WebSocket (falling back to batched
+/// REST polling when the socket is unavailable). Historical candles use the
+/// instrument token from the instruments master.
 /// Documentation: https://kite.trade/docs/connect/v3/
 pub struct ZerodhaKiteAdapter {
-    api_key: String,
-    access_token: Arc<RwLock<Option<String>>>,
-    client: Client,
-    health: Arc<RwLock<AdapterHealth>>,
-}
-
-/// Zerodha API quote response
-#[derive(Debug, Deserialize)]
-struct ZerodhaQuote {
-    last_price: f64,
-    #[serde(default)]
-    ohlc: ZerodhaOHLC,
-    #[serde(default)]
-    depth: ZerodhaDepth,
-    #[serde(default)]
-    volume: u64,
-    #[serde(default)]
-    change_percent: f64,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ZerodhaOHLC {
-    #[serde(default)]
-    open: f64,
-    #[serde(default)]
-    high: f64,
-    #[serde(default)]
-    low: f64,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ZerodhaDepth {
-    #[serde(default)]
-    buy: Vec<ZerodhaDepthItem>,
-    #[serde(default)]
-    sell: Vec<ZerodhaDepthItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ZerodhaDepthItem {
-    price: f64,
-}
-
-/// Zerodha API OHLC response
-#[derive(Debug, Deserialize)]
-struct ZerodhaHistoricalData {
-    data: ZerodhaHistoricalDataWrapper,
-}
-
-#[derive(Debug, Deserialize)]
-struct ZerodhaHistoricalDataWrapper {
-    candles: Vec<Vec<serde_json::Value>>,
+    session: Arc<KiteSession>,
+    instruments: Arc<InstrumentMaster>,
+    hub: Arc<TickerHub>,
 }
 
 impl ZerodhaKiteAdapter {
-    /// Create a new Zerodha Kite adapter
+    /// Create a new Zerodha Kite adapter with its own session.
     ///
     /// # Arguments
-    /// * `api_key` - Zerodha API key from app.kite.trade
+    /// * `api_key` - Zerodha API key from the Kite Connect console
     /// * `access_token` - Access token obtained after login flow
     pub fn new(api_key: String, access_token: Option<String>) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("Failed to create HTTP client")?;
-
-        Ok(Self {
-            api_key,
-            access_token: Arc::new(RwLock::new(access_token)),
-            client,
-            health: Arc::new(RwLock::new(AdapterHealth::Healthy)),
-        })
+        Ok(Self::from_shared(
+            KiteSession::new(api_key, access_token)?,
+            Arc::new(InstrumentMaster::new()),
+        ))
     }
 
-    /// Set access token (after login flow)
+    /// Create an adapter on a session shared with the execution adapter.
+    pub fn from_shared(session: Arc<KiteSession>, instruments: Arc<InstrumentMaster>) -> Self {
+        let hub = TickerHub::new(session.clone(), instruments.clone());
+        Self { session, instruments, hub }
+    }
+
+    pub fn session(&self) -> &Arc<KiteSession> {
+        &self.session
+    }
+
+    pub fn instruments(&self) -> &Arc<InstrumentMaster> {
+        &self.instruments
+    }
+
+    /// Start the WebSocket connection without waiting for a subscription, so
+    /// order updates flow as soon as the user logs in. Needs a Tokio runtime.
+    pub fn start_background(&self) {
+        if self.session.is_authenticated() {
+            self.hub.start();
+        }
+    }
+
     pub fn set_access_token(&self, token: String) {
-        let mut access_token = self.access_token.write().unwrap();
-        *access_token = Some(token);
-        info!("Zerodha access token updated");
+        self.session.set_token(token);
+        self.start_background_if_runtime();
     }
 
-    /// Clear access token (after logout or when resetting auth state).
     pub fn clear_access_token(&self) {
-        let mut access_token = self.access_token.write().unwrap();
-        *access_token = None;
-        self.set_health(AdapterHealth::Unhealthy("Not authenticated".to_string()));
-        info!("Zerodha access token cleared");
+        self.session.clear_token();
     }
 
-    /// Check if authenticated
     pub fn is_authenticated(&self) -> bool {
-        self.access_token.read().unwrap().is_some()
+        self.session.is_authenticated()
     }
 
-    /// Get authorization header value
-    fn get_auth_header(&self) -> Result<String> {
-        let token = self.access_token.read().unwrap();
-        match token.as_ref() {
-            Some(t) => Ok(format!("token {}:{}", self.api_key, t)),
-            None => Err(anyhow::anyhow!("No access token available")),
+    fn start_background_if_runtime(&self) {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.start_background();
         }
     }
 
-    /// Map APEX symbol to Zerodha instrument token
-    /// Note: In production, maintain a symbol-to-instrument mapping table
-    fn symbol_to_instrument_token(&self, symbol: &Symbol) -> String {
-        // Simplified mapping - in production, use Zerodha instruments API
-        // Format: NSE:SYMBOL or BSE:SYMBOL
-        format!("NSE:{}", symbol.0)
-    }
-
-    /// Map APEX timeframe to Zerodha interval string
-    fn timeframe_to_interval(&self, tf: &Timeframe) -> &'static str {
+    /// Map APEX timeframe to Zerodha interval string and the longest window
+    /// Kite serves per request.
+    fn timeframe_to_interval(tf: &Timeframe) -> Option<(&'static str, i64)> {
         match tf {
-            Timeframe::M1 => "minute",
-            Timeframe::M3 => "3minute",
-            Timeframe::M5 => "5minute",
-            Timeframe::M15 => "15minute",
-            Timeframe::M30 => "30minute",
-            Timeframe::H1 => "60minute",
-            Timeframe::D1 => "day",
-            _ => "minute", // Default fallback
+            Timeframe::M1 => Some(("minute", 60)),
+            Timeframe::M3 => Some(("3minute", 100)),
+            Timeframe::M5 => Some(("5minute", 100)),
+            Timeframe::M15 => Some(("15minute", 200)),
+            Timeframe::M30 => Some(("30minute", 200)),
+            Timeframe::H1 => Some(("60minute", 400)),
+            Timeframe::D1 => Some(("day", 2000)),
+            _ => None,
         }
     }
 
-    /// Update health status
-    fn set_health(&self, health: AdapterHealth) {
-        let mut h = self.health.write().unwrap();
-        *h = health;
+    async fn resolve(&self, symbol: &Symbol) -> Result<Instrument> {
+        self.instruments.ensure_loaded(&self.session).await?;
+        self.instruments
+            .resolve(symbol)
+            .ok_or_else(|| anyhow!("{} is not a known Zerodha instrument", symbol.0))
     }
 }
 
 #[async_trait]
 impl MarketDataPort for ZerodhaKiteAdapter {
+    fn subscription_ready(&self) -> bool {
+        self.is_authenticated()
+    }
+
+    fn supports_symbol(&self, symbol: &Symbol) -> bool {
+        if is_explicit_indian_symbol(&symbol.0) {
+            return true;
+        }
+        // Bare symbols are only claimed once the master confirms them, so US
+        // tickers like AAPL never get routed here.
+        self.instruments.is_loaded() && self.instruments.resolve(symbol).is_some()
+    }
+
     async fn subscribe(&self, symbols: &[Symbol]) -> Result<TickStream> {
         if !self.is_authenticated() {
-            return Err(anyhow::anyhow!("Not authenticated with Zerodha"));
+            return Err(anyhow!("Not authenticated with Zerodha"));
+        }
+        self.instruments.ensure_loaded(&self.session).await?;
+
+        let mut tokens: HashMap<u32, Symbol> = HashMap::new();
+        for symbol in symbols {
+            match self.instruments.resolve(symbol) {
+                Some(instrument) => {
+                    tokens.insert(instrument.token, symbol.clone());
+                }
+                None => warn!(symbol = %symbol.0, "Symbol not found in Zerodha instruments"),
+            }
+        }
+        if tokens.is_empty() {
+            return Err(anyhow!("None of the requested symbols exist on Zerodha"));
         }
 
-        // Zerodha WebSocket subscription would go here
-        // For now, implement polling-based subscription
-        let (tx, rx) = mpsc::channel(1000);
-
-        let symbols_clone: Vec<Symbol> = symbols.to_vec();
-        let adapter = ZerodhaKiteAdapter::new(
-            self.api_key.clone(),
-            self.access_token.read().unwrap().clone(),
-        )?;
-
-        tokio::spawn(async move {
-            loop {
-                for symbol in &symbols_clone {
-                    match adapter.get_snapshot(symbol).await {
-                        Ok(quote) => {
-                            let tick = Tick {
-                                time: Utc::now(),
-                                symbol: symbol.clone(),
-                                bid: quote.bid,
-                                ask: quote.ask,
-                                last: quote.last,
-                                volume: quote.volume,
-                                source: "zerodha_kite".to_string(),
-                                open: Some(quote.open),
-                                change_pct: Some(quote.change_pct),
-                            };
-
-                            if tx.send(tick).await.is_err() {
-                                warn!("Tick channel closed, stopping subscription");
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to fetch quote for {}: {}", symbol.0, e);
-                        }
-                    }
-                }
-
-                // Poll every 1 second
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        });
-
-        info!("Subscribed to {} symbols via Zerodha Kite", symbols.len());
+        let (tx, rx) = mpsc::channel(2048);
+        let count = tokens.len();
+        self.hub.subscribe(tokens, tx);
+        info!("Subscribed to {count} symbols via Zerodha KiteTicker");
         Ok(rx)
     }
 
     async fn unsubscribe(&self, symbols: &[Symbol]) -> Result<()> {
-        // In WebSocket implementation, send unsubscribe message
+        // Subscriber channels close when the aggregator drops its receiver; the
+        // hub prunes them on the next tick.
         debug!("Unsubscribed from {} symbols", symbols.len());
         Ok(())
     }
 
     async fn get_snapshot(&self, symbol: &Symbol) -> Result<Quote> {
         if !self.is_authenticated() {
-            self.set_health(AdapterHealth::Unhealthy("Not authenticated".to_string()));
-            return Err(anyhow::anyhow!("Not authenticated with Zerodha"));
+            return Err(anyhow!("Not authenticated with Zerodha"));
         }
-
-        let instrument = self.symbol_to_instrument_token(symbol);
-        let url = format!("https://api.kite.trade/quote/ohlc?i={}", instrument);
-
-        let auth_header = self.get_auth_header()?;
-
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", auth_header)
-            .header("X-Kite-Version", "3")
-            .send()
-            .await
-            .context("Failed to fetch quote from Zerodha")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            self.set_health(AdapterHealth::Degraded(format!("HTTP {}", status)));
-            return Err(anyhow::anyhow!(
-                "Zerodha API error {}: {}",
-                status,
-                error_text
-            ));
-        }
-
-        let data: serde_json::Value = response
-            .json()
-            .await
-            .context("Failed to parse Zerodha response")?;
-
-        // Extract quote data from nested response
-        let quote_data = data
-            .get("data")
-            .and_then(|d| d.get(&instrument))
-            .ok_or_else(|| anyhow::anyhow!("Quote data not found in response"))?;
-
-        let zerodha_quote: ZerodhaQuote =
-            serde_json::from_value(quote_data.clone()).context("Failed to deserialize quote")?;
-
-        // Calculate bid/ask from depth or use last_price
-        let (bid, ask) =
-            if !zerodha_quote.depth.buy.is_empty() && !zerodha_quote.depth.sell.is_empty() {
-                (
-                    zerodha_quote.depth.buy[0].price,
-                    zerodha_quote.depth.sell[0].price,
-                )
-            } else {
-                // Approximate bid/ask if depth not available
-                let spread = zerodha_quote.last_price * 0.0005; // 0.05% spread
-                (
-                    zerodha_quote.last_price - spread,
-                    zerodha_quote.last_price + spread,
-                )
-            };
-
-        self.set_health(AdapterHealth::Healthy);
-
+        let key = parse_symbol(&symbol.0).key();
+        let data = self
+            .session
+            .get("/quote", &[("i", key.clone())], Bucket::Quote)
+            .await?;
+        let entry = data
+            .get(&key)
+            .ok_or_else(|| anyhow!("Quote for {key} not found in response"))?;
+        let q = quote_from_rest(entry).ok_or_else(|| anyhow!("Malformed quote for {key}"))?;
+        let ohlc = entry.get("ohlc");
+        let field = |name: &str| ohlc.and_then(|o| o.get(name)).and_then(|v| v.as_f64());
+        let vwap = entry
+            .get("average_price")
+            .and_then(|v| v.as_f64())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(q.last);
         Ok(Quote {
             symbol: symbol.clone(),
-            bid,
-            ask,
-            last: zerodha_quote.last_price,
-            open: zerodha_quote.ohlc.open,
-            high: zerodha_quote.ohlc.high,
-            low: zerodha_quote.ohlc.low,
-            volume: zerodha_quote.volume,
-            change_pct: zerodha_quote.change_percent,
-            vwap: zerodha_quote.last_price, // VWAP not provided by Zerodha quote API
+            bid: q.bid.unwrap_or(q.last),
+            ask: q.ask.unwrap_or(q.last),
+            last: q.last,
+            open: field("open").unwrap_or(q.last),
+            high: field("high").unwrap_or(q.last),
+            low: field("low").unwrap_or(q.last),
+            volume: q.volume.unwrap_or(0),
+            change_pct: q.change_pct().unwrap_or(0.0),
+            vwap,
             updated_at: Utc::now(),
         })
     }
@@ -294,73 +194,47 @@ impl MarketDataPort for ZerodhaKiteAdapter {
         to: DateTime<Utc>,
     ) -> Result<Vec<OHLCV>> {
         if !self.is_authenticated() {
-            return Err(anyhow::anyhow!("Not authenticated with Zerodha"));
+            return Err(anyhow!("Not authenticated with Zerodha"));
         }
+        let (interval, max_days) = Self::timeframe_to_interval(&timeframe)
+            .ok_or_else(|| anyhow!("Timeframe {timeframe:?} is not supported by Zerodha"))?;
+        let instrument = self.resolve(symbol).await?;
+        let ist = FixedOffset::east_opt(5 * 3600 + 1800).expect("valid offset");
+        let format_ist = |t: DateTime<Utc>| t.with_timezone(&ist).format("%Y-%m-%d %H:%M:%S").to_string();
 
-        let instrument = self.symbol_to_instrument_token(symbol);
-        let interval = self.timeframe_to_interval(&timeframe);
-
-        let url = format!(
-            "https://api.kite.trade/instruments/historical/{}/{}?from={}&to={}",
-            instrument,
-            interval,
-            from.format("%Y-%m-%d"),
-            to.format("%Y-%m-%d")
-        );
-
-        let auth_header = self.get_auth_header()?;
-
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", auth_header)
-            .header("X-Kite-Version", "3")
-            .send()
-            .await
-            .context("Failed to fetch historical data from Zerodha")?;
-
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Zerodha API error: {}", response.status()));
-        }
-
-        let hist_data: ZerodhaHistoricalData = response
-            .json()
-            .await
-            .context("Failed to parse historical data")?;
-
-        let mut bars = Vec::new();
-
-        for candle in hist_data.data.candles {
-            if candle.len() < 6 {
-                continue;
+        // Kite caps the window per request, so walk the range in chunks.
+        let mut bars: Vec<OHLCV> = Vec::new();
+        let mut cursor = from;
+        while cursor < to {
+            let end = (cursor + Duration::days(max_days)).min(to);
+            let data = self
+                .session
+                .get(
+                    &format!("/instruments/historical/{}/{interval}", instrument.token),
+                    &[("from", format_ist(cursor)), ("to", format_ist(end))],
+                    Bucket::Historical,
+                )
+                .await?;
+            for candle in data.get("candles").and_then(|c| c.as_array()).into_iter().flatten() {
+                // [timestamp, open, high, low, close, volume]
+                let Some(fields) = candle.as_array().filter(|f| f.len() >= 6) else { continue };
+                let Some(time) = fields[0].as_str().and_then(parse_kite_time) else { continue };
+                bars.push(OHLCV {
+                    time,
+                    symbol: symbol.clone(),
+                    timeframe: timeframe.clone(),
+                    open: fields[1].as_f64().unwrap_or(0.0),
+                    high: fields[2].as_f64().unwrap_or(0.0),
+                    low: fields[3].as_f64().unwrap_or(0.0),
+                    close: fields[4].as_f64().unwrap_or(0.0),
+                    volume: fields[5].as_u64().unwrap_or(0),
+                });
             }
-
-            // Candle format: [timestamp, open, high, low, close, volume]
-            let time_str = candle[0].as_str().unwrap_or("");
-            let time = DateTime::parse_from_rfc3339(time_str)
-                .ok()
-                .and_then(|dt| Some(dt.with_timezone(&Utc)))
-                .unwrap_or_else(Utc::now);
-
-            let bar = OHLCV {
-                time,
-                symbol: symbol.clone(),
-                timeframe: timeframe.clone(),
-                open: candle[1].as_f64().unwrap_or(0.0),
-                high: candle[2].as_f64().unwrap_or(0.0),
-                low: candle[3].as_f64().unwrap_or(0.0),
-                close: candle[4].as_f64().unwrap_or(0.0),
-                volume: candle[5].as_u64().unwrap_or(0),
-            };
-
-            bars.push(bar);
+            cursor = end;
         }
-
-        debug!(
-            "Fetched {} historical bars for {} from Zerodha",
-            bars.len(),
-            symbol.0
-        );
+        bars.sort_by_key(|b| b.time);
+        bars.dedup_by_key(|b| b.time);
+        debug!("Fetched {} historical bars for {} from Zerodha", bars.len(), symbol.0);
         Ok(bars)
     }
 
@@ -369,27 +243,105 @@ impl MarketDataPort for ZerodhaKiteAdapter {
     }
 
     fn health(&self) -> AdapterHealth {
-        self.health.read().unwrap().clone()
+        match self.session.health() {
+            AdapterHealth::Healthy if self.hub.is_started() && self.hub.is_polling() => {
+                AdapterHealth::Degraded("KiteTicker unavailable; polling REST quotes".into())
+            }
+            AdapterHealth::Healthy if self.hub.is_started() && !self.hub.is_connected() => {
+                AdapterHealth::Degraded("KiteTicker connecting".into())
+            }
+            other => other,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[test]
-    fn test_symbol_to_instrument() {
-        let adapter = ZerodhaKiteAdapter::new("test_key".to_string(), None).unwrap();
-        let symbol = Symbol("RELIANCE".to_string());
-        let instrument = adapter.symbol_to_instrument_token(&symbol);
-        assert_eq!(instrument, "NSE:RELIANCE");
+    const CSV: &str = "instrument_token,exchange_token,tradingsymbol,name,last_price,expiry,strike,tick_size,lot_size,instrument_type,segment,exchange\n\
+738561,2885,RELIANCE,RELIANCE INDUSTRIES,0,,0,0.05,1,EQ,NSE,NSE\n";
+
+    fn adapter(server: &MockServer) -> ZerodhaKiteAdapter {
+        let session =
+            KiteSession::with_base_url("key".into(), Some("tok".into()), server.uri()).unwrap();
+        let instruments = Arc::new(InstrumentMaster::new());
+        instruments.load_csv(CSV);
+        ZerodhaKiteAdapter::from_shared(session, instruments)
     }
 
     #[test]
     fn test_timeframe_mapping() {
-        let adapter = ZerodhaKiteAdapter::new("test_key".to_string(), None).unwrap();
-        assert_eq!(adapter.timeframe_to_interval(&Timeframe::M1), "minute");
-        assert_eq!(adapter.timeframe_to_interval(&Timeframe::M5), "5minute");
-        assert_eq!(adapter.timeframe_to_interval(&Timeframe::D1), "day");
+        assert_eq!(ZerodhaKiteAdapter::timeframe_to_interval(&Timeframe::M1), Some(("minute", 60)));
+        assert_eq!(ZerodhaKiteAdapter::timeframe_to_interval(&Timeframe::M5).unwrap().0, "5minute");
+        assert_eq!(ZerodhaKiteAdapter::timeframe_to_interval(&Timeframe::D1).unwrap().0, "day");
+        assert!(ZerodhaKiteAdapter::timeframe_to_interval(&Timeframe::S1).is_none());
+    }
+
+    #[tokio::test]
+    async fn supports_only_known_indian_symbols() {
+        let server = MockServer::start().await;
+        let adapter = adapter(&server);
+        assert!(adapter.supports_symbol(&Symbol("RELIANCE.NS".into())));
+        assert!(adapter.supports_symbol(&Symbol("RELIANCE".into())));
+        assert!(!adapter.supports_symbol(&Symbol("AAPL".into())));
+        assert!(!adapter.supports_symbol(&Symbol("BTCUSDT".into())));
+    }
+
+    #[tokio::test]
+    async fn snapshot_reads_depth_and_change() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .and(query_param("i", "NSE:RELIANCE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "success",
+                "data": {"NSE:RELIANCE": {
+                    "instrument_token": 738561, "last_price": 1250.0, "volume": 5000,
+                    "average_price": 1245.0,
+                    "ohlc": {"open": 1240.0, "high": 1255.0, "low": 1238.0, "close": 1230.0},
+                    "depth": {"buy": [{"price": 1249.9}], "sell": [{"price": 1250.1}]}
+                }}
+            })))
+            .mount(&server)
+            .await;
+        let quote = adapter(&server).get_snapshot(&Symbol("RELIANCE.NS".into())).await.unwrap();
+        assert_eq!(quote.bid, 1249.9);
+        assert_eq!(quote.vwap, 1245.0);
+        assert!((quote.change_pct - 1.626).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn historical_uses_instrument_token_and_parses_kite_timestamps() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/instruments/historical/738561/day"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "success",
+                "data": {"candles": [
+                    ["2024-01-15T00:00:00+0530", 100.0, 110.0, 95.0, 105.0, 1000],
+                    ["2024-01-16T00:00:00+0530", 105.0, 112.0, 101.0, 111.0, 2000]
+                ]}
+            })))
+            .mount(&server)
+            .await;
+        let from = Utc::now() - Duration::days(5);
+        let bars = adapter(&server)
+            .get_historical_ohlcv(&Symbol("RELIANCE.NS".into()), Timeframe::D1, from, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].close, 105.0);
+        assert_eq!(bars[0].time.to_rfc3339(), "2024-01-14T18:30:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn subscribe_rejects_unknown_symbols() {
+        let server = MockServer::start().await;
+        let adapter = adapter(&server);
+        assert!(adapter.subscribe(&[Symbol("NOPE.NS".into())]).await.is_err());
     }
 }

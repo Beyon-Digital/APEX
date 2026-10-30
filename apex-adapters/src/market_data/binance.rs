@@ -44,7 +44,9 @@ impl BinanceAdapter {
 
         Self {
             client,
-            status: Arc::new(RwLock::new(AdapterHealth::Healthy)),
+            status: Arc::new(RwLock::new(AdapterHealth::Degraded(
+                "Waiting for a supported symbol".into(),
+            ))),
             subscribed_symbols: Arc::new(RwLock::new(Vec::new())),
             api_key,
             testnet,
@@ -71,7 +73,16 @@ impl BinanceAdapter {
 
     /// Convert APEX symbol to Binance format (e.g., "BTC/USDT" -> "btcusdt")
     fn format_symbol(symbol: &Symbol) -> String {
-        symbol.0.replace('/', "").to_lowercase()
+        symbol.0.replace(['/', '-'], "").to_lowercase()
+    }
+
+    fn supports_pair(symbol: &Symbol) -> bool {
+        let raw = symbol.0.to_uppercase();
+        let pair = raw.replace(['/', '-'], "");
+        pair.chars().all(|c| c.is_ascii_alphanumeric())
+            && ["USDT", "USDC", "BUSD", "BTC", "ETH", "BNB"]
+                .iter()
+                .any(|quote| pair.ends_with(quote) && pair.len() > quote.len())
     }
 
     /// Convert Binance symbol to APEX format (e.g., "btcusdt" -> "BTC/USDT")
@@ -273,7 +284,11 @@ impl Default for BinanceAdapter {
 
 #[async_trait]
 impl MarketDataPort for BinanceAdapter {
+    fn supports_symbol(&self, symbol: &Symbol) -> bool {
+        Self::supports_pair(symbol)
+    }
     async fn subscribe(&self, symbols: &[Symbol]) -> Result<TickStream> {
+        *self.status.write().await = AdapterHealth::Degraded("Connecting".into());
         let (tx, rx) = mpsc::channel(1024);
         let status = self.status.clone();
         let symbols: Vec<Symbol> = symbols.to_vec();
@@ -293,7 +308,15 @@ impl MarketDataPort for BinanceAdapter {
             .map(|s| format!("{}@trade", Self::format_symbol(s)))
             .collect();
 
-        let url = format!("{}/{}", self.ws_base_url(), streams.join("/"));
+        let url = if streams.len() == 1 {
+            format!("{}/{}", self.ws_base_url(), streams[0])
+        } else {
+            format!(
+                "{}?streams={}",
+                self.ws_base_url().trim_end_matches("/ws").to_owned() + "/stream",
+                streams.join("/")
+            )
+        };
 
         info!("Connecting to Binance WebSocket: {}", url);
 
@@ -311,12 +334,18 @@ impl MarketDataPort for BinanceAdapter {
                             message = ws_stream.next() => {
                                 match message {
                                     Some(Ok(Message::Text(text))) => {
-                                        if let Ok(trade_msg) = serde_json::from_str::<BinanceTradeMessage>(&text) {
+                                        let payload = serde_json::from_str::<serde_json::Value>(&text).ok();
+                                        let data = payload.as_ref().and_then(|v| v.get("data")).or(payload.as_ref());
+                                        if let Some(Ok(trade_msg)) = data.map(|v| serde_json::from_value::<BinanceTradeMessage>(v.clone())) {
                                             match BinanceAdapter::parse_trade_message(&trade_msg) {
                                                 Ok(tick) => {
-                                                    if tx.send(tick).await.is_err() {
-                                                        info!("Tick stream closed, stopping WebSocket");
-                                                        break;
+                                                    for original in symbols.iter().filter(|s| Self::format_symbol(s).eq_ignore_ascii_case(&trade_msg.symbol)) {
+                                                        let mut mapped = tick.clone();
+                                                        mapped.symbol = original.clone();
+                                                        if tx.send(mapped).await.is_err() {
+                                                            info!("Tick stream closed, stopping WebSocket");
+                                                            return;
+                                                        }
                                                     }
                                                     *status.write().await = AdapterHealth::Healthy;
                                                 }
@@ -333,6 +362,7 @@ impl MarketDataPort for BinanceAdapter {
                                     }
                                     Some(Ok(Message::Close(_))) => {
                                         info!("Binance WebSocket closed");
+                                        *status.write().await = AdapterHealth::Degraded("Connection closed; retry on next subscription".into());
                                         break;
                                     }
                                     Some(Err(e)) => {
@@ -342,6 +372,7 @@ impl MarketDataPort for BinanceAdapter {
                                     }
                                     None => {
                                         info!("WebSocket stream ended");
+                                        *status.write().await = AdapterHealth::Degraded("Connection ended; retry on next subscription".into());
                                         break;
                                     }
                                     Some(Ok(_)) => {}
@@ -420,14 +451,27 @@ struct BinanceTradeMessage {
     symbol: String,
     #[serde(rename = "t")]
     trade_id: u64,
-    #[serde(rename = "p")]
+    #[serde(rename = "p", deserialize_with = "deserialize_number")]
     price: f64,
-    #[serde(rename = "q")]
+    #[serde(rename = "q", deserialize_with = "deserialize_number")]
     quantity: f64,
     #[serde(rename = "T")]
     trade_time: i64,
     #[serde(rename = "m")]
     is_buyer_maker: bool,
+}
+
+fn deserialize_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Numeric {
+        Number(f64),
+        String(String),
+    }
+    match Numeric::deserialize(d)? {
+        Numeric::Number(n) => Ok(n),
+        Numeric::String(s) => s.parse().map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,6 +531,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn routes_only_binance_pairs_and_parses_real_trade_numbers() {
+        let adapter = BinanceAdapter::new();
+        assert!(adapter.supports_symbol(&Symbol("BTC/USDT".into())));
+        assert!(adapter.supports_symbol(&Symbol("ETHUSDT".into())));
+        assert!(!adapter.supports_symbol(&Symbol("BTC-USD".into())));
+        assert!(!adapter.supports_symbol(&Symbol("AAPL".into())));
+        let trade: BinanceTradeMessage = serde_json::from_str(r#"{"e":"trade","E":1710000000000,"s":"BTCUSDT","t":1,"p":"64500.50","q":"0.001","T":1710000000000,"m":false}"#).unwrap();
+        assert_eq!(
+            BinanceAdapter::parse_trade_message(&trade).unwrap().last,
+            64500.5
+        );
+    }
+
+    #[test]
     fn test_adapter_id() {
         let adapter = BinanceAdapter::new();
         assert_eq!(adapter.adapter_id(), "binance");
@@ -526,6 +584,9 @@ mod tests {
     #[test]
     fn test_health_default() {
         let adapter = BinanceAdapter::new();
-        assert_eq!(adapter.health(), AdapterHealth::Healthy);
+        assert_eq!(
+            adapter.health(),
+            AdapterHealth::Degraded("Waiting for a supported symbol".into())
+        );
     }
 }

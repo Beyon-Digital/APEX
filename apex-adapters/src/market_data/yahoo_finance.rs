@@ -147,7 +147,16 @@ impl YahooFinanceAdapter {
             // True VWAP requires intraday volume-weighted averaging which Yahoo
             // does not expose; use last price as a rough approximation.
             vwap: last,
-            updated_at: Utc::now(),
+            updated_at: meta
+                .regular_market_time
+                .or_else(|| {
+                    result
+                        .timestamp
+                        .as_ref()
+                        .and_then(|times| times.last().copied())
+                })
+                .and_then(|stamp| DateTime::from_timestamp(stamp, 0))
+                .ok_or_else(|| anyhow!("Yahoo quote has no valid market timestamp"))?,
         })
     }
 
@@ -267,6 +276,10 @@ impl Default for YahooFinanceAdapter {
 
 #[async_trait]
 impl MarketDataPort for YahooFinanceAdapter {
+    /// Delayed public data: any broker feed for the same symbol takes precedence.
+    fn priority(&self) -> u8 {
+        0
+    }
     async fn subscribe(&self, symbols: &[Symbol]) -> Result<TickStream> {
         let (tx, rx) = mpsc::channel(1024);
         let client = self.client.clone();
@@ -307,7 +320,7 @@ impl MarketDataPort for YahooFinanceAdapter {
                                     YahooFinanceAdapter::parse_quote_response(symbol, &body)
                                 {
                                     let tick = Tick {
-                                        time: Utc::now(),
+                                        time: quote.updated_at,
                                         symbol: symbol.clone(),
                                         bid: quote.bid,
                                         ask: quote.ask,
@@ -426,6 +439,7 @@ struct YahooChartResult {
 #[serde(rename_all = "camelCase")]
 struct YahooMeta {
     regular_market_price: f64,
+    regular_market_time: Option<i64>,
     chart_previous_close: Option<f64>,
 }
 
@@ -469,6 +483,23 @@ mod tests {
             }]
         }
     }"#;
+
+    #[test]
+    fn quote_preserves_market_time_instead_of_refresh_time() {
+        let quote = YahooFinanceAdapter::parse_quote_response(
+            &Symbol("AAPL".into()),
+            SAMPLE_QUOTE_RESPONSE,
+        )
+        .unwrap();
+        assert_eq!(quote.updated_at.timestamp(), 1700000000);
+        let with_meta = SAMPLE_QUOTE_RESPONSE.replace(
+            "\"regularMarketPrice\": 175.50",
+            "\"regularMarketTime\": 1700000005, \"regularMarketPrice\": 175.50",
+        );
+        let quote =
+            YahooFinanceAdapter::parse_quote_response(&Symbol("AAPL".into()), &with_meta).unwrap();
+        assert_eq!(quote.updated_at.timestamp(), 1700000005);
+    }
 
     const SAMPLE_HISTORICAL_RESPONSE: &str = r#"{
         "chart": {

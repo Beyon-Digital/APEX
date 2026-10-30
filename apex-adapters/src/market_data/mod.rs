@@ -7,3 +7,4 @@ pub mod polymarket;
 pub mod robinhood_market_data;
 pub mod yahoo_finance;
 pub mod zerodha_kite;
+pub mod zerodha_ticker;

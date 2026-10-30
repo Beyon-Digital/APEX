@@ -95,6 +95,9 @@ impl GrowwMarketDataAdapter {
 
 #[async_trait]
 impl MarketDataPort for GrowwMarketDataAdapter {
+    fn subscription_ready(&self) -> bool {
+        self.is_authenticated()
+    }
     async fn subscribe(&self, symbols: &[Symbol]) -> Result<TickStream> {
         if !self.is_authenticated() {
             return Err(anyhow::anyhow!("Not authenticated with Groww"));

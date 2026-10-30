@@ -9,6 +9,13 @@ use tokio::sync::Mutex;
 use apex_core::domain::models::*;
 use apex_core::ports::storage::StoragePort;
 
+// Accept both canonical SQL enum names and historical JSON-quoted values.
+fn decode_enum<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
+    serde_json::from_str(value)
+        .or_else(|_| serde_json::from_value(serde_json::Value::String(value.into())))
+        .map_err(Into::into)
+}
+
 /// SQLite-based storage adapter for configuration, orders, and lightweight data storage.
 /// Serves as a self-contained fallback when TimescaleDB is unavailable.
 pub struct SqliteStorage {
@@ -81,7 +88,8 @@ impl SqliteStorage {
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL,
                 broker_id   TEXT NOT NULL,
-                source      TEXT NOT NULL DEFAULT 'manual'
+                source      TEXT NOT NULL DEFAULT 'manual',
+                rejection_reason TEXT
             );
 
             CREATE TABLE IF NOT EXISTS positions (
@@ -109,6 +117,14 @@ impl SqliteStorage {
             );
             ",
         )?;
+
+        let has_rejection_reason: bool = conn
+            .prepare("PRAGMA table_info(orders)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|name| name.map(|n| n == "rejection_reason").unwrap_or(false));
+        if !has_rejection_reason {
+            conn.execute("ALTER TABLE orders ADD COLUMN rejection_reason TEXT", [])?;
+        }
 
         // Older DBs lack the timeframe column — add it before indexing.
         let has_tf: bool = conn
@@ -228,7 +244,7 @@ impl StoragePort for SqliteStorage {
                     row.get::<_, f64>(4)?,
                     row.get::<_, f64>(5)?,
                     row.get::<_, f64>(6)?,
-                    row.get::<_, i64>(7)?,
+                    row.get::<_, f64>(7)?,
                 ))
             },
         )?;
@@ -258,23 +274,24 @@ impl StoragePort for SqliteStorage {
         conn.execute(
             "INSERT OR REPLACE INTO orders
              (id, symbol, side, order_type, quantity, price, stop_price,
-              status, filled_qty, avg_price, created_at, updated_at, broker_id, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              status, filled_qty, avg_price, created_at, updated_at, broker_id, source, rejection_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 order.id.0,
                 order.symbol.0,
-                serde_json::to_string(&order.side).unwrap_or_default(),
-                serde_json::to_string(&order.order_type).unwrap_or_default(),
+                format!("{:?}", order.side),
+                format!("{:?}", order.order_type),
                 order.quantity,
                 order.price,
                 order.stop_price,
-                serde_json::to_string(&order.status).unwrap_or_default(),
+                format!("{:?}", order.status),
                 order.filled_qty,
                 order.avg_price,
                 order.created_at.to_rfc3339(),
                 order.updated_at.to_rfc3339(),
                 order.broker_id,
                 order.source,
+                order.rejection_reason,
             ],
         )?;
         Ok(())
@@ -290,7 +307,7 @@ impl StoragePort for SqliteStorage {
         // Build query with parameterized placeholders to prevent SQL injection
         let mut sql = String::from(
             "SELECT id, symbol, side, order_type, quantity, price, stop_price,
-                    status, filled_qty, avg_price, created_at, updated_at, broker_id, source
+                    status, filled_qty, avg_price, created_at, updated_at, broker_id, source, rejection_reason
              FROM orders WHERE 1=1",
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -302,9 +319,14 @@ impl StoragePort for SqliteStorage {
             param_idx += 1;
         }
         if let Some(ref status) = params_q.status {
-            sql.push_str(&format!(" AND status = ?{}", param_idx));
-            bind_values.push(Box::new(serde_json::to_string(status).unwrap_or_default()));
-            param_idx += 1;
+            sql.push_str(&format!(
+                " AND status IN (?{}, ?{})",
+                param_idx,
+                param_idx + 1
+            ));
+            bind_values.push(Box::new(format!("{:?}", status)));
+            bind_values.push(Box::new(serde_json::to_string(status)?));
+            param_idx += 2;
         }
         if let Some(ref broker_id) = params_q.broker_id {
             sql.push_str(&format!(" AND broker_id = ?{}", param_idx));
@@ -338,6 +360,7 @@ impl StoragePort for SqliteStorage {
                 row.get::<_, String>(11)?,
                 row.get::<_, String>(12)?,
                 row.get::<_, String>(13)?,
+                row.get::<_, Option<String>>(14)?,
             ))
         })?;
 
@@ -358,16 +381,17 @@ impl StoragePort for SqliteStorage {
                 updated_at,
                 broker_id,
                 source,
+                rejection_reason,
             ) = row?;
             orders.push(Order {
                 id: OrderId(id),
                 symbol: Symbol(symbol),
-                side: serde_json::from_str(&side).unwrap_or(OrderSide::Buy),
-                order_type: serde_json::from_str(&order_type).unwrap_or(OrderType::Market),
+                side: decode_enum(&side)?,
+                order_type: decode_enum(&order_type)?,
                 quantity,
                 price,
                 stop_price,
-                status: serde_json::from_str(&status).unwrap_or(OrderStatus::Pending),
+                status: decode_enum(&status)?,
                 filled_qty,
                 avg_price,
                 created_at: DateTime::parse_from_rfc3339(&created_at)
@@ -378,6 +402,7 @@ impl StoragePort for SqliteStorage {
                     .unwrap_or_else(|_| Utc::now()),
                 broker_id,
                 source,
+                rejection_reason,
             });
         }
         Ok(orders)
@@ -394,7 +419,7 @@ impl StoragePort for SqliteStorage {
                 pos.broker_id,
                 pos.quantity,
                 pos.avg_price,
-                serde_json::to_string(&pos.side).unwrap_or_default(),
+                format!("{:?}", pos.side),
                 pos.pnl,
                 pos.pnl_pct,
             ],
@@ -429,7 +454,7 @@ impl StoragePort for SqliteStorage {
                 broker_id,
                 quantity,
                 avg_price,
-                side: serde_json::from_str(&side).unwrap_or(OrderSide::Buy),
+                side: decode_enum(&side)?,
                 pnl,
                 pnl_pct,
             });
@@ -442,10 +467,68 @@ impl StoragePort for SqliteStorage {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn migrates_legacy_order_table_and_round_trips_rejection_reason() {
+        let storage = SqliteStorage::new(":memory:").unwrap();
+        {
+            let conn = storage.conn.lock().await;
+            conn.execute_batch("CREATE TABLE orders (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, order_type TEXT NOT NULL, quantity REAL NOT NULL, price REAL, stop_price REAL, status TEXT NOT NULL, filled_qty REAL NOT NULL DEFAULT 0, avg_price REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, broker_id TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'manual');").unwrap();
+        }
+        storage.init_schema().await.unwrap();
+        let now = Utc::now();
+        let order = Order {
+            id: OrderId("migration-test".into()),
+            symbol: Symbol("TEST".into()),
+            side: OrderSide::Buy,
+            order_type: OrderType::Stop,
+            quantity: 1.0,
+            price: None,
+            stop_price: Some(10.0),
+            status: OrderStatus::Rejected,
+            filled_qty: 0.0,
+            avg_price: 0.0,
+            created_at: now,
+            updated_at: now,
+            broker_id: "paper".into(),
+            source: "manual".into(),
+            rejection_reason: Some("Insufficient funds".into()),
+        };
+        storage.write_order(&order).await.unwrap();
+        let found = storage
+            .query_orders(OrderQuery {
+                symbol: None,
+                status: None,
+                broker_id: None,
+                from: None,
+                to: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            found[0].rejection_reason.as_deref(),
+            Some("Insufficient funds")
+        );
+    }
+
     async fn setup() -> SqliteStorage {
         let storage = SqliteStorage::new(":memory:").unwrap();
         storage.init_schema().await.unwrap();
         storage
+    }
+
+    #[test]
+    fn decodes_plain_and_legacy_enums() {
+        assert_eq!(decode_enum::<OrderSide>("Sell").unwrap(), OrderSide::Sell);
+        assert_eq!(
+            decode_enum::<OrderSide>("\"Sell\"").unwrap(),
+            OrderSide::Sell
+        );
+        assert_eq!(
+            decode_enum::<OrderStatus>("Filled").unwrap(),
+            OrderStatus::Filled
+        );
+        assert!(decode_enum::<OrderSide>("garbage").is_err());
     }
 
     #[tokio::test]
@@ -513,8 +596,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reads_legacy_real_volume() {
+        let storage = setup().await;
+        let now = Utc::now();
+        // REAL affinity reproduces databases populated by data science tools.
+        storage.conn.lock().await.execute_batch("ALTER TABLE ohlcv RENAME TO old_ohlcv; CREATE TABLE ohlcv(time TEXT, symbol TEXT,timeframe TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL);").unwrap();
+        storage
+            .conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO ohlcv VALUES(?1,'AAPL','D1',1,2,1,2,123.0)",
+                params![now.to_rfc3339()],
+            )
+            .unwrap();
+        let bars = storage
+            .query_ohlcv(OHLCVQuery {
+                symbol: Symbol("AAPL".into()),
+                timeframe: Timeframe::D1,
+                from: now - chrono::Duration::hours(1),
+                to: now + chrono::Duration::hours(1),
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(bars[0].volume, 123);
+    }
+
+    #[tokio::test]
     async fn test_write_and_query_orders() {
         let storage = setup().await;
+        storage.conn.lock().await.execute_batch("CREATE TRIGGER enforce_order_side BEFORE INSERT ON orders WHEN NEW.side NOT IN ('Buy','Sell') BEGIN SELECT RAISE(ABORT,'invalid SQL side'); END;").unwrap();
         let order = Order {
             id: OrderId("test-001".into()),
             symbol: Symbol("AAPL".into()),
@@ -530,6 +642,7 @@ mod tests {
             updated_at: Utc::now(),
             broker_id: "paper".into(),
             source: "manual".into(),
+            rejection_reason: None,
         };
         storage.write_order(&order).await.unwrap();
 
@@ -564,6 +677,7 @@ mod tests {
             updated_at: Utc::now(),
             broker_id: "paper".into(),
             source: "strategy".into(),
+            rejection_reason: None,
         };
         storage.write_order(&order).await.unwrap();
 

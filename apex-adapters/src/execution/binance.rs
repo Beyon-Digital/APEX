@@ -296,6 +296,7 @@ impl BinanceExecutionAdapter {
                 .unwrap_or_else(Utc::now),
             broker_id: broker_id.to_string(),
             source: "binance".into(),
+            rejection_reason: None,
         }
     }
 }
