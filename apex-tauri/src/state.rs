@@ -1,26 +1,19 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::commands::python_runtime::RuntimePaths;
+use crate::broker_runtime::{
+    build_broker, paper_entry, BrokerCredentials, BrokerRuntimeEntry, BuiltBroker,
+    CONFIGURABLE_BROKERS,
+};
 use crate::config::CopilotConfig;
+use crate::live_guard::LiveTradingGuard;
+use crate::vault::Vault;
 use crate::config::{AppConfig, StorageBackendKind};
 use anyhow::{anyhow, Result};
-use apex_adapters::execution::angel_one_execution::AngelOneExecutionAdapter;
-use apex_adapters::execution::binance::BinanceExecutionAdapter;
-use apex_adapters::execution::coinbase::CoinbaseExecutionAdapter;
-use apex_adapters::execution::groww_execution::GrowwExecutionAdapter;
 use apex_adapters::execution::paper_trading::PaperTradingAdapter;
-use apex_adapters::execution::robinhood_execution::RobinhoodExecutionAdapter;
-use apex_adapters::execution::zerodha_execution::ZerodhaExecutionAdapter;
-use apex_adapters::market_data::angel_one_market_data::AngelOneMarketDataAdapter;
-use apex_adapters::market_data::binance::BinanceAdapter;
-use apex_adapters::market_data::coinbase::CoinbaseAdapter;
-use apex_adapters::market_data::groww_market_data::GrowwMarketDataAdapter;
-use apex_adapters::market_data::polymarket::PolymarketAdapter;
-use apex_adapters::market_data::robinhood_market_data::RobinhoodMarketDataAdapter;
 use apex_adapters::market_data::yahoo_finance::YahooFinanceAdapter;
-use apex_adapters::market_data::zerodha_kite::ZerodhaKiteAdapter;
 use apex_adapters::storage::sqlite_storage::SqliteStorage;
 use apex_adapters::storage::timescale::TimescaleAdapter;
 use apex_core::application::alert_engine::AlertEngine;
@@ -30,280 +23,19 @@ use apex_core::application::graph_engine::GraphEngine;
 use apex_core::application::market_data_aggregator::MarketDataAggregator;
 use apex_core::application::metrics::Metrics;
 use apex_core::application::news_engine::{FeedType, NewsEngine, NewsFeed};
-use apex_core::application::order_trade_manager::OrderTradeManager;
+use apex_core::application::order_trade_manager::{cancel_orphaned_paper_orders, OrderTradeManager};
 use apex_core::application::risk_engine::{RiskConfig, RiskEngine};
 use apex_core::application::scanner::MarketScanner;
 use apex_core::bus::message_bus::{BusMessage, MessageBus, Topic};
-use apex_core::ports::execution::ExecutionPort;
 use apex_core::ports::market_data::MarketDataPort;
 use apex_core::ports::storage::StoragePort;
 
-fn env_var(name: &str) -> Option<String> {
-    let raw = std::env::var(name).ok()?;
-    let value = raw.trim();
-
-    if value.is_empty() || (value.starts_with("your_") && value.ends_with("_here")) {
-        return None;
-    }
-
-    Some(value.to_string())
-}
-
-enum ExecutionHandle {
-    Zerodha(Arc<ZerodhaExecutionAdapter>),
-    AngelOne(Arc<AngelOneExecutionAdapter>),
-    Groww(Arc<GrowwExecutionAdapter>),
-    Robinhood(Arc<RobinhoodExecutionAdapter>),
-    Binance(Arc<BinanceExecutionAdapter>),
-    Coinbase(Arc<CoinbaseExecutionAdapter>),
-}
-
-impl ExecutionHandle {
-    fn is_authenticated(&self) -> bool {
-        match self {
-            Self::Zerodha(adapter) => adapter.is_authenticated(),
-            Self::AngelOne(adapter) => adapter.is_authenticated(),
-            Self::Groww(adapter) => adapter.is_authenticated(),
-            Self::Robinhood(adapter) => adapter.is_authenticated(),
-            Self::Binance(adapter) => adapter.is_authenticated(),
-            Self::Coinbase(adapter) => adapter.is_authenticated(),
-        }
-    }
-
-    fn set_session_token(&self, token: &str) {
-        match self {
-            Self::Zerodha(adapter) => adapter.set_access_token(token.to_string()),
-            Self::AngelOne(adapter) => adapter.set_jwt_token(token.to_string()),
-            Self::Groww(adapter) => adapter.set_access_token(token.to_string()),
-            Self::Robinhood(adapter) => adapter.set_access_token(token.to_string()),
-            Self::Binance(_) => {} // Binance uses API key/secret, not session token
-            Self::Coinbase(_) => {} // Coinbase uses API key/secret/passphrase, not session token
-        }
-    }
-
-    fn clear_session_token(&self) {
-        match self {
-            Self::Zerodha(adapter) => adapter.clear_access_token(),
-            Self::AngelOne(adapter) => adapter.clear_jwt_token(),
-            Self::Groww(adapter) => adapter.clear_access_token(),
-            Self::Robinhood(adapter) => adapter.clear_access_token(),
-            Self::Binance(_) => {}
-            Self::Coinbase(_) => {}
-        }
-    }
-}
-
-enum MarketDataHandle {
-    Zerodha(Arc<ZerodhaKiteAdapter>),
-    AngelOne(Arc<AngelOneMarketDataAdapter>),
-    Groww(Arc<GrowwMarketDataAdapter>),
-    Robinhood(Arc<RobinhoodMarketDataAdapter>),
-    Binance(Arc<BinanceAdapter>),
-    Coinbase(Arc<CoinbaseAdapter>),
-    Polymarket(Arc<PolymarketAdapter>),
-}
-
-impl MarketDataHandle {
-    fn is_authenticated(&self) -> bool {
-        match self {
-            Self::Zerodha(adapter) => adapter.is_authenticated(),
-            Self::AngelOne(adapter) => adapter.is_authenticated(),
-            Self::Groww(adapter) => adapter.is_authenticated(),
-            Self::Robinhood(adapter) => adapter.is_authenticated(),
-            Self::Binance(_) => true, // Binance market data doesn't require auth
-            Self::Coinbase(_) => true, // Coinbase market data doesn't require auth
-            Self::Polymarket(_) => true, // Polymarket market data doesn't require auth
-        }
-    }
-
-    fn set_session_token(&self, token: &str) {
-        match self {
-            Self::Zerodha(adapter) => adapter.set_access_token(token.to_string()),
-            Self::AngelOne(adapter) => adapter.set_jwt_token(token.to_string()),
-            Self::Groww(adapter) => adapter.set_access_token(token.to_string()),
-            Self::Robinhood(adapter) => adapter.set_access_token(token.to_string()),
-            Self::Binance(_) => {}
-            Self::Coinbase(_) => {}
-            Self::Polymarket(_) => {}
-        }
-    }
-
-    fn clear_session_token(&self) {
-        match self {
-            Self::Zerodha(adapter) => adapter.clear_access_token(),
-            Self::AngelOne(adapter) => adapter.clear_jwt_token(),
-            Self::Groww(adapter) => adapter.clear_access_token(),
-            Self::Robinhood(adapter) => adapter.clear_access_token(),
-            Self::Binance(_) => {}
-            Self::Coinbase(_) => {}
-            Self::Polymarket(_) => {}
-        }
-    }
-}
-
-struct BrokerRuntimeEntry {
-    display_name: &'static str,
-    mode: &'static str,
-    token_label: Option<&'static str>,
-    config_hint: &'static str,
-    execution_available: bool,
-    market_data_available: bool,
-    execution: Option<ExecutionHandle>,
-    market_data: Option<MarketDataHandle>,
-}
-
-impl BrokerRuntimeEntry {
-    fn configured(&self) -> bool {
-        self.mode == "paper" || self.execution_available || self.market_data_available
-    }
-
-    fn authenticated(&self) -> bool {
-        if self.mode == "paper" {
-            return true;
-        }
-
-        let execution_auth = self
-            .execution
-            .as_ref()
-            .map(ExecutionHandle::is_authenticated)
-            .unwrap_or(false);
-        let market_auth = self
-            .market_data
-            .as_ref()
-            .map(MarketDataHandle::is_authenticated)
-            .unwrap_or(false);
-
-        execution_auth || market_auth
-    }
-
-    fn capability_summary(&self) -> &'static str {
-        match (self.execution_available, self.market_data_available) {
-            (true, true) => "live orders, account access, and market data",
-            (true, false) => "live orders and account access",
-            (false, true) => "live market data",
-            (false, false) => "live connectivity",
-        }
-    }
-
-    fn status_and_message(&self) -> (String, String) {
-        if self.mode == "paper" {
-            return (
-                "ready".to_string(),
-                "Paper trading is active for safe simulated execution.".to_string(),
-            );
-        }
-
-        if !self.configured() {
-            return (
-                "not_configured".to_string(),
-                format!(
-                    "Add {} to `.env` and restart the desktop app to enable {}.",
-                    self.config_hint, self.display_name
-                ),
-            );
-        }
-
-        if !self.authenticated() {
-            let token_label = self.token_label.unwrap_or("session token");
-            return (
-                "auth_required".to_string(),
-                format!(
-                    "{} is configured for {}. Paste a {} to enable live connectivity.",
-                    self.display_name,
-                    self.capability_summary(),
-                    token_label
-                ),
-            );
-        }
-
-        (
-            "connected".to_string(),
-            format!(
-                "{} is authenticated and ready for safe live data and account checks.",
-                self.display_name
-            ),
-        )
-    }
-
-    fn set_session_token(&self, token: &str) -> Result<()> {
-        if self.mode == "paper" {
-            return Err(anyhow!("Paper trading does not use a live session token"));
-        }
-
-        if !self.configured() {
-            return Err(anyhow!(
-                "{} is not configured. Add {} to `.env` and restart the desktop app.",
-                self.display_name,
-                self.config_hint
-            ));
-        }
-
-        let mut applied = false;
-
-        if let Some(execution) = &self.execution {
-            execution.set_session_token(token);
-            applied = true;
-        }
-
-        if let Some(market_data) = &self.market_data {
-            market_data.set_session_token(token);
-            applied = true;
-        }
-
-        if !applied {
-            return Err(anyhow!(
-                "{} does not expose a live session surface",
-                self.display_name
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn clear_session_token(&self) -> Result<()> {
-        if self.mode == "paper" {
-            return Ok(());
-        }
-
-        let mut cleared = false;
-
-        if let Some(execution) = &self.execution {
-            execution.clear_session_token();
-            cleared = true;
-        }
-
-        if let Some(market_data) = &self.market_data {
-            market_data.clear_session_token();
-            cleared = true;
-        }
-
-        if !cleared {
-            return Err(anyhow!(
-                "{} is not configured. Add {} to `.env` and restart the desktop app.",
-                self.display_name,
-                self.config_hint
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn to_dto(&self, broker_id: &str) -> crate::dto::BrokerConnectionDto {
-        let (status, message) = self.status_and_message();
-
-        crate::dto::BrokerConnectionDto {
-            broker_id: broker_id.to_string(),
-            display_name: self.display_name.to_string(),
-            mode: self.mode.to_string(),
-            status,
-            configured: self.configured(),
-            authenticated: self.authenticated(),
-            execution_available: self.execution_available,
-            market_data_available: self.market_data_available,
-            token_field_label: self.token_label.unwrap_or("").to_string(),
-            message,
-        }
-    }
+/// How a live order was authorised.
+pub enum LiveAuth<'a> {
+    /// A person confirmed it in the UI; carries the preview's confirmation id.
+    Manual(Option<&'a str>),
+    /// Placed by an automation rule or the AI copilot (gated separately by config).
+    Unattended,
 }
 
 /// Shared application state — initialised once at startup, shared across all IPC handlers.
@@ -311,6 +43,7 @@ pub struct AppState {
     pub aggregator: Arc<MarketDataAggregator>,
     pub otm: Arc<OrderTradeManager>,
     pub alerts: Arc<AlertEngine>,
+    pub alert_store: Arc<crate::commands::persistent_alerts::PersistentAlerts>,
     pub risk: Arc<RiskEngine>,
     pub bus: Arc<MessageBus>,
     pub storage: Arc<dyn StoragePort>,
@@ -335,7 +68,10 @@ pub struct AppState {
     pub copilot_tool_cache: std::sync::Mutex<HashMap<String, String>>,
     pub http: reqwest::Client,
     pub paper: Arc<PaperTradingAdapter>,
-    brokers: HashMap<String, BrokerRuntimeEntry>,
+    brokers: RwLock<HashMap<String, BrokerRuntimeEntry>>,
+    pub vault: Arc<Vault>,
+    pub live_guard: LiveTradingGuard,
+    market_data_feed: String,
     pub started_at: Instant,
 }
 
@@ -352,6 +88,8 @@ impl AppState {
         let config = AppConfig::load(&runtime_paths)?;
         let resolved_data_dir = config.resolved_data_dir(&runtime_paths)?;
         let storage = build_storage(&runtime_paths, &config).await?;
+        let cancelled = cancel_orphaned_paper_orders(storage.storage.as_ref()).await?;
+        if cancelled > 0 { tracing::info!(cancelled, "Cancelled paper orders from the previous session"); }
 
         tracing::info!(
             bundled_runtime = runtime_paths.is_bundled(),
@@ -371,7 +109,7 @@ impl AppState {
 
         let mut aggregator_inner = MarketDataAggregator::new(bus.clone());
         aggregator_inner.set_storage(storage.storage.clone());
-        let mut otm_inner = OrderTradeManager::new(risk.clone(), bus.clone());
+        let otm_inner = OrderTradeManager::new(risk.clone(), bus.clone());
         let mut brokers = HashMap::new();
 
         let yahoo_adapter = Arc::new(YahooFinanceAdapter::new());
@@ -381,312 +119,38 @@ impl AppState {
         // Register paper trading adapter — always available as default execution.
         let paper = Arc::new(PaperTradingAdapter::new());
         otm_inner.register_execution("paper".to_string(), paper.clone());
-        brokers.insert(
-            "paper".to_string(),
-            BrokerRuntimeEntry {
-                display_name: "Paper Trading",
-                mode: "paper",
-                token_label: None,
-                config_hint: "",
-                execution_available: true,
-                market_data_available: false,
-                execution: None,
-                market_data: None,
-            },
-        );
+        brokers.insert("paper".to_string(), paper_entry());
 
-        let zerodha_api_key = env_var("ZERODHA_API_KEY");
-        let zerodha_access_token = env_var("ZERODHA_ACCESS_TOKEN");
-        let mut zerodha_execution = None;
-        let mut zerodha_market_data = None;
-        let mut zerodha_execution_available = false;
-        let mut zerodha_market_data_available = false;
-
-        if let Some(api_key) = zerodha_api_key.clone() {
-            match ZerodhaExecutionAdapter::new(api_key.clone(), zerodha_access_token.clone()) {
-                Ok(adapter) => {
-                    let adapter = Arc::new(adapter);
-                    otm_inner.register_execution("zerodha".to_string(), adapter.clone());
-                    zerodha_execution = Some(ExecutionHandle::Zerodha(adapter));
-                    zerodha_execution_available = true;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "Failed to initialize Zerodha execution adapter");
-                }
+        // Live brokers start unconfigured; their adapters are built from the
+        // encrypted vault once it is unlocked (see `apply_all_brokers`).
+        let market_data_feed = config.market_data.adapter.clone();
+        for broker_id in CONFIGURABLE_BROKERS {
+            let built = build_broker(broker_id, &BrokerCredentials::default(), &market_data_feed)?;
+            if let Some(execution) = &built.execution {
+                otm_inner.register_execution(broker_id.to_string(), execution.clone());
             }
-
-            match ZerodhaKiteAdapter::new(api_key, zerodha_access_token.clone()) {
-                Ok(adapter) => {
-                    let adapter = Arc::new(adapter);
-                    aggregator_inner.add_adapter(adapter.clone());
-                    zerodha_market_data = Some(MarketDataHandle::Zerodha(adapter));
-                    zerodha_market_data_available = true;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "Failed to initialize Zerodha market data adapter");
-                }
+            if let Some(market_data) = &built.market_data {
+                aggregator_inner.add_adapter(market_data.clone());
             }
+            brokers.insert(broker_id.to_string(), built.entry);
         }
 
-        brokers.insert(
-            "zerodha".to_string(),
-            BrokerRuntimeEntry {
-                display_name: "Zerodha Kite",
-                mode: "live",
-                token_label: Some("Access Token"),
-                config_hint: "ZERODHA_API_KEY",
-                execution_available: zerodha_execution_available,
-                market_data_available: zerodha_market_data_available,
-                execution: zerodha_execution,
-                market_data: zerodha_market_data,
-            },
+        let vault = Arc::new(
+            Vault::open(&resolved_data_dir.join("vault.db")).map_err(|e| anyhow!(e))?,
         );
 
-        let angel_api_key = env_var("ANGEL_ONE_API_KEY");
-        let angel_client_code = env_var("ANGEL_ONE_CLIENT_CODE");
-        let angel_jwt_token = env_var("ANGEL_ONE_JWT_TOKEN");
-        let mut angel_execution = None;
-        let mut angel_market_data = None;
-        let mut angel_execution_available = false;
-        let mut angel_market_data_available = false;
-
-        if let (Some(api_key), Some(client_code)) = (angel_api_key, angel_client_code) {
-            match AngelOneExecutionAdapter::new(
-                api_key.clone(),
-                client_code,
-                angel_jwt_token.clone(),
-            ) {
-                Ok(adapter) => {
-                    let adapter = Arc::new(adapter);
-                    otm_inner.register_execution("angel_one".to_string(), adapter.clone());
-                    angel_execution = Some(ExecutionHandle::AngelOne(adapter));
-                    angel_execution_available = true;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "Failed to initialize Angel One execution adapter");
-                }
-            }
-
-            match AngelOneMarketDataAdapter::new(api_key, angel_jwt_token.clone()) {
-                Ok(adapter) => {
-                    let adapter = Arc::new(adapter);
-                    aggregator_inner.add_adapter(adapter.clone());
-                    angel_market_data = Some(MarketDataHandle::AngelOne(adapter));
-                    angel_market_data_available = true;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "Failed to initialize Angel One market data adapter");
-                }
-            }
-        }
-
-        brokers.insert(
-            "angel_one".to_string(),
-            BrokerRuntimeEntry {
-                display_name: "Angel One",
-                mode: "live",
-                token_label: Some("JWT Token"),
-                config_hint: "ANGEL_ONE_API_KEY and ANGEL_ONE_CLIENT_CODE",
-                execution_available: angel_execution_available,
-                market_data_available: angel_market_data_available,
-                execution: angel_execution,
-                market_data: angel_market_data,
-            },
-        );
-
-        let groww_api_key = env_var("GROWW_API_KEY");
-        let groww_access_token = env_var("GROWW_ACCESS_TOKEN");
-        let mut groww_execution = None;
-        let mut groww_market_data = None;
-        let mut groww_execution_available = false;
-        let mut groww_market_data_available = false;
-
-        if let Some(api_key) = groww_api_key {
-            match GrowwExecutionAdapter::new(api_key.clone(), groww_access_token.clone()) {
-                Ok(adapter) => {
-                    let adapter = Arc::new(adapter);
-                    otm_inner.register_execution("groww".to_string(), adapter.clone());
-                    groww_execution = Some(ExecutionHandle::Groww(adapter));
-                    groww_execution_available = true;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "Failed to initialize Groww execution adapter");
-                }
-            }
-
-            match GrowwMarketDataAdapter::new(api_key, groww_access_token.clone()) {
-                Ok(adapter) => {
-                    let adapter = Arc::new(adapter);
-                    aggregator_inner.add_adapter(adapter.clone());
-                    groww_market_data = Some(MarketDataHandle::Groww(adapter));
-                    groww_market_data_available = true;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "Failed to initialize Groww market data adapter");
-                }
-            }
-        }
-
-        brokers.insert(
-            "groww".to_string(),
-            BrokerRuntimeEntry {
-                display_name: "Groww",
-                mode: "live",
-                token_label: Some("Access Token"),
-                config_hint: "GROWW_API_KEY",
-                execution_available: groww_execution_available,
-                market_data_available: groww_market_data_available,
-                execution: groww_execution,
-                market_data: groww_market_data,
-            },
-        );
-
-        let robinhood_client_id = env_var("ROBINHOOD_CLIENT_ID");
-        let robinhood_access_token = env_var("ROBINHOOD_ACCESS_TOKEN");
-        let mut robinhood_execution = None;
-        let mut robinhood_market_data = None;
-        let mut robinhood_execution_available = false;
-        let mut robinhood_market_data_available = false;
-
-        if let Some(client_id) = robinhood_client_id {
-            match RobinhoodExecutionAdapter::new(client_id, robinhood_access_token.clone()) {
-                Ok(adapter) => {
-                    let adapter = Arc::new(adapter);
-                    otm_inner.register_execution("robinhood".to_string(), adapter.clone());
-                    robinhood_execution = Some(ExecutionHandle::Robinhood(adapter));
-                    robinhood_execution_available = true;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "Failed to initialize Robinhood execution adapter");
-                }
-            }
-        }
-
-        match RobinhoodMarketDataAdapter::new(robinhood_access_token.clone()) {
-            Ok(adapter) => {
-                let adapter = Arc::new(adapter);
-                aggregator_inner.add_adapter(adapter.clone());
-                robinhood_market_data = Some(MarketDataHandle::Robinhood(adapter));
-                robinhood_market_data_available = true;
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "Failed to initialize Robinhood market data adapter");
-            }
-        }
-
-        brokers.insert(
-            "robinhood".to_string(),
-            BrokerRuntimeEntry {
-                display_name: "Robinhood",
-                mode: "live",
-                token_label: Some("Access Token"),
-                config_hint:
-                    "ROBINHOOD_ACCESS_TOKEN (market data) and ROBINHOOD_CLIENT_ID (execution)",
-                execution_available: robinhood_execution_available,
-                market_data_available: robinhood_market_data_available,
-                execution: robinhood_execution,
-                market_data: robinhood_market_data,
-            },
-        );
-
-        // Binance - Crypto exchange
-        let binance_api_key = env_var("BINANCE_API_KEY");
-        let binance_api_secret = env_var("BINANCE_API_SECRET");
-        let mut binance_execution = None;
-        let mut binance_market_data = None;
-        let mut binance_execution_available = false;
-        let mut binance_market_data_available = false;
-
-        if let (Some(api_key), Some(api_secret)) = (binance_api_key, binance_api_secret) {
-            let adapter = Arc::new(BinanceExecutionAdapter::new(api_key, api_secret, false));
-            otm_inner.register_execution("binance".to_string(), adapter.clone());
-            binance_execution = Some(ExecutionHandle::Binance(adapter));
-            binance_execution_available = true;
-        }
-
-        // Binance market data doesn't require API keys
-        let binance_adapter = Arc::new(BinanceAdapter::new());
-        aggregator_inner.add_adapter(binance_adapter.clone());
-        binance_market_data = Some(MarketDataHandle::Binance(binance_adapter));
-        binance_market_data_available = true;
-
-        brokers.insert(
-            "binance".to_string(),
-            BrokerRuntimeEntry {
-                display_name: "Binance",
-                mode: "live",
-                token_label: Some("API Key"),
-                config_hint: "BINANCE_API_KEY and BINANCE_API_SECRET (execution only)",
-                execution_available: binance_execution_available,
-                market_data_available: binance_market_data_available,
-                execution: binance_execution,
-                market_data: binance_market_data,
-            },
-        );
-
-        // Coinbase Pro - Crypto exchange
-        let coinbase_api_key = env_var("COINBASE_API_KEY");
-        let coinbase_api_secret = env_var("COINBASE_API_SECRET");
-        let coinbase_passphrase = env_var("COINBASE_PASSPHRASE");
-        let mut coinbase_execution = None;
-        let mut coinbase_market_data = None;
-        let mut coinbase_execution_available = false;
-        let mut coinbase_market_data_available = false;
-
-        if let (Some(api_key), Some(api_secret), Some(passphrase)) =
-            (coinbase_api_key, coinbase_api_secret, coinbase_passphrase)
-        {
-            let adapter = Arc::new(CoinbaseExecutionAdapter::new(
-                api_key, api_secret, passphrase,
-            ));
-            otm_inner.register_execution("coinbase".to_string(), adapter.clone());
-            coinbase_execution = Some(ExecutionHandle::Coinbase(adapter));
-            coinbase_execution_available = true;
-        }
-
-        // Coinbase market data doesn't require API keys
-        let coinbase_adapter = Arc::new(CoinbaseAdapter::new());
-        aggregator_inner.add_adapter(coinbase_adapter.clone());
-        coinbase_market_data = Some(MarketDataHandle::Coinbase(coinbase_adapter));
-        coinbase_market_data_available = true;
-
-        brokers.insert(
-            "coinbase".to_string(),
-            BrokerRuntimeEntry {
-                display_name: "Coinbase Pro",
-                mode: "live",
-                token_label: Some("API Key"),
-                config_hint: "COINBASE_API_KEY, COINBASE_API_SECRET, and COINBASE_PASSPHRASE (execution only)",
-                execution_available: coinbase_execution_available,
-                market_data_available: coinbase_market_data_available,
-                execution: coinbase_execution,
-                market_data: coinbase_market_data,
-            },
-        );
-
-        // Polymarket - Prediction markets
-        let polymarket_adapter = Arc::new(PolymarketAdapter::new());
-        aggregator_inner.add_adapter(polymarket_adapter.clone());
-        let polymarket_market_data = Some(MarketDataHandle::Polymarket(polymarket_adapter));
-
-        brokers.insert(
-            "polymarket".to_string(),
-            BrokerRuntimeEntry {
-                display_name: "Polymarket",
-                mode: "live",
-                token_label: None,
-                config_hint: "",
-                execution_available: false,
-                market_data_available: true,
-                execution: None,
-                market_data: polymarket_market_data,
-            },
-        );
-
+        otm_inner.set_quote_cache(aggregator_inner.quote_cache());
         let aggregator = Arc::new(aggregator_inner);
         let otm = Arc::new(otm_inner);
+        // Pick up fills/cancels on live orders even without a broker push stream.
+        OrderTradeManager::start_live_order_sync(otm.clone(), std::time::Duration::from_secs(3));
 
         let alerts = Arc::new(AlertEngine::new(bus.clone()));
+        let alert_store = Arc::new(crate::commands::persistent_alerts::PersistentAlerts::load(
+            alerts.clone(),
+            aggregator.clone(),
+            resolved_data_dir.join("alerts.json"),
+        ).await);
         alerts.start();
 
         // Evaluate DailyPnl alert rules against the live session P&L whenever a
@@ -800,6 +264,7 @@ impl AppState {
             aggregator,
             otm,
             alerts,
+            alert_store,
             risk,
             bus,
             storage: storage.storage,
@@ -822,7 +287,10 @@ impl AppState {
                 .build()
                 .unwrap_or_default(),
             paper,
-            brokers,
+            brokers: RwLock::new(brokers),
+            vault,
+            live_guard: LiveTradingGuard::new(config.live.clone()),
+            market_data_feed,
             started_at: Instant::now(),
         })
     }
@@ -830,6 +298,8 @@ impl AppState {
     pub fn broker_connections(&self) -> Vec<crate::dto::BrokerConnectionDto> {
         let mut connections: Vec<_> = self
             .brokers
+            .read()
+            .expect("brokers lock poisoned")
             .iter()
             .map(|(broker_id, broker)| broker.to_dto(broker_id))
             .collect();
@@ -846,13 +316,15 @@ impl AppState {
 
     pub fn broker_connection(&self, broker_id: &str) -> Option<crate::dto::BrokerConnectionDto> {
         self.brokers
+            .read()
+            .expect("brokers lock poisoned")
             .get(broker_id)
             .map(|broker| broker.to_dto(broker_id))
     }
 
     pub fn set_broker_session(&self, broker_id: &str, session_token: &str) -> Result<()> {
-        let broker = self
-            .brokers
+        let brokers = self.brokers.read().expect("brokers lock poisoned");
+        let broker = brokers
             .get(broker_id)
             .ok_or_else(|| anyhow!("Unknown broker: {}", broker_id))?;
 
@@ -860,12 +332,259 @@ impl AppState {
     }
 
     pub fn clear_broker_session(&self, broker_id: &str) -> Result<()> {
-        let broker = self
-            .brokers
+        let brokers = self.brokers.read().expect("brokers lock poisoned");
+        let broker = brokers
             .get(broker_id)
             .ok_or_else(|| anyhow!("Unknown broker: {}", broker_id))?;
 
         broker.clear_session_token()
+    }
+
+    /// Persist a broker session token (encrypted) so a restart doesn't need a new login.
+    /// No-op when the vault is locked or the broker has no session token.
+    pub fn persist_session_token(
+        &self,
+        broker_id: &str,
+        token: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        let Some(field) = crate::broker_runtime::session_token_field(broker_id) else {
+            return Ok(());
+        };
+        if !self.vault.is_unlocked() {
+            return Ok(());
+        }
+        self.vault.set_secret(broker_id, field, token).map_err(|e| anyhow!(e))?;
+        self.set_token_expiry(broker_id, field, expires_at)
+    }
+
+    /// Remove a persisted session token.
+    pub fn forget_session_token(&self, broker_id: &str) -> Result<()> {
+        let Some(field) = crate::broker_runtime::session_token_field(broker_id) else {
+            return Ok(());
+        };
+        if !self.vault.is_unlocked() {
+            return Ok(());
+        }
+        self.vault.delete_secret(broker_id, field).map_err(|e| anyhow!(e))?;
+        self.set_token_expiry(broker_id, field, None)
+    }
+
+    fn set_token_expiry(
+        &self,
+        broker_id: &str,
+        field: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        let config = self.vault.get_config(broker_id).map_err(|e| anyhow!(e))?;
+        let enabled = config.as_ref().map(|c| c.enabled).unwrap_or(true);
+        let mut settings: serde_json::Map<String, serde_json::Value> = config
+            .and_then(|c| serde_json::from_str(&c.settings_json).ok())
+            .unwrap_or_default();
+        let key = format!("{field}_expires_at");
+        match expires_at {
+            Some(at) => settings.insert(key, serde_json::Value::String(at.to_rfc3339())),
+            None => settings.remove(&key),
+        };
+        self.vault
+            .set_config(broker_id, enabled, &serde_json::Value::Object(settings).to_string())
+            .map_err(|e| anyhow!(e))
+    }
+
+    /// Search Zerodha instruments (loading the master first if needed). Empty
+    /// when Zerodha is not connected.
+    pub async fn search_zerodha_instruments(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Vec<apex_adapters::kite::instruments::Instrument> {
+        let (instruments, session) = {
+            let brokers = self.brokers.read().expect("brokers lock poisoned");
+            let handle = brokers.get("zerodha").and_then(|b| b.market_data.as_ref());
+            (
+                handle.and_then(|h| h.instruments()),
+                handle.and_then(|h| h.kite_session()),
+            )
+        };
+        let (Some(instruments), Some(session)) = (instruments, session) else {
+            return Vec::new();
+        };
+        if session.is_authenticated() {
+            if let Err(error) = instruments.ensure_loaded(&session).await {
+                tracing::debug!(%error, "Could not load Kite instruments for search");
+            }
+        }
+        instruments.search(query, limit)
+    }
+
+    /// Submit an order, applying the live-trading safeguards to non-paper brokers.
+    /// Paper orders pass straight through.
+    pub async fn guarded_submit(
+        &self,
+        order: apex_core::domain::models::NewOrderRequest,
+        broker_id: &str,
+        auth: LiveAuth<'_>,
+    ) -> std::result::Result<apex_core::domain::models::OrderId, String> {
+        if broker_id == "paper" {
+            return self.otm.submit_order(order, broker_id).await.map_err(|e| e.to_string());
+        }
+        self.live_guard.check_order(&order)?;
+        if let LiveAuth::Manual(confirmation) = auth {
+            let id = confirmation.ok_or_else(|| {
+                "Order was not confirmed. Review and confirm it first.".to_string()
+            })?;
+            self.live_guard.consume_confirmation(id, broker_id, &order)?;
+        }
+        let slot = self.live_guard.reserve()?;
+        match self.otm.submit_order(order, broker_id).await {
+            Ok(id) => Ok(id),
+            Err(error) => {
+                slot.refund();
+                Err(error.to_string())
+            }
+        }
+    }
+
+    /// Emergency stop: disarm live trading, halt the risk engine and cancel
+    /// every working live order APEX knows about.
+    pub async fn kill_switch(&self) -> (Vec<String>, Vec<String>) {
+        use apex_core::domain::models::OrderStatus;
+        self.live_guard.set_armed(false);
+        self.risk.halt();
+        let working: Vec<_> = self
+            .otm
+            .open_orders()
+            .into_iter()
+            .filter(|o| {
+                o.broker_id != "paper"
+                    && matches!(
+                        o.status,
+                        OrderStatus::Pending | OrderStatus::Open | OrderStatus::PartiallyFilled
+                    )
+            })
+            .collect();
+        let (mut cancelled, mut failed) = (Vec::new(), Vec::new());
+        for order in working {
+            match self.otm.cancel_order(&order.id, &order.broker_id).await {
+                Ok(()) => cancelled.push(order.id.0.clone()),
+                Err(error) => failed.push(format!("{}: {error}", order.id.0)),
+            }
+        }
+        (cancelled, failed)
+    }
+
+    /// Decrypt one adapter's stored settings and secrets. Requires an unlocked vault.
+    pub fn load_broker_credentials(&self, broker_id: &str) -> Result<BrokerCredentials> {
+        let mut creds = BrokerCredentials::default();
+        if let Some(config) = self.vault.get_config(broker_id).map_err(|e| anyhow!(e))? {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(&config.settings_json)
+            {
+                for (key, value) in map {
+                    let text = match value {
+                        serde_json::Value::String(s) => s,
+                        serde_json::Value::Null => continue,
+                        other => other.to_string(),
+                    };
+                    creds.settings.insert(key, text);
+                }
+            }
+        }
+        for field in self.vault.secret_fields(broker_id).map_err(|e| anyhow!(e))? {
+            if let Some(value) = self.vault.get_secret(broker_id, &field).map_err(|e| anyhow!(e))? {
+                creds.secrets.insert(field, value);
+            }
+        }
+        Ok(creds)
+    }
+
+    /// (Re)build one broker from the vault and swap it into the running registries.
+    /// A disabled adapter is replaced by its unconfigured form.
+    pub async fn apply_broker(&self, broker_id: &str) -> Result<()> {
+        if !CONFIGURABLE_BROKERS.contains(&broker_id) {
+            return Err(anyhow!("Unknown broker: {}", broker_id));
+        }
+        let enabled = self
+            .vault
+            .get_config(broker_id)
+            .map_err(|e| anyhow!(e))?
+            .map(|config| config.enabled)
+            .unwrap_or(true);
+        let creds = if enabled {
+            self.load_broker_credentials(broker_id)?
+        } else {
+            BrokerCredentials::default()
+        };
+        let built = build_broker(broker_id, &creds, &self.market_data_feed)?;
+        self.replace_broker(broker_id, built).await;
+        Ok(())
+    }
+
+    /// Build every configurable broker from the vault (after unlock).
+    pub async fn apply_all_brokers(&self) {
+        for broker_id in CONFIGURABLE_BROKERS {
+            if let Err(error) = self.apply_broker(broker_id).await {
+                tracing::warn!(broker = broker_id, %error, "Failed to apply broker configuration");
+            }
+        }
+    }
+
+    /// Reset a broker to its unconfigured form, dropping any held credentials.
+    pub async fn reset_broker(&self, broker_id: &str) -> Result<()> {
+        let built = build_broker(broker_id, &BrokerCredentials::default(), &self.market_data_feed)?;
+        self.replace_broker(broker_id, built).await;
+        Ok(())
+    }
+
+    /// Lock the vault and drop every in-memory credential.
+    pub async fn lock_vault(&self) {
+        self.vault.lock();
+        for broker_id in CONFIGURABLE_BROKERS {
+            if let Err(error) = self.reset_broker(broker_id).await {
+                tracing::warn!(broker = broker_id, %error, "Failed to reset broker on lock");
+            }
+        }
+    }
+
+    async fn replace_broker(&self, broker_id: &str, built: BuiltBroker) {
+        let old_market_data_id = self
+            .brokers
+            .read()
+            .expect("brokers lock poisoned")
+            .get(broker_id)
+            .and_then(|entry| entry.market_data.as_ref().map(|handle| handle.adapter_id()));
+
+        self.otm.unregister_execution(broker_id);
+        if let Some(adapter_id) = old_market_data_id {
+            if let Some(old) = self.aggregator.remove_adapter(&adapter_id) {
+                let symbols = self.aggregator.requested_symbols();
+                if let Err(error) = old.unsubscribe(&symbols).await {
+                    tracing::debug!(adapter = %adapter_id, %error, "Unsubscribe on replace failed");
+                }
+            }
+        }
+
+        if let Some(execution) = built.execution {
+            self.otm.register_execution(broker_id.to_string(), execution);
+            self.otm.attach_order_stream(broker_id);
+        }
+        if let Some(handle) = &built.entry.market_data {
+            handle.start_background();
+        }
+        let has_market_data = built.market_data.is_some();
+        if let Some(market_data) = built.market_data {
+            self.aggregator.add_adapter(market_data);
+        }
+        self.brokers
+            .write()
+            .expect("brokers lock poisoned")
+            .insert(broker_id.to_string(), built.entry);
+
+        if has_market_data {
+            if let Err(error) = self.aggregator.sync_subscriptions().await {
+                tracing::warn!(broker = broker_id, %error, "Failed to subscribe symbols on new adapter");
+            }
+        }
     }
 
     /// Start real-time event push to the frontend.
@@ -876,16 +595,21 @@ impl AppState {
         // Forward quote updates
         let bus = self.bus.clone();
         let handle = app_handle.clone();
-        let paper = self.paper.clone();
+        let otm = self.otm.clone();
         tokio::spawn(async move {
             let mut rx = bus.subscribe(Topic::Quote("*".into()));
-            while let Ok(msg) = rx.recv().await {
-                if let BusMessage::QuoteData(quote) = msg {
-                    // Feed every streamed quote to the paper adapter so market
-                    // orders can fill; emit to the UI at the same time.
-                    paper.update_quote(&quote);
+            loop {
+                match rx.recv().await {
+                  Ok(BusMessage::QuoteData(quote)) => {
+                    // Matching and lifecycle updates are serialized by the order manager.
+                    if let Err(error) = otm.process_paper_quote(&quote).await {
+                        tracing::warn!(%error, "Paper quote processing failed");
+                    }
                     let dto = crate::dto::QuoteDto::from(&quote);
                     let _ = handle.emit("quote-update", &dto);
+                  }
+                  Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                  Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });

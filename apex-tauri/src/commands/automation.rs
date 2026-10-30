@@ -226,9 +226,13 @@ async fn run_rule(
         price: None,
         stop_price: None,
         tag: Some(format!("automation:{}", rule.id)),
+        broker_params: None,
     };
 
-    match state.otm.submit_order(order, &rule.broker_id).await {
+    match state
+        .guarded_submit(order, &rule.broker_id, crate::state::LiveAuth::Unattended)
+        .await
+    {
         Ok(id) => {
             state.automations.record_order(&rule.id);
             format!(

@@ -86,6 +86,7 @@ pub struct OrderDto {
     pub updated_at: String,
     pub broker_id: String,
     pub source: String,
+    pub rejection_reason: Option<String>,
 }
 
 impl From<&models::Order> for OrderDto {
@@ -105,6 +106,7 @@ impl From<&models::Order> for OrderDto {
             updated_at: o.updated_at.to_rfc3339(),
             broker_id: o.broker_id.clone(),
             source: o.source.clone(),
+            rejection_reason: o.rejection_reason.clone(),
         }
     }
 }
@@ -184,6 +186,9 @@ pub struct NewOrderRequestDto {
     pub stop_price: Option<f64>,
     pub broker_id: String,
     pub tag: Option<String>,
+    /// Broker margin product (e.g. Zerodha CNC/MIS/NRML); the broker default when absent.
+    #[serde(default)]
+    pub product: Option<String>,
 }
 
 /// Account balance DTO for frontend.
@@ -257,7 +262,7 @@ pub struct StorageSettingsDto {
 /// Appearance settings DTO (theme + density).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppearanceSettingsDto {
-    /// "dark" | "light"
+    /// "terminal" | "dark" | "light"
     pub theme: String,
     /// "comfortable" | "compact"
     pub density: String,
@@ -358,8 +363,8 @@ fn default_write_api_kind() -> String {
 impl Default for AppearanceSettingsDto {
     fn default() -> Self {
         Self {
-            theme: "dark".to_string(),
-            density: "comfortable".to_string(),
+            theme: "terminal".to_string(),
+            density: "compact".to_string(),
         }
     }
 }
@@ -601,6 +606,7 @@ mod tests {
             updated_at: Utc::now(),
             broker_id: "paper".into(),
             source: "manual".into(),
+            rejection_reason: None,
         };
         let dto = OrderDto::from(&order);
         assert_eq!(dto.id, "test-1");
@@ -710,4 +716,101 @@ mod tests {
         assert!(json.contains("Research"));
         assert!(json.contains("cell-1"));
     }
+}
+
+/// One input field in an adapter's configuration form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterFieldDto {
+    pub key: String,
+    pub label: String,
+    /// "text" | "secret" | "toggle"
+    pub kind: String,
+    pub required: bool,
+    pub help: String,
+}
+
+/// Describes an adapter so the UI can render its configuration form generically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterSchemaDto {
+    pub adapter_id: String,
+    pub display_name: String,
+    /// "broker" | "data" | "llm"
+    pub category: String,
+    pub description: String,
+    pub fields: Vec<AdapterFieldDto>,
+}
+
+/// Stored (non-secret) configuration for one adapter. Secrets are reported only
+/// as the names of fields that have a stored value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterConfigDto {
+    pub adapter_id: String,
+    pub enabled: bool,
+    pub settings: std::collections::HashMap<String, String>,
+    pub secrets_configured: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveAdapterConfigRequest {
+    pub adapter_id: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub settings: std::collections::HashMap<String, String>,
+    /// Only fields being set or replaced; omitted/empty values keep the stored secret.
+    #[serde(default)]
+    pub secrets: std::collections::HashMap<String, String>,
+    /// Secret fields to delete.
+    #[serde(default)]
+    pub clear_secrets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterTestResultDto {
+    pub adapter_id: String,
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvImportResultDto {
+    pub source: String,
+    pub imported: Vec<String>,
+}
+
+/// State of the live-trading safeguards.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveStatusDto {
+    pub armed: bool,
+    pub orders_today: u32,
+    pub max_orders_per_day: u32,
+    pub max_qty_per_order: f64,
+    pub halted: bool,
+}
+
+/// Result of previewing an order. Live orders carry a short-lived confirmation id
+/// that `place_order` requires.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderPreviewDto {
+    pub broker_id: String,
+    pub live: bool,
+    pub estimated_value: Option<f64>,
+    pub confirmation_id: Option<String>,
+    pub expires_in_secs: u64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KillSwitchResultDto {
+    pub cancelled: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+/// One match in the symbol picker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolSearchResultDto {
+    pub symbol: String,
+    pub name: String,
+    pub exchange: String,
+    /// Where the match came from: "zerodha" or "yahoo".
+    pub source: String,
 }

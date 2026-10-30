@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod adapters;
 pub mod alerts;
 pub mod automation;
 pub mod brokers;
@@ -6,15 +7,20 @@ pub mod copilot;
 pub mod data;
 pub mod graph;
 pub mod health;
+pub mod live;
 pub mod market;
 pub mod ml;
 pub mod news;
 pub mod notebook;
 pub mod orderbook;
 pub mod orders;
+pub mod persistent_alerts;
 pub mod python_runtime;
 pub mod quant;
 pub mod risk;
 pub mod scanner;
 pub mod settings;
 pub mod strategy;
+pub mod vault;
+
+pub mod strategy_worker;

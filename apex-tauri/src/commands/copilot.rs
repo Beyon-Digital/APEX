@@ -180,11 +180,15 @@ struct ResolvedProvider {
     max_tokens: u32,
 }
 
-fn env_key(name: &str) -> Option<String> {
-    if name.trim().is_empty() {
-        return None;
+/// API key for an LLM provider, read from the encrypted vault (`llm:<id>`).
+fn vault_key(state: &AppState, provider_id: &str) -> Result<Option<String>, String> {
+    if !state.vault.is_unlocked() {
+        return Err("Vault is locked. Unlock it to use the LLM provider.".to_string());
     }
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    Ok(state
+        .vault
+        .get_secret(&format!("llm:{provider_id}"), "api_key")?
+        .filter(|v| !v.trim().is_empty()))
 }
 
 fn resolve_provider(state: &AppState) -> Result<ResolvedProvider, String> {
@@ -212,7 +216,7 @@ fn resolve_provider(state: &AppState) -> Result<ResolvedProvider, String> {
             base_url,
             model: provider.model.clone(),
             api_kind: provider.api_kind.clone(),
-            api_key: env_key(&provider.api_key_env).unwrap_or_default(),
+            api_key: vault_key(state, &provider.id)?.unwrap_or_default(),
             // 0 = "use the legacy [copilot] limit" (see LlmProviderConfig docs)
             max_tokens: if provider.max_tokens == 0 {
                 state.copilot.max_tokens
@@ -222,18 +226,15 @@ fn resolve_provider(state: &AppState) -> Result<ResolvedProvider, String> {
         });
     }
 
-    // Legacy fallback: [copilot] section + OPEN_ROUTER env var.
+    // Legacy fallback: [copilot] section + the `llm:copilot` vault key.
     if !state.copilot.enabled {
         return Err(
             "Copilot is disabled — enable it in settings or configure an LLM provider".to_string(),
         );
     }
-    let api_key = ["OPEN_ROUTER", "OPENROUTER_API_KEY"]
-        .iter()
-        .find_map(|n| env_key(n))
-        .ok_or_else(|| {
-            "No LLM provider configured — set OPEN_ROUTER or add a provider in Settings".to_string()
-        })?;
+    let api_key = vault_key(state, "copilot")?.ok_or_else(|| {
+        "No LLM provider configured — add an API key under Settings > Adapters".to_string()
+    })?;
     let base_url = state
         .copilot
         .base_url
@@ -785,9 +786,12 @@ async fn exec_tool(
                 other => return Err(format!("invalid order_type `{other}`")),
             };
 
+            if broker_id == "paper" && order_type != OrderType::Market {
+                state.aggregator.start(&[Symbol(symbol.clone())]).await
+                    .map_err(|e| format!("Could not subscribe to market data for paper order: {e}"))?;
+            }
             let id = state
-                .otm
-                .submit_order(
+                .guarded_submit(
                     NewOrderRequest {
                         symbol: Symbol(symbol.clone()),
                         side,
@@ -796,11 +800,12 @@ async fn exec_tool(
                         price: args.get("price").and_then(|v| v.as_f64()),
                         stop_price: args.get("stop_price").and_then(|v| v.as_f64()),
                         tag: Some("copilot".into()),
+                        broker_params: None,
                     },
                     &broker_id,
+                    crate::state::LiveAuth::Unattended,
                 )
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             Ok(json!({"order_id": id.0, "symbol": symbol, "broker_id": broker_id}))
         }
         "cancel_order" => {
@@ -914,18 +919,18 @@ async fn exec_tool(
             };
             let id = uuid::Uuid::new_v4().to_string();
             state
-                .alerts
-                .add_rule(StoredAlert {
+                .alert_store
+                .add(StoredAlert {
                     id: id.clone(),
                     rule,
                     delivery: vec![AlertDelivery::InApp],
                     enabled: true,
                 })
-                .await;
+                .await?;
             Ok(json!({"alert_id": id, "symbol": symbol}))
         }
         "list_alerts" => {
-            let rules = state.alerts.get_rules().await;
+            let rules = state.alert_store.list().await?;
             Ok(
                 json!({"count": rules.len(), "alerts": rules.iter().map(|r| {
                 json!({"id": r.id, "enabled": r.enabled,
@@ -935,7 +940,7 @@ async fn exec_tool(
         }
         "remove_alert" => {
             let id = arg_str(args, "id")?;
-            if !state.alerts.remove_rule(id).await {
+            if !state.alert_store.remove(id).await? {
                 return Err(format!("no alert `{id}`"));
             }
             Ok(json!({"removed": id}))

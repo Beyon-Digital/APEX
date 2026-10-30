@@ -32,6 +32,8 @@ pub struct AppConfig {
     pub acp: AcpConfig,
     #[serde(default)]
     pub automations: AutomationsConfig,
+    #[serde(default)]
+    pub live: LiveConfig,
 }
 
 impl AppConfig {
@@ -131,7 +133,7 @@ fn resolve_runtime_dir(
 /// UI appearance: theme + density.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppearanceConfig {
-    /// "dark" or "light".
+    /// "terminal", "dark" or "light".
     #[serde(default = "default_theme")]
     pub theme: String,
     /// "comfortable" or "compact".
@@ -201,6 +203,34 @@ impl Default for AcpConfig {
         Self {
             command: String::new(),
             cwd: String::new(),
+        }
+    }
+}
+
+/// Limits applied to every order sent to a live (non-paper) broker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveConfig {
+    /// Orders allowed per UTC day across all live brokers.
+    #[serde(default = "default_live_max_orders")]
+    pub max_orders_per_day: u32,
+    /// Largest quantity allowed in a single live order.
+    #[serde(default = "default_live_max_qty")]
+    pub max_qty_per_order: f64,
+}
+
+fn default_live_max_orders() -> u32 {
+    50
+}
+
+fn default_live_max_qty() -> f64 {
+    1000.0
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self {
+            max_orders_per_day: default_live_max_orders(),
+            max_qty_per_order: default_live_max_qty(),
         }
     }
 }
@@ -473,11 +503,11 @@ fn default_max_daily_loss() -> f64 {
 }
 
 fn default_theme() -> String {
-    "dark".to_string()
+    "terminal".to_string()
 }
 
 fn default_density() -> String {
-    "comfortable".to_string()
+    "compact".to_string()
 }
 
 fn default_api_kind() -> String {
