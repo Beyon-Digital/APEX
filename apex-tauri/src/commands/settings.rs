@@ -13,26 +13,36 @@ use crate::dto::{
 };
 use crate::state::AppState;
 
-const EXECUTION_ADAPTERS: &[&str] = &["paper", "zerodha", "angel_one", "groww", "robinhood"];
+const EXECUTION_ADAPTERS: &[&str] = &[
+    "paper",
+    "zerodha",
+    "angel_one",
+    "groww",
+    "robinhood",
+    "binance",
+    "coinbase",
+];
 const MARKET_DATA_ADAPTERS: &[&str] = &[
     "yahoo_finance",
     "zerodha",
     "angel_one",
     "groww",
     "robinhood",
+    "binance",
+    "coinbase",
+    "polymarket",
 ];
 const STORAGE_BACKENDS: &[&str] = &["sqlite", "timescale"];
-const THEMES: &[&str] = &["dark", "light"];
+const THEMES: &[&str] = &["terminal", "dark", "light"];
 const DENSITIES: &[&str] = &["comfortable", "compact"];
 const LLM_API_KINDS: &[&str] = &["chat", "responses", "acp"];
 
-/// Whether the named env var resolves to a non-empty value (never exposes it).
-fn env_key_present(name: &str) -> bool {
-    if name.trim().is_empty() {
-        return false;
-    }
-    std::env::var(name)
-        .map(|v| !v.trim().is_empty())
+/// Whether the vault holds an API key for this LLM provider (never exposes it).
+fn key_stored(state: &AppState, provider_id: &str) -> bool {
+    state
+        .vault
+        .secret_fields(&format!("llm:{provider_id}"))
+        .map(|fields| fields.iter().any(|f| f == "api_key"))
         .unwrap_or(false)
 }
 
@@ -121,7 +131,7 @@ fn build_settings_dto(
                     api_kind: p.api_kind.clone(),
                     api_key_env: p.api_key_env.clone(),
                     max_tokens: p.max_tokens,
-                    key_configured: env_key_present(&p.api_key_env),
+                    key_configured: key_stored(state, &p.id),
                 })
                 .collect(),
         },

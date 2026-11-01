@@ -1,4 +1,4 @@
-use crate::dto::{OHLCVDto, QuoteDto};
+use crate::dto::{OHLCVDto, QuoteDto, SymbolSearchResultDto};
 use crate::state::AppState;
 use crate::validation;
 use apex_core::domain::models::Symbol;
@@ -12,7 +12,7 @@ pub async fn get_quote(symbol: String, state: State<'_, AppState>) -> Result<Quo
 
     state
         .aggregator
-        .get_cached_quote(&symbol)
+        .get_display_quote(&symbol)
         .map(|q| QuoteDto::from(&q))
         .ok_or_else(|| format!("No quote available for {}", symbol))
 }
@@ -82,4 +82,78 @@ pub async fn subscribe_symbols(
         .start(&syms)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Stop streaming symbols that were removed from the watchlist.
+#[tauri::command]
+pub async fn unsubscribe_symbols(
+    symbols: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    for symbol in &symbols {
+        validation::validate_symbol(symbol)?;
+    }
+    let syms: Vec<Symbol> = symbols.into_iter().map(Symbol).collect();
+    state.aggregator.unsubscribe(&syms).await;
+    Ok(())
+}
+
+/// Symbol picker search: Zerodha instruments when connected, plus Yahoo Finance.
+#[tauri::command]
+pub async fn search_symbols(
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SymbolSearchResultDto>, String> {
+    const LIMIT: usize = 12;
+    let query = query.trim().to_string();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    validation::validate_string_length(&query, "query")?;
+
+    let mut results: Vec<SymbolSearchResultDto> = state
+        .search_zerodha_instruments(&query, LIMIT)
+        .await
+        .into_iter()
+        .map(|i| SymbolSearchResultDto {
+            symbol: i.apex_symbol(),
+            name: i.name.clone(),
+            exchange: i.exchange.clone(),
+            source: "zerodha".to_string(),
+        })
+        .collect();
+
+    if let Ok(response) = state
+        .http
+        .get("https://query1.finance.yahoo.com/v1/finance/search")
+        .query(&[("q", query.as_str()), ("quotesCount", "10"), ("newsCount", "0")])
+        .timeout(std::time::Duration::from_secs(4))
+        .send()
+        .await
+    {
+        if let Ok(body) = response.json::<serde_json::Value>().await {
+            for quote in body.get("quotes").and_then(|q| q.as_array()).into_iter().flatten() {
+                let Some(symbol) = quote.get("symbol").and_then(|s| s.as_str()) else { continue };
+                if validation::validate_symbol(symbol).is_err() {
+                    continue;
+                }
+                let name = ["longname", "shortname"]
+                    .iter()
+                    .find_map(|k| quote.get(*k).and_then(|v| v.as_str()))
+                    .unwrap_or_default();
+                let exchange = quote.get("exchDisp").and_then(|v| v.as_str()).unwrap_or_default();
+                results.push(SymbolSearchResultDto {
+                    symbol: symbol.to_string(),
+                    name: name.to_string(),
+                    exchange: exchange.to_string(),
+                    source: "yahoo".to_string(),
+                });
+            }
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|r| seen.insert(r.symbol.to_uppercase()));
+    results.truncate(LIMIT);
+    Ok(results)
 }

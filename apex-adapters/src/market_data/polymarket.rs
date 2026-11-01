@@ -36,7 +36,9 @@ impl PolymarketAdapter {
 
         Self {
             client,
-            status: Arc::new(RwLock::new(AdapterHealth::Healthy)),
+            status: Arc::new(RwLock::new(AdapterHealth::Degraded(
+                "Waiting for a supported symbol".into(),
+            ))),
             subscribed_symbols: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -180,7 +182,11 @@ impl Default for PolymarketAdapter {
 
 #[async_trait]
 impl MarketDataPort for PolymarketAdapter {
+    fn supports_symbol(&self, symbol: &Symbol) -> bool {
+        !symbol.0.is_empty() && symbol.0.chars().all(|c| c.is_ascii_digit())
+    }
     async fn subscribe(&self, symbols: &[Symbol]) -> Result<TickStream> {
+        *self.status.write().await = AdapterHealth::Degraded("Connecting".into());
         let (tx, rx) = mpsc::channel(1024);
         let status = self.status.clone();
         let symbols: Vec<Symbol> = symbols.to_vec();
@@ -250,6 +256,7 @@ impl MarketDataPort for PolymarketAdapter {
                                     }
                                     Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => {
                                         info!("Polymarket WebSocket closed");
+                                        *status.write().await = AdapterHealth::Degraded("Connection closed; retry on next subscription".into());
                                         break;
                                     }
                                     Some(Err(e)) => {
@@ -259,6 +266,7 @@ impl MarketDataPort for PolymarketAdapter {
                                     }
                                     None => {
                                         info!("WebSocket stream ended");
+                                        *status.write().await = AdapterHealth::Degraded("Connection ended; retry on next subscription".into());
                                         break;
                                     }
                                     Some(Ok(_)) => {}
@@ -407,6 +415,9 @@ mod tests {
     #[test]
     fn test_health_default() {
         let adapter = PolymarketAdapter::new();
-        assert_eq!(adapter.health(), AdapterHealth::Healthy);
+        assert_eq!(
+            adapter.health(),
+            AdapterHealth::Degraded("Waiting for a supported symbol".into())
+        );
     }
 }

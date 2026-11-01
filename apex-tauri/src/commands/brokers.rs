@@ -26,6 +26,9 @@ pub async fn set_broker_session(
     state
         .set_broker_session(&broker_id, session_token.trim())
         .map_err(|err| err.to_string())?;
+    state
+        .persist_session_token(&broker_id, session_token.trim(), None)
+        .map_err(|err| err.to_string())?;
 
     state
         .broker_connection(&broker_id)
@@ -36,30 +39,33 @@ pub async fn set_broker_session(
 /// redirect `https://kite.trade/connect/login?api_key=…`) for a daily
 /// `access_token` and install it on the Zerodha adapters.
 ///
-/// Requires `ZERODHA_API_KEY` + `ZERODHA_API_SECRET` env vars (the secret
-/// never leaves this call). The Kite checksum is
-/// `sha256(api_key + request_token + api_secret)`.
+/// The API key and secret come from the vault (the secret never leaves this
+/// call). The Kite checksum is `sha256(api_key + request_token + api_secret)`.
+/// Accepts either the bare token or the full redirect URL.
 #[tauri::command]
 pub async fn zerodha_login(
     request_token: String,
     state: State<'_, AppState>,
 ) -> Result<BrokerConnectionDto, String> {
-    let request_token = request_token.trim();
+    let request_token = extract_request_token(&request_token);
+    let request_token = request_token.as_str();
     if request_token.is_empty() || request_token.len() > 256 {
         return Err("Invalid request_token".to_string());
     }
-    let api_key = std::env::var("ZERODHA_API_KEY")
-        .ok()
+    if !state.vault.is_unlocked() {
+        return Err("Vault is locked. Unlock it to log in to Zerodha.".to_string());
+    }
+    let api_key = state
+        .vault
+        .get_secret("zerodha", "api_key")?
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "Zerodha API key not set. Add it under Settings > Adapters.".to_string())?;
+    let api_secret = state
+        .vault
+        .get_secret("zerodha", "api_secret")?
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| {
-            "ZERODHA_API_KEY env var not set — configure it and restart the app".to_string()
-        })?;
-    let api_secret = std::env::var("ZERODHA_API_SECRET")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| {
-            "ZERODHA_API_SECRET env var not set — required to exchange the request token"
-                .to_string()
+            "Zerodha API secret not set. It is required to exchange the request token.".to_string()
         })?;
 
     let checksum = hex::encode(
@@ -109,6 +115,13 @@ pub async fn zerodha_login(
         .set_broker_session("zerodha", &token)
         .map_err(|e| e.to_string())?;
     state
+        .persist_session_token(
+            "zerodha",
+            &token,
+            Some(crate::broker_runtime::kite_token_expiry(chrono::Utc::now())),
+        )
+        .map_err(|e| e.to_string())?;
+    state
         .broker_connection("zerodha")
         .ok_or_else(|| "Unknown broker: zerodha".to_string())
 }
@@ -124,8 +137,56 @@ pub async fn clear_broker_session(
     state
         .clear_broker_session(&broker_id)
         .map_err(|err| err.to_string())?;
+    state
+        .forget_session_token(&broker_id)
+        .map_err(|err| err.to_string())?;
 
     state
         .broker_connection(&broker_id)
         .ok_or_else(|| format!("Unknown broker: {}", broker_id))
+}
+
+/// Kite login URL for the stored API key, to open in the user's browser.
+#[tauri::command]
+pub async fn zerodha_login_url(state: State<'_, AppState>) -> Result<String, String> {
+    if !state.vault.is_unlocked() {
+        return Err("Vault is locked. Unlock it first.".to_string());
+    }
+    let api_key = state
+        .vault
+        .get_secret("zerodha", "api_key")?
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "Zerodha API key not set. Add it under Settings > Adapters.".to_string())?;
+    Ok(format!(
+        "https://kite.zerodha.com/connect/login?v=3&api_key={}",
+        api_key.trim()
+    ))
+}
+
+/// Accept either a bare request token or the full redirect URL containing
+/// `request_token=…`.
+fn extract_request_token(input: &str) -> String {
+    let input = input.trim();
+    if let Some(query) = input.split('?').nth(1) {
+        for pair in query.split(['&', '#']) {
+            if let Some(value) = pair.strip_prefix("request_token=") {
+                return value.trim().to_string();
+            }
+        }
+    }
+    input.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_request_token;
+
+    #[test]
+    fn extracts_token_from_redirect_url() {
+        assert_eq!(
+            extract_request_token("http://127.0.0.1/?action=login&type=login&status=success&request_token=abc123&x=1"),
+            "abc123"
+        );
+        assert_eq!(extract_request_token("  abc123 "), "abc123");
+    }
 }

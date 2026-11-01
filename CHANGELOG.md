@@ -7,6 +7,16 @@ The format is based on "Keep a Changelog" and this project adheres to [Semantic 
 ## [Unreleased]
 
 ### Added
+- **Encrypted credential vault**: broker and AI API keys are entered in the app (Settings > Adapters & API keys) and stored in `vault.db`, encrypted with a passphrase-derived key (Argon2id + XChaCha20-Poly1305). Adapters are built from the vault and hot-added, replaced or removed at runtime with no restart; locking the vault drops every in-memory credential. A one-time "Import .env" command migrates old env files. Env-var credentials are no longer read.
+- **Live Zerodha Kite**: form-encoded orders with correct SL/SL-M mapping, product/exchange/variety, order history and status mapping, positions, holdings, margins and P&L; instruments master; KiteTicker WebSocket (binary packets, order postbacks) with batched REST fallback; token-based historical candles; rate limiting, retries and `TokenException` handling; daily login flow with token persisted until 06:00 IST.
+- **Live-trading safeguards**: explicit arm toggle (disarms on restart), single-use order confirmation bound to the exact order, per-day order and per-order quantity caps (`[live]` config), kill switch (Ctrl+Shift+K) that halts trading and cancels working live orders. Automations and the AI copilot go through the same guard.
+- **Live order sync**: broker-pushed and polled order updates drive fills, positions and live realized P&L into the risk engine; live market orders are valued from the quote cache and rejected without a quote.
+- **Terminal UI**: amber-on-black terminal theme (new default, dense), tiled draggable multi-panel workspace with Trading/Research/Monitor presets, symbol search with autocomplete (broker instruments + Yahoo), command-bar `ADD`/`RM`, history, suggestions and Ctrl+K.
+
+### Changed
+- Watchlist symbols added after launch are now subscribed (and removed ones released); index, FX and futures-style symbols (`^GSPC`, `EURUSD=X`, `GC=F`) pass validation.
+- When several feeds stream the same symbol, the higher-priority (broker) feed wins over delayed Yahoo data.
+
 - **AI Copilot**: OpenRouter-backed assistant panel with live terminal context (positions, watchlist quotes, session P&L injected into the system prompt). `copilot_chat` IPC command, `OPEN_ROUTER` / `OPENROUTER_API_KEY` env var, `[copilot]` config section, default model `openrouter/free`
 - **News Panel**: Center-tab news feed backed by the previously dormant NewsEngine — RSS polling wired into `AppState`, `news-item` Tauri event stream, `get_news` / `search_news` / `list_news_feeds` commands, symbol filter + keyword search UI
 - **Order Blotter**: `get_orders` command merging persisted order history with in-memory open orders; blotter tab with cancel support for working orders

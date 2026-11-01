@@ -1,11 +1,15 @@
+import { listen } from '@tauri-apps/api/event';
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import Editor, { type OnMount } from '@monaco-editor/react';
+import '../../lib/monacoSetup';
 import type { editor } from 'monaco-editor';
 import {
   createStrategyFile,
   listStrategyFiles,
   runStrategyBacktest,
   runStrategyFile,
+  stopStrategyFile,
+  listStrategySessions,
   saveStrategyFile,
 } from '../../lib/tauri';
 import type { StrategyBacktestRequestDto, StrategyBacktestResultDto, StrategyExecutionResultDto } from '../../lib/types';
@@ -32,7 +36,6 @@ interface StrategyIDEProps {
   initialFiles?: StrategyFile[];
   onRun?: (file: StrategyFile) => void;
   onStop?: () => void;
-  onRestart?: () => void;
   onSave?: (file: StrategyFile) => void;
   metrics?: StrategyMetrics;
 }
@@ -119,13 +122,15 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
   initialFiles,
   onRun,
   onStop,
-  onRestart,
   onSave,
   metrics,
 }) => {
   const [files, setFiles] = useState<StrategyFile[]>(initialFiles ?? DEFAULT_FILES);
   const [activeFileIndex, setActiveFileIndex] = useState(0);
+  const [activeSessions, setActiveSessions] = useState<string[]>([]);
+  const runningPathRef = useRef<string | null>(null);
   const [runState, setRunState] = useState<RunState>('idle');
+  const [paperQuantity, setPaperQuantity] = useState(1);
   const [output, setOutput] = useState<string[]>([]);
   const [saveConfirm, setSaveConfirm] = useState(false);
   const [isLoadingFiles, setIsLoadingFiles] = useState(!initialFiles);
@@ -135,10 +140,30 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     () => createDefaultBacktestConfig(defaultSymbol),
   );
   const [backtestResult, setBacktestResult] = useState<StrategyBacktestResultDto | null>(null);
+  const [backtestResultKey, setBacktestResultKey] = useState('');
   const editorRef = useRef<EditorInstance | null>(null);
+  const editorContainerRef = useRef<HTMLDivElement>(null);
   const outputRef = useRef<HTMLDivElement>(null);
+  const saveCurrentFileRef = useRef<() => void>(() => {});
 
   const activeFile = files[activeFileIndex];
+  const backtestKey = JSON.stringify([activeFile?.path, activeFile?.content, backtestConfig]);
+  const backtestValidation = !backtestConfig.symbol.trim() ? 'Enter a symbol.'
+    : !backtestConfig.from || !backtestConfig.to ? 'Choose both dates.'
+      : backtestConfig.from >= backtestConfig.to ? 'Start date must be earlier than end date.'
+        : !Number.isFinite(backtestConfig.quantity) || (backtestConfig.quantity ?? 0) <= 0 ? 'Trade size must be greater than zero.'
+          : !Number.isFinite(backtestConfig.initial_capital) || (backtestConfig.initial_capital ?? 0) <= 0 ? 'Initial capital must be greater than zero.'
+            : (backtestConfig.commission_bps ?? 0) < 0 || (backtestConfig.slippage_bps ?? 0) < 0 ? 'Commission and slippage cannot be negative.'
+              : null;
+  useEffect(() => {
+    let disposed = false;
+    const refresh = async () => {
+      try { const paths = await listStrategySessions(); if (!disposed && Array.isArray(paths)) setActiveSessions(paths); } catch { /* Browser fixtures do not run native sessions. */ }
+    };
+    void refresh();
+    const timer = setInterval(() => void refresh(), 2000);
+    return () => { disposed = true; clearInterval(timer); };
+  }, []);
 
   const replaceFileInState = useCallback((file: StrategyFile) => {
     setFiles((prev) => {
@@ -172,6 +197,30 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     }
     return saved;
   }, [onSave, replaceFileInState]);
+
+  const handleSave = useCallback(() => {
+    const updated = currentEditorFile();
+    if (!updated) return;
+    void persistFile(updated, true).catch((err) => {
+      setStrategyError(err instanceof Error ? err.message : 'Failed to save strategy');
+    });
+  }, [currentEditorFile, persistFile]);
+
+  useEffect(() => {
+    saveCurrentFileRef.current = handleSave;
+  }, [handleSave]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's' && !event.repeat && event.target instanceof Node && editorContainerRef.current?.contains(event.target)) {
+        event.preventDefault();
+        event.stopPropagation();
+        saveCurrentFileRef.current();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, []);
 
   useEffect(() => {
     if (!defaultSymbol) {
@@ -207,7 +256,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         setStrategyError(null);
       } catch (err) {
         if (cancelled) return;
-        setFiles(DEFAULT_FILES);
+        setFiles([]);
         setActiveFileIndex(0);
         setStrategyError(err instanceof Error ? err.message : 'Failed to load strategy files');
       } finally {
@@ -224,21 +273,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
 
   const handleEditorMount: OnMount = useCallback((editor) => {
     editorRef.current = editor;
-
-    // Ctrl+S save
-    editor.addCommand(
-      // Monaco KeyMod.CtrlCmd | Monaco KeyCode.KeyS
-      2048 | 49, // KeyMod.CtrlCmd | KeyCode.KeyS
-      () => {
-        const updated = currentEditorFile();
-        if (updated) {
-          void persistFile(updated, true).catch((err) => {
-            setStrategyError(err instanceof Error ? err.message : 'Failed to save strategy');
-          });
-        }
-      },
-    );
-  }, [currentEditorFile, persistFile]);
+  }, []);
 
   const handleEditorChange = useCallback(
     (value: string | undefined) => {
@@ -266,19 +301,30 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     }
   }, [appendOutput]);
 
+  useEffect(() => {
+    let disposed = false;
+    let cleanup: (() => void) | undefined;
+    void listen<{path: string; line: string}>('strategy-output', (event) => {
+      appendOutput(`[${event.payload.path}] ${event.payload.line}`);
+    }).then((unlisten) => { if (disposed) unlisten(); else cleanup = unlisten; }).catch(() => {});
+    return () => { disposed = true; cleanup?.(); };
+  }, [appendOutput]);
+
   const handleRun = useCallback(async () => {
     const fileToRun = currentEditorFile();
-    if (!fileToRun) return;
+    if (!fileToRun || !Number.isFinite(paperQuantity) || paperQuantity <= 0) return;
 
+    runningPathRef.current = fileToRun.path;
     setRunState('running');
     setStrategyError(null);
     appendOutput(`[${new Date().toLocaleTimeString()}] ▶ Running ${fileToRun.name}...`);
 
     try {
       const savedFile = await persistFile(fileToRun);
-      const result = await runStrategyFile(savedFile.path);
+      const result = await runStrategyFile(savedFile.path, { quantity: paperQuantity });
       appendResult(result);
       onRun?.(savedFile);
+      runningPathRef.current = null;
       setRunState(result.success ? 'stopped' : 'error');
       if (!result.success) {
         setStrategyError(result.error ?? 'Strategy execution failed');
@@ -287,25 +333,22 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
       const message = err instanceof Error ? err.message : 'Strategy execution failed';
       setStrategyError(message);
       appendOutput(`Error: ${message}`);
+      runningPathRef.current = null;
       setRunState('error');
     }
-  }, [appendOutput, appendResult, currentEditorFile, onRun, persistFile]);
+  }, [appendOutput, appendResult, currentEditorFile, onRun, persistFile, paperQuantity]);
 
   const handleStop = useCallback(async () => {
-    setRunState('stopped');
-    appendOutput(`[${new Date().toLocaleTimeString()}] ■ Strategy stopped`);
+    const path = currentEditorFile()?.path;
+    if (!path || !activeSessions.includes(path)) return;
+    try { await stopStrategyFile(path); } catch (err) { setStrategyError(String(err)); return; }
+    appendOutput(`[${new Date().toLocaleTimeString()}] ■ Stop requested; waiting for paper cleanup`);
     onStop?.();
-  }, [onStop, appendOutput]);
-
-  const handleRestart = useCallback(async () => {
-    appendOutput(`[${new Date().toLocaleTimeString()}] ↻ Restarting strategy...`);
-    onRestart?.();
-    await handleRun();
-  }, [appendOutput, handleRun, onRestart]);
+  }, [onStop, appendOutput, currentEditorFile, activeSessions]);
 
   const handleBacktest = useCallback(async () => {
     const fileToBacktest = currentEditorFile();
-    if (!fileToBacktest) return;
+    if (!fileToBacktest || backtestValidation) return;
 
     setIsBacktesting(true);
     setStrategyError(null);
@@ -320,17 +363,19 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         ...backtestConfig,
       });
       setBacktestResult(result);
+      setBacktestResultKey(backtestKey);
       appendOutput(
         `[${new Date().toLocaleTimeString()}] ✓ Backtest complete: ${formatPercent(result.metrics.total_return_pct)} total return over ${result.bars_analyzed} bars`,
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Strategy backtest failed';
+      setBacktestResult(null);
       setStrategyError(message);
       appendOutput(`Backtest error: ${message}`);
     } finally {
       setIsBacktesting(false);
     }
-  }, [appendOutput, backtestConfig, currentEditorFile, persistFile]);
+  }, [appendOutput, backtestConfig, backtestKey, backtestValidation, currentEditorFile, persistFile]);
 
   const [newFileName, setNewFileName] = useState('');
   const [showNewFileInput, setShowNewFileInput] = useState(false);
@@ -362,57 +407,55 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     }
   }, [output]);
 
+  const selectedRunning = activeSessions.includes(activeFile?.path ?? '');
+  const displayRunState = selectedRunning ? 'running' : runState === 'running' && runningPathRef.current !== activeFile?.path ? 'idle' : runState;
+
   return (
-    <div className="flex flex-col h-full bg-surface-0" data-testid="strategy-ide">
+    <div className="flex flex-1 flex-col h-full min-h-0 min-w-0 bg-surface-0" data-testid="strategy-ide">
+      {activeSessions.length > 0 && <div className="px-4 py-2 text-xs border-b border-[var(--border-color)]" data-testid="paper-strategy-sessions">
+        {activeSessions.map((path) => <div key={path} className="flex items-center justify-between gap-2">
+          <span>Paper running: {path}</span>
+          <button type="button" onClick={() => void stopStrategyFile(path).catch((err) => setStrategyError(String(err)))}>Stop paper session</button>
+        </div>)}
+      </div>}
       {/* Toolbar */}
-      <div className="px-3 py-1.5 border-b border-[var(--border-color)] flex items-center justify-between bg-surface-1">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-text-secondary">Strategy IDE</span>
-          <div className="flex items-center gap-1 ml-2">
-            <span className={`w-2 h-2 rounded-full ${STATE_COLORS[runState]}`} data-testid="pipeline-status" data-status={runState} />
-            <span className="text-xs text-text-muted font-mono">{STATE_LABELS[runState]}</span>
+      <div className="px-4 py-3 border-b border-[var(--border-color)] flex flex-wrap items-center justify-between gap-3 bg-surface-1">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-text-primary">Strategy workspace</div>
+          <div className="mt-1 flex items-center gap-1.5">
+            <span className={`w-2 h-2 rounded-full ${STATE_COLORS[displayRunState]}`} data-testid="pipeline-status" data-status={displayRunState} />
+            <span className="text-xs text-text-muted">{STATE_LABELS[displayRunState]}{activeSessions.length > 0 ? ` · ${activeSessions.length} paper session${activeSessions.length === 1 ? '' : 's'}` : ''}</span>
           </div>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="flex items-center gap-2 text-xs text-text-secondary">
+            Paper size
+            <input type="number" min="0" step="any" value={paperQuantity} onChange={(event) => setPaperQuantity(Number(event.target.value))} className="w-16 rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1 text-text-primary" data-testid="paper-strategy-quantity" />
+          </label>
           <button
             type="button"
             onClick={() => void handleRun()}
-            disabled={runState === 'running'}
+            disabled={isLoadingFiles || !activeFile || !Number.isFinite(paperQuantity) || paperQuantity <= 0 || activeSessions.includes(activeFile.path) || runningPathRef.current === activeFile.path}
             data-testid="execute-strategy"
-            className="px-3 py-1 text-xs font-mono rounded bg-bull/20 text-bull hover:bg-bull/30 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="px-4 py-2 text-xs font-medium rounded bg-bull text-on-bull hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
-            ▶ Run
+            Run paper
           </button>
           <button
             type="button"
             onClick={() => void handleStop()}
-            disabled={runState !== 'running'}
-            className="px-3 py-1 text-xs font-mono rounded bg-bear/20 text-bear hover:bg-bear/30 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            disabled={!activeSessions.includes(activeFile?.path ?? '')}
+            className="px-3 py-2 text-xs rounded border border-[var(--border-color)] text-text-secondary hover:bg-surface-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
-            ■ Stop
+            Stop selected
           </button>
           <button
             type="button"
-            onClick={() => void handleRestart()}
-            disabled={runState === 'running' && isLoadingFiles}
-            className="px-3 py-1 text-xs font-mono rounded bg-accent/20 text-accent hover:bg-accent/30 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-          >
-            ↻ Restart
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              const updated = currentEditorFile();
-              if (!updated) return;
-
-              void persistFile(updated, true).catch((err) => {
-                setStrategyError(err instanceof Error ? err.message : 'Failed to save strategy');
-              });
-            }}
+            onClick={handleSave}
             data-testid="save-strategy"
-            className="px-3 py-1 text-xs font-mono rounded bg-surface-2 text-text-secondary hover:text-text-primary transition-colors"
+            className="px-3 py-2 text-xs rounded border border-[var(--border-color)] text-text-secondary hover:bg-surface-2 transition-colors"
           >
-            💾 Save
+            Save
           </button>
         </div>
       </div>
@@ -433,10 +476,108 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         <div className="px-3 py-1 text-xs text-bull bg-bull/10" data-testid="save-confirmation">File saved</div>
       )}
 
-      <div
-        className="border-b border-[var(--border-color)] bg-surface-1/70 px-3 py-3 space-y-3"
-        data-testid="strategy-backtest-panel"
-      >
+
+
+      <div className="flex flex-1 min-h-0">
+        {/* File browser sidebar */}
+        <div className="w-52 shrink-0 border-r border-[var(--border-color)] bg-surface-1 flex flex-col">
+          <div className="px-3 py-3 flex items-center justify-between">
+            <div>
+              <div className="text-xs font-semibold text-text-primary">Strategies</div>
+              <div className="mt-1 text-xs text-text-muted">{files.length} file{files.length === 1 ? '' : 's'}</div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowNewFileInput(true)}
+              data-testid="strategy-new-file"
+              className="rounded border border-[var(--border-color)] px-2 py-1 text-xs text-text-secondary hover:bg-surface-2 transition-colors"
+              title="New file"
+            >
+              + New
+            </button>
+          </div>
+          {showNewFileInput && (
+            <div className="px-2 py-1 flex gap-1 border-b border-[var(--border-color)]">
+              <input
+                type="text"
+                value={newFileName}
+                onChange={(e) => setNewFileName(e.target.value)}
+                placeholder="filename.py"
+                data-testid="file-name-input"
+                className="flex-1 min-w-0 bg-surface-2 text-text-primary font-mono text-xs px-1 py-0.5 rounded border border-[var(--border-color)] focus:border-accent focus:outline-none"
+                autoFocus
+                onKeyDown={(e) => { if (e.key === 'Enter') void handleNewFile(); }}
+              />
+              <button
+                type="button"
+                onClick={() => void handleNewFile()}
+                data-testid="confirm-create-file"
+                className="shrink-0 text-xs text-bull px-0.5"
+              >
+                ✓
+              </button>
+            </div>
+          )}
+          <div className="flex-1 overflow-auto px-2 pb-2" data-testid="strategy-file-list">
+            {files.map((file, idx) => (
+              <button
+                key={file.path}
+                type="button"
+                onClick={() => setActiveFileIndex(idx)}
+                data-testid={`file-${file.name}`}
+                aria-current={idx === activeFileIndex ? 'true' : undefined}
+                className={`w-full text-left px-3 py-2 text-xs font-mono rounded truncate transition-colors strategy-file-item ${
+                  idx === activeFileIndex
+                    ? 'bg-surface-2 text-text-primary shadow-[inset_2px_0_0_0_var(--color-accent)]'
+                    : 'text-text-secondary hover:bg-surface-2'
+                }`}
+              >
+                {file.name}{activeSessions.includes(file.path) ? ' · running' : ''}
+              </button>
+            ))}
+          </div>
+
+          {/* Live metrics */}
+          {metrics && (
+            <div className="border-t border-[var(--border-color)] px-2 py-2 space-y-1">
+              <span className="text-xs text-text-muted uppercase tracking-wider">Metrics</span>
+              <div className="text-xs font-mono text-text-secondary space-y-0.5">
+                <div className="flex justify-between">
+                  <span>Signals</span>
+                  <span className="text-text-primary">{metrics.totalSignals}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Latency</span>
+                  <span className="text-text-primary">{metrics.avgLatencyMs.toFixed(1)}ms</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Errors</span>
+                  <span className={metrics.errorCount > 0 ? 'text-bear' : 'text-text-primary'}>
+                    {metrics.errorCount}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Uptime</span>
+                  <span className="text-text-primary">{metrics.uptime}</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Editor + Output */}
+        <div className="flex-1 flex flex-col min-w-0">
+          <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border-color)] bg-surface-1 px-4 py-2">
+            <div className="min-w-0">
+              <div className="truncate text-xs font-medium text-text-primary">{activeFile?.name ?? 'Choose a strategy'}</div>
+              <div className="truncate text-[11px] text-text-muted">{activeFile?.path ?? 'Create or select a file to begin'}</div>
+            </div>
+            <span className="shrink-0 text-xs text-text-muted">Python</span>
+          </div>
+
+          <details className="shrink-0 border-b border-[var(--border-color)] bg-surface-1/70" data-testid="strategy-backtest-panel">
+        <summary className="cursor-pointer px-4 py-2.5 text-xs font-medium text-text-primary hover:bg-surface-2" data-testid="strategy-backtest-setup">Backtest setup and results</summary>
+        <div className="max-h-[45vh] overflow-auto px-3 pb-3 space-y-3">
         <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <div className="text-xs font-medium uppercase tracking-wider text-text-muted">Strategy Backtest</div>
@@ -447,7 +588,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
           <button
             type="button"
             onClick={() => void handleBacktest()}
-            disabled={isBacktesting || isLoadingFiles || !activeFile}
+            disabled={isBacktesting || isLoadingFiles || !activeFile || !!backtestValidation}
             data-testid="run-backtest"
             className="px-3 py-1 text-xs font-mono rounded bg-accent/20 text-accent hover:bg-accent/30 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
@@ -552,6 +693,8 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
           </label>
         </div>
 
+        {backtestValidation && <p className="text-xs text-text-secondary" data-testid="strategy-backtest-validation">{backtestValidation}</p>}
+        {backtestResult && backtestKey !== backtestResultKey && <p className="text-xs text-text-secondary" data-testid="strategy-backtest-stale">Inputs or code changed. Run the backtest again to update these results.</p>}
         {backtestResult && (
           <div className="space-y-3 rounded border border-[var(--border-color)] bg-surface-0 p-3" data-testid="backtest-results">
             <div className="flex flex-col gap-1 lg:flex-row lg:items-center lg:justify-between">
@@ -584,17 +727,17 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
                 </ul>
               </div>
               <div>
-                <div className="mb-2 text-xs font-medium uppercase tracking-wider text-text-muted">Recent Trades</div>
+                <div className="mb-2 text-xs font-medium uppercase tracking-wider text-text-muted">Recent closed trades</div>
                 <div className="max-h-32 overflow-auto rounded border border-[var(--border-color)]">
-                  {backtestResult.trades.length === 0 ? (
+                  {backtestResult.trades.every((trade) => trade.exit_time === null) ? (
                     <div className="px-2 py-2 text-xs text-text-muted">No closed trades were generated for this run.</div>
                   ) : (
-                    backtestResult.trades.slice(-5).reverse().map((trade, index) => (
+                    backtestResult.trades.filter((trade) => trade.exit_time !== null).slice(-5).reverse().map((trade, index) => (
                       <div key={`${trade.entry_time}-${trade.exit_time ?? 'open'}-${index}`} className="grid grid-cols-4 gap-2 border-b border-[var(--border-color)] px-2 py-1 text-xs last:border-b-0">
                         <span className="font-mono text-text-primary">{trade.symbol}</span>
                         <span className="text-text-secondary">{trade.side}</span>
                         <span className={trade.pnl >= 0 ? 'text-bull' : 'text-bear'}>{formatNumber(trade.pnl)}</span>
-                        <span className="text-text-muted">{new Date(trade.entry_time).toLocaleDateString()}</span>
+                        <span className="text-text-muted">{new Date(trade.exit_time!).toLocaleDateString()}</span>
                       </div>
                     ))
                   )}
@@ -603,113 +746,11 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
             </div>
           </div>
         )}
-      </div>
-
-      <div className="flex flex-1 min-h-0">
-        {/* File browser sidebar */}
-        <div className="w-48 border-r border-[var(--border-color)] bg-surface-1 flex flex-col">
-          <div className="px-2 py-1.5 border-b border-[var(--border-color)] flex items-center justify-between">
-            <span className="text-xs text-text-muted uppercase tracking-wider">Files</span>
-            <button
-              type="button"
-              onClick={() => setShowNewFileInput(true)}
-              data-testid="strategy-new-file"
-              className="text-xs text-accent hover:text-text-primary transition-colors"
-              title="New file"
-            >
-              +
-            </button>
-          </div>
-          {showNewFileInput && (
-            <div className="px-2 py-1 flex gap-1 border-b border-[var(--border-color)]">
-              <input
-                type="text"
-                value={newFileName}
-                onChange={(e) => setNewFileName(e.target.value)}
-                placeholder="filename.py"
-                data-testid="file-name-input"
-                className="flex-1 min-w-0 bg-surface-2 text-text-primary font-mono text-xs px-1 py-0.5 rounded border border-[var(--border-color)] focus:border-accent focus:outline-none"
-                autoFocus
-                onKeyDown={(e) => { if (e.key === 'Enter') void handleNewFile(); }}
-              />
-              <button
-                type="button"
-                onClick={() => void handleNewFile()}
-                data-testid="confirm-create-file"
-                className="shrink-0 text-xs text-bull px-0.5"
-              >
-                ✓
-              </button>
-            </div>
-          )}
-          <div className="flex-1 overflow-auto py-1" data-testid="strategy-file-list">
-            {files.map((file, idx) => (
-              <button
-                key={file.path}
-                type="button"
-                onClick={() => setActiveFileIndex(idx)}
-                data-testid={`file-${file.name}`}
-                className={`w-full text-left px-2 py-1 text-xs font-mono truncate transition-colors strategy-file-item ${
-                  idx === activeFileIndex
-                    ? 'bg-surface-2 text-text-primary'
-                    : 'text-text-secondary hover:bg-surface-2/50'
-                }`}
-              >
-                🐍 {file.name}
-              </button>
-            ))}
-          </div>
-
-          {/* Live metrics */}
-          {metrics && (
-            <div className="border-t border-[var(--border-color)] px-2 py-2 space-y-1">
-              <span className="text-xs text-text-muted uppercase tracking-wider">Metrics</span>
-              <div className="text-xs font-mono text-text-secondary space-y-0.5">
-                <div className="flex justify-between">
-                  <span>Signals</span>
-                  <span className="text-text-primary">{metrics.totalSignals}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>Latency</span>
-                  <span className="text-text-primary">{metrics.avgLatencyMs.toFixed(1)}ms</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>Errors</span>
-                  <span className={metrics.errorCount > 0 ? 'text-bear' : 'text-text-primary'}>
-                    {metrics.errorCount}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span>Uptime</span>
-                  <span className="text-text-primary">{metrics.uptime}</span>
-                </div>
-              </div>
-            </div>
-          )}
         </div>
-
-        {/* Editor + Output */}
-        <div className="flex-1 flex flex-col min-w-0">
-          {/* File tabs */}
-          <div className="flex border-b border-[var(--border-color)] bg-surface-1">
-            {files.map((file, idx) => (
-              <button
-                key={file.path}
-                type="button"
-                onClick={() => setActiveFileIndex(idx)}
-                className={`px-3 py-1 text-xs font-mono border-r border-[var(--border-color)] transition-colors ${
-                  idx === activeFileIndex
-                    ? 'bg-surface-0 text-text-primary border-b-2 border-b-accent'
-                    : 'bg-surface-1 text-text-muted hover:text-text-secondary'
-                }`}
-              >
-                {file.name}
-              </button>
-            ))}
-          </div>
+      </details>
 
           {/* Monaco Editor */}
-          <div className="flex-1 min-h-0" data-testid="strategy-editor">
+          <div ref={editorContainerRef} className="flex-1 min-h-0" data-testid="strategy-editor">
             <Editor
               height="100%"
               language="python"
@@ -735,9 +776,9 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
           </div>
 
           {/* Output panel */}
-          <div className="h-32 border-t border-[var(--border-color)] bg-surface-1 flex flex-col" data-testid="strategy-output">
+          <div className="h-32 shrink-0 border-t border-[var(--border-color)] bg-surface-1 flex flex-col" data-testid="strategy-output">
             <div className="px-3 py-1 border-b border-[var(--border-color)] flex items-center justify-between">
-              <span className="text-xs text-text-muted uppercase tracking-wider">Output</span>
+              <span className="text-xs font-medium text-text-secondary">Output</span>
               <button
                 type="button"
                 onClick={() => setOutput([])}
@@ -768,6 +809,9 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
               )}
             </div>
           </div>
+          <p className="shrink-0 border-t border-[var(--border-color)] px-3 py-2 text-[11px] text-text-muted">
+            Paper uses the symbol and 1m, 5m or 15m interval in your code. Sessions stop after 30 minutes or 90 seconds without fresh data. Stop requests an exit from the paper position.
+          </p>
         </div>
       </div>
     </div>

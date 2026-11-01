@@ -14,7 +14,9 @@ import { useMarketStore } from '../../stores/marketStore';
 import { getHistoricalData, computeIndicator } from '../../lib/tauri';
 import type { OHLCVDto } from '../../lib/types';
 import { formatPrice, formatVolume } from '../../lib/format';
+import { quoteAge } from '../../lib/quoteAge';
 import { chartTheme, useThemeTick, withAlpha } from '../../lib/chartTheme';
+import { repaintChart } from '../../lib/chartPaint';
 
 interface CandleChartProps {
   symbol: string;
@@ -101,6 +103,8 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
   const [timeframe, setTimeframe] = useState<ChartTimeframe>('1d');
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [noBars, setNoBars] = useState(false);
+  const [barCount, setBarCount] = useState(0);
   const [activeOverlays, setActiveOverlays] = useState<Set<OverlayId>>(new Set());
   const [activeOscillator, setActiveOscillator] = useState<OscillatorId | null>(null);
   const [indMenuOpen, setIndMenuOpen] = useState(false);
@@ -204,6 +208,7 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
   }, [height, themeTick]);
 
   const lastBarsRef = useRef<OHLCVDto[]>([]);
+  const needsInitialFitRef = useRef(false);
 
   const setBars = useCallback((bars: OHLCVDto[]) => {
     lastBarsRef.current = bars;
@@ -216,6 +221,8 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
       // previous symbol's candles on screen.
       candleSeries.setData([]);
       volumeSeries.setData([]);
+      lastBarTimeRef.current = 0;
+      needsInitialFitRef.current = false;
       return;
     }
 
@@ -246,8 +253,13 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
     candleSeries.setData(candles);
     volumeSeries.setData(volumes);
     lastBarTimeRef.current = Number(candles[candles.length - 1].time);
-    chart.timeScale().fitContent();
-  }, []);
+    const container = containerRef.current;
+    needsInitialFitRef.current = !container || container.clientWidth <= 0 || (height ?? container.clientHeight) <= 0;
+    if (!needsInitialFitRef.current) {
+      chart.timeScale().fitContent();
+      repaintChart(chart, container, height);
+    }
+  }, [height]);
 
   // Initialize chart once (and repaint data after a theme-driven rebuild)
   useEffect(() => {
@@ -258,10 +270,18 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
     const handleResize = () => {
       const container = containerRef.current;
       if (container && chartRef.current) {
+        const width = container.clientWidth;
+        const chartHeight = height ?? container.clientHeight;
+        if (width <= 0 || chartHeight <= 0) return;
         chartRef.current.applyOptions({
-          width: container.clientWidth,
-          height: height ?? container.clientHeight,
+          width,
+          height: chartHeight,
         });
+        if (needsInitialFitRef.current && lastBarsRef.current.length > 0) {
+          chartRef.current.timeScale().fitContent();
+          needsInitialFitRef.current = false;
+          repaintChart(chartRef.current, container, height);
+        }
       }
     };
 
@@ -270,8 +290,18 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
       resizeObserver.observe(containerRef.current);
     }
 
+    const repaintWhenVisible = () => {
+      if (document.visibilityState === 'visible' && chartRef.current === chart) {
+        repaintChart(chart, containerRef.current, height);
+      }
+    };
+    window.addEventListener('focus', repaintWhenVisible);
+    document.addEventListener('visibilitychange', repaintWhenVisible);
+
     return () => {
       resizeObserver.disconnect();
+      window.removeEventListener('focus', repaintWhenVisible);
+      document.removeEventListener('visibilitychange', repaintWhenVisible);
       if (chartRef.current) {
         chartRef.current.remove();
         chartRef.current = null;
@@ -295,6 +325,11 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
     let cancelled = false;
     setLoading(true);
     setLoadError(null);
+    setNoBars(false);
+    setBarCount(0);
+    // Never display the previous symbol's candles while the next request is
+    // loading or has failed. A dated quote alone is not historical data.
+    setBars([]);
 
     const load = async () => {
       try {
@@ -303,6 +338,8 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
           : await getHistoricalData(symbol, timeframe, 500);
         if (cancelled) return;
         setBars(bars);
+        setNoBars(bars.length === 0);
+        setBarCount(bars.length);
       } catch (err) {
         if (!cancelled) {
           setLoadError(typeof err === 'string' ? err : err instanceof Error ? err.message : 'Failed to load chart data');
@@ -470,6 +507,7 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
     const intervalId = setInterval(() => {
       const q = getQuote(symbol);
       if (!q || !candleSeriesRef.current || !volumeSeriesRef.current) return;
+      if (quoteAge(q.updated_at).stale) return;
       if (![q.open, q.high, q.low, q.last, q.volume].every((v) => Number.isFinite(v))) return;
 
       // Ticks must never update at a time earlier than the last stored bar
@@ -523,9 +561,11 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
       <div className="px-3 py-1.5 border-b border-[var(--border-color)] flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="text-sm font-mono font-medium text-text-primary">{symbol}</span>
+          {barCount > 0 && <span className="text-xs text-text-muted" data-testid="chart-bar-count">{barCount} bars</span>}
           {quote && (
             <>
               <span className="text-sm font-mono text-text-primary">{formatPrice(quote.last)}</span>
+              {quoteAge(quote.updated_at).stale && <span className="text-xs text-text-muted" title={quoteAge(quote.updated_at).title}>Last update {quoteAge(quote.updated_at).label}</span>}
               <span className={`text-xs font-mono ${quote.change_pct >= 0 ? 'text-bull' : 'text-bear'}`}>
                 {quote.change_pct >= 0 ? '+' : ''}{quote.change_pct.toFixed(2)}%
               </span>
@@ -615,6 +655,11 @@ const CandleChartInner: React.FC<CandleChartProps> = ({ symbol, ohlcvData, heigh
         {loadError && !loading && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <span className="text-xs font-mono text-bear" data-testid="chart-load-error">{loadError}</span>
+          </div>
+        )}
+        {noBars && !loading && !loadError && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <span className="text-xs text-text-muted" data-testid="chart-empty">No historical bars for {symbol} on this timeframe.</span>
           </div>
         )}
         {indError && (

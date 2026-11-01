@@ -128,6 +128,9 @@ impl AngelOneMarketDataAdapter {
 
 #[async_trait]
 impl MarketDataPort for AngelOneMarketDataAdapter {
+    fn subscription_ready(&self) -> bool {
+        self.is_authenticated()
+    }
     async fn subscribe(&self, symbols: &[Symbol]) -> Result<TickStream> {
         if !self.is_authenticated() {
             return Err(anyhow::anyhow!("Not authenticated with Angel One"));

@@ -74,6 +74,7 @@ test.describe('Custom ML Pipeline Execution', () => {
   });
 
   test('should run a strategy backtest and display metrics', async ({ page }) => {
+    await page.getByTestId('strategy-backtest-setup').click();
     const backtestButton = page.getByTestId('run-backtest');
     await backtestButton.click();
 
@@ -81,6 +82,17 @@ test.describe('Custom ML Pipeline Execution', () => {
     await expect(backtestResults).toBeVisible({ timeout: 10000 });
     await expect(page.getByTestId('backtest-total-return')).toContainText('%');
     await expect(page.getByTestId('backtest-trade-count')).toContainText('closed trades');
+  });
+
+  test('should retain strategy output when navigating to the blotter and back', async ({ page }) => {
+    await page.getByTestId('execute-strategy').click();
+    const output = page.getByTestId('strategy-output');
+    await expect(output).toContainText('Running');
+    const before = await output.textContent();
+    await page.getByTestId('tab-blotter').click();
+    await expect(page.getByTestId('strategy-ide')).toBeHidden();
+    await page.getByTestId('tab-strategy').click();
+    await expect(output).toContainText(before ?? 'Running');
   });
 
   test('should switch between chart and strategy tabs', async ({ page }) => {
@@ -93,4 +105,24 @@ test.describe('Custom ML Pipeline Execution', () => {
     // Verify chart is visible and strategy is hidden
     await expect(page.getByTestId('candle-chart')).toBeVisible({ timeout: 5000 });
   });
+});
+
+test('backtest inputs explain validation and identify stale results', async ({ page }) => {
+  await page.goto('/');
+  await page.getByTestId('tab-backtest').click();
+  const run = page.getByTestId('backtest-run');
+  await expect(run).toBeEnabled();
+  await page.getByTestId('backtest-quantity').fill('0');
+  await expect(page.getByTestId('backtest-validation')).toContainText('greater than zero');
+  await expect(run).toBeDisabled();
+  await page.getByTestId('backtest-quantity').fill('1');
+  await run.click();
+  await expect(page.getByTestId('backtest-metrics')).toBeVisible();
+  await expect(page.getByTestId('backtest-metrics')).toContainText('Closed trades');
+  await expect.poll(() => page.getByTestId('backtest-equity-chart').locator('canvas').first().evaluate((canvas) => canvas.getBoundingClientRect().width)).toBeGreaterThan(100);
+  await expect.poll(() => page.getByTestId('backtest-drawdown-chart').locator('canvas').first().evaluate((canvas) => canvas.getBoundingClientRect().width)).toBeGreaterThan(100);
+  await expect(page.getByTestId('backtest-trades')).toContainText('Closed trades (2)');
+  await expect(page.getByTestId('backtest-trades').locator('tbody tr')).toHaveCount(2);
+  await page.getByTestId('backtest-symbol').fill('BTC-USD');
+  await expect(page.getByTestId('backtest-stale')).toContainText('previous run');
 });

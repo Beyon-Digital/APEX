@@ -139,6 +139,21 @@ impl RiskEngine {
     /// This is synchronous and does no I/O. Target: < 10μs.
     #[tracing::instrument(skip(self, order, account), fields(symbol = %order.symbol.0))]
     pub fn check(&self, order: &NewOrderRequest, account: &AccountBalance) -> RiskVerdict {
+        self.check_inner(order, account, true)
+    }
+
+    /// Revalidate a resting order at its current execution price. It is not a
+    /// new submission, so duplicate-submission detection must not run again.
+    pub fn check_resting(&self, order: &NewOrderRequest, account: &AccountBalance) -> RiskVerdict {
+        self.check_inner(order, account, false)
+    }
+
+    fn check_inner(
+        &self,
+        order: &NewOrderRequest,
+        account: &AccountBalance,
+        check_duplicate: bool,
+    ) -> RiskVerdict {
         // 1. FIRST CHECK: Is trading halted? This is UNBYPASSABLE.
         if self.trading_halted.load(Ordering::SeqCst) {
             return RiskVerdict::Reject(
@@ -180,7 +195,7 @@ impl RiskEngine {
         }
 
         // 5. Check for accidental duplicate submissions within the configured debounce window.
-        if self.track_and_detect_duplicate(order) {
+        if check_duplicate && self.track_and_detect_duplicate(order) {
             return RiskVerdict::Reject(format!(
                 "Potential duplicate order detected within {} ms window",
                 self.config.duplicate_window_ms
@@ -192,7 +207,7 @@ impl RiskEngine {
 
     /// Update session P&L (called after each fill)
     pub fn update_pnl(&self, pnl_change: f64) {
-        let change_fixed = (pnl_change * 100.0) as i64;
+        let change_fixed = (pnl_change * 100.0).round() as i64;
         let new_pnl = self.session_pnl.fetch_add(change_fixed, Ordering::SeqCst) + change_fixed;
 
         // Check if we've breached max daily loss
@@ -209,6 +224,11 @@ impl RiskEngine {
     /// Get current session P&L
     pub fn session_pnl(&self) -> f64 {
         self.session_pnl.load(Ordering::SeqCst) as f64 / 100.0
+    }
+
+    /// Halt trading immediately (kill switch). Cleared only by `reset_halt`.
+    pub fn halt(&self) {
+        self.trading_halted.store(true, Ordering::SeqCst);
     }
 
     /// Check if trading is halted
@@ -261,6 +281,7 @@ mod tests {
             price: None,
             stop_price: None,
             tag: None,
+            broker_params: None,
         }
     }
 
@@ -273,6 +294,7 @@ mod tests {
             price: Some(price),
             stop_price: None,
             tag: None,
+            broker_params: None,
         }
     }
 

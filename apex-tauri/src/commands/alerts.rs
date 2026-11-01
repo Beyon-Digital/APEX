@@ -35,14 +35,14 @@ pub async fn add_alert(
     }
 
     state
-        .alerts
-        .add_rule(StoredAlert {
+        .alert_store
+        .add(StoredAlert {
             id,
             rule,
             delivery: vec![AlertDelivery::InApp],
             enabled: true,
         })
-        .await;
+        .await?;
 
     Ok(())
 }
@@ -50,13 +50,13 @@ pub async fn add_alert(
 /// Remove an alert rule.
 #[tauri::command]
 pub async fn remove_alert(rule_id: String, state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.alerts.remove_rule(&rule_id).await)
+    state.alert_store.remove(&rule_id).await
 }
 
 /// Get all alert rules.
 #[tauri::command]
 pub async fn get_alert_rules(state: State<'_, AppState>) -> Result<Vec<AlertRuleDto>, String> {
-    let rules = state.alerts.get_rules().await;
+    let rules = state.alert_store.list().await?;
     Ok(rules
         .into_iter()
         .map(|r| AlertRuleDto {

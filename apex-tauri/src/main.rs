@@ -1,33 +1,22 @@
+mod broker_runtime;
 mod commands;
 mod config;
 mod dto;
+mod live_guard;
 mod state;
 mod tracing_setup;
 mod validation;
+mod vault;
 
 use commands::strategy;
+use commands::vault as vault_cmd;
 use commands::{
-    alerts, automation, brokers, copilot, data, graph, health, market, ml, news, notebook,
+    adapters, alerts, automation, brokers, copilot, data, graph, health, live, market, ml, news, notebook,
     orderbook, orders, quant, risk, scanner, settings,
 };
 use tauri::Manager;
 
-fn load_env_file() {
-    let Ok(current_dir) = std::env::current_dir() else {
-        return;
-    };
-
-    for dir in current_dir.ancestors() {
-        let env_path = dir.join(".env");
-        if env_path.exists() {
-            let _ = dotenvy::from_path_override(env_path);
-            break;
-        }
-    }
-}
-
 fn main() {
-    load_env_file();
     tracing_setup::init();
 
     tracing::info!("APEX Terminal starting...");
@@ -71,7 +60,14 @@ fn main() {
             market::get_quote,
             market::get_ohlcv,
             market::subscribe_symbols,
+            market::unsubscribe_symbols,
+            market::search_symbols,
+            orders::get_holdings,
             orders::place_order,
+            orders::preview_order,
+            live::get_live_status,
+            live::set_live_armed,
+            live::kill_switch,
             orders::cancel_order,
             orders::modify_order,
             orders::get_positions,
@@ -102,6 +98,8 @@ fn main() {
             strategy::save_strategy_file,
             strategy::delete_strategy_file,
             strategy::run_strategy_file,
+            commands::strategy_worker::stop_strategy_file,
+            commands::strategy_worker::list_strategy_sessions,
             strategy::run_strategy_backtest,
             ml::list_ml_models,
             ml::train_ml_model,
@@ -115,6 +113,19 @@ fn main() {
             brokers::set_broker_session,
             brokers::clear_broker_session,
             brokers::zerodha_login,
+            brokers::zerodha_login_url,
+            vault_cmd::vault_status,
+            vault_cmd::vault_init,
+            vault_cmd::vault_unlock,
+            vault_cmd::vault_lock,
+            vault_cmd::vault_change_passphrase,
+            vault_cmd::import_env_credentials,
+            adapters::list_adapter_schemas,
+            adapters::get_adapter_configs,
+            adapters::save_adapter_config,
+            adapters::set_adapter_enabled,
+            adapters::delete_adapter_config,
+            adapters::test_adapter_connection,
             health::get_system_health,
             settings::get_app_settings,
             settings::save_app_settings,

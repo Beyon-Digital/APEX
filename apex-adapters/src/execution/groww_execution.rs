@@ -387,6 +387,7 @@ impl ExecutionPort for GrowwExecutionAdapter {
                     updated_at: Utc::now(),
                     broker_id: "groww".to_string(),
                     source: "api".to_string(),
+                    rejection_reason: None,
                 });
             }
         }

@@ -280,7 +280,7 @@ Adding a new broker requires only implementing `ExecutionPort` and `MarketDataPo
 |Build system|Cargo (Rust) + Bun/Vite (frontend) + Hatchling/pip (Python)|
 |Logging     |**tracing** (Rust, structured JSON) + **loguru** (Python)|
 |Metrics     |**Prometheus** (local scrape) + optional Grafana         |
-|Config      |**TOML** files + env var overrides                       |
+|Config      |**TOML** files; broker/API keys in an encrypted in-app vault|
 |Testing     |**cargo test** + **pytest** + **Playwright** (E2E)       |
 |Packaging   |**Tauri bundler** (.dmg / .AppImage / .msi)              |
 

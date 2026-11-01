@@ -3,7 +3,8 @@
 //! Every Tauri command should validate its inputs before passing them to the
 //! core domain.  These helpers enforce:
 //!
-//! * Symbol format (non-empty, alphanumeric + `.`, max 20 chars)
+//! * Symbol format (non-empty, alphanumeric + `. - _ ^ = : /`, max 20 chars;
+//!   covers Yahoo-style `^GSPC`, `GC=F`, `EURUSD=X` and `NFO:SYMBOL`)
 //! * Quantity bounds (positive, finite, capped at 1 000 000)
 //! * Price bounds (positive, finite when present)
 //! * String length limits (prevent oversized payloads)
@@ -22,7 +23,15 @@ const MAX_ALERT_JSON_LEN: usize = 4096;
 const MAX_SESSION_TOKEN_LEN: usize = 8192;
 
 /// Known broker IDs.
-const VALID_BROKERS: &[&str] = &["paper", "zerodha", "angel_one", "groww", "robinhood"];
+const VALID_BROKERS: &[&str] = &[
+    "paper",
+    "zerodha",
+    "angel_one",
+    "groww",
+    "robinhood",
+    "binance",
+    "coinbase",
+];
 
 /// Known ML algorithm identifiers.
 const VALID_ALGORITHMS: &[&str] = &[
@@ -46,7 +55,7 @@ pub fn validate_symbol(symbol: &str) -> Result<(), String> {
     }
     if !symbol
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+        .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '^' | '=' | ':' | '/'))
     {
         return Err(format!("Symbol contains invalid characters: {}", symbol));
     }
@@ -93,6 +102,28 @@ pub fn validate_broker_id(broker_id: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Validate an adapter id for vault storage: a configurable broker or an
+/// `llm:<provider>` credential slot.
+pub fn validate_adapter_id(adapter_id: &str) -> Result<(), String> {
+    if let Some(provider) = adapter_id.strip_prefix("llm:") {
+        let ok = !provider.is_empty()
+            && provider.len() <= 64
+            && provider
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+        return if ok {
+            Ok(())
+        } else {
+            Err(format!("Invalid LLM provider id: {adapter_id}"))
+        };
+    }
+    if crate::broker_runtime::CONFIGURABLE_BROKERS.contains(&adapter_id) {
+        Ok(())
+    } else {
+        Err(format!("Unknown adapter: {adapter_id}"))
+    }
 }
 
 /// Validate a generic string field against a maximum length.
@@ -286,6 +317,15 @@ mod tests {
     fn valid_broker_ids() {
         assert!(validate_broker_id("paper").is_ok());
         assert!(validate_broker_id("zerodha").is_ok());
+    }
+
+    #[test]
+    fn index_and_fx_symbols_allowed() {
+        for symbol in ["^GSPC", "GC=F", "EURUSD=X", "NFO:NIFTY24DECFUT", "BTC/USDT"] {
+            assert!(validate_symbol(symbol).is_ok(), "{symbol}");
+        }
+        assert!(validate_symbol("A B").is_err());
+        assert!(validate_symbol("AAPL;rm").is_err());
     }
 
     #[test]

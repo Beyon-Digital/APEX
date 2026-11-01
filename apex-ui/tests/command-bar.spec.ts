@@ -11,6 +11,12 @@ test.describe('CommandBar Execution', () => {
     await expect(input).toBeVisible({ timeout: 10000 });
   });
 
+  test('space opens the command bar when focus is outside an editor', async ({ page }) => {
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press('Space');
+    await expect(page.getByTestId('command-bar-input')).toBeFocused();
+  });
+
   test('should accept text input', async ({ page }) => {
     const input = page.getByTestId('command-bar-input');
     await input.click();

@@ -66,6 +66,79 @@
     --transition-normal: 200ms ease;
 }
 
+/* Terminal theme: black canvas, amber accent, flat square panels, monospace type */
+[data-theme='terminal'] {
+    --surface-0: #000000;
+    --surface-1: #0a0a09;
+    --surface-2: #141311;
+    --surface-3: #211e19;
+
+    --color-bull: #2ee66b;
+    --color-bear: #ff4538;
+    --color-accent: #ff9f1c;
+    --color-accent-soft: #ffc266;
+    --color-accent-strong: #e07f00;
+    --color-muted: #7d7258;
+    --color-warning: #ffd23f;
+    --color-error: #ff4538;
+    --color-success: #2ee66b;
+    --color-bull-rgb: 46 230 107;
+    --color-bear-rgb: 255 69 56;
+    --color-accent-rgb: 255 159 28;
+    --color-accent-soft-rgb: 255 194 102;
+    --color-accent-strong-rgb: 224 127 0;
+    --color-muted-rgb: 125 114 88;
+    --color-warning-rgb: 255 210 63;
+    --color-error-rgb: 255 69 56;
+    --color-success-rgb: 46 230 107;
+
+    --color-on-bull: #021a0a;
+    --color-on-bear: #ffffff;
+    --color-on-accent: #120a00;
+
+    --text-primary: #f1ece0;
+    --text-secondary: #cdb98a;
+    --text-muted: #85795e;
+
+    --font-sans: 'JetBrains Mono', 'IBM Plex Mono', 'Fira Code', ui-monospace, monospace;
+
+    --radius-sm: 0;
+    --radius-md: 0;
+    --radius-lg: 0;
+
+    --border-color: #3a3122;
+
+    --shadow-sm: none;
+    --shadow-md: 0 0 0 1px #3a3122;
+    --shadow-lg: 0 0 0 1px #3a3122;
+}
+
+/* Square everything except status dots */
+[data-theme='terminal'] *:not(.rounded-full) {
+    border-radius: 0 !important;
+}
+
+[data-theme='terminal'] body,
+[data-theme='terminal'] button,
+[data-theme='terminal'] input,
+[data-theme='terminal'] select,
+[data-theme='terminal'] textarea {
+    font-family: var(--font-sans);
+}
+
+/* Column headers and panel titles read as terminal labels */
+[data-theme='terminal'] th,
+[data-theme='terminal'] h2,
+[data-theme='terminal'] h3,
+[data-theme='terminal'] h4 {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+[data-theme='terminal'] ::selection {
+    background: rgb(var(--color-accent-rgb) / 0.35);
+}
+
 /* Light theme */
 [data-theme='light'] {
     --surface-0: #f4f5f8;

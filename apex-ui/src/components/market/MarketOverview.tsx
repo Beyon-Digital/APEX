@@ -5,6 +5,7 @@ import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { getQuote, subscribeSymbols } from '../../lib/tauri';
 import { formatPrice } from '../../lib/format';
 import { PnlValue } from '../common/PnlValue';
+import { quoteAge } from '../../lib/quoteAge';
 
 const INDEX_SYMBOLS = ['^GSPC', '^IXIC', '^DJI', '^NSEI', 'BTC-USD', 'ETH-USD', 'GC=F', 'CL=F', 'EURUSD=X', 'USDINR=X'];
 
@@ -51,7 +52,7 @@ export const MarketOverview: React.FC = () => {
   const movers = useMemo(() => {
     const rows = watchlist
       .map((symbol) => ({ symbol, quote: quotes.get(symbol) }))
-      .filter((r): r is { symbol: string; quote: NonNullable<typeof r.quote> } => r.quote !== undefined);
+      .filter((r): r is { symbol: string; quote: NonNullable<typeof r.quote> } => r.quote !== undefined && !quoteAge(r.quote.updated_at).stale);
     const sorted = [...rows].sort((a, b) => b.quote.change_pct - a.quote.change_pct);
     return {
       gainers: sorted.filter((r) => r.quote.change_pct > 0).slice(0, 5),
@@ -88,6 +89,7 @@ export const MarketOverview: React.FC = () => {
               <div className="font-mono text-sm text-text-primary mt-1" data-numeric>
                 {quote ? formatPrice(quote.last) : '—'}
               </div>
+              {quote && quoteAge(quote.updated_at).stale && <div className="text-[10px] text-text-muted" title={quoteAge(quote.updated_at).title}>{quoteAge(quote.updated_at).label}</div>}
               {quote && (
                 <div className="mt-0.5">
                   <PnlValue value={quote.change_pct} type="percent" className="text-[11px] font-mono" />
@@ -101,7 +103,7 @@ export const MarketOverview: React.FC = () => {
       <div className="grid grid-cols-3 gap-3">
         {/* Breadth */}
         <div className="bg-surface-1 border border-[var(--border-color)] rounded p-3">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-text-muted mb-2">Watchlist Breadth</div>
+          <div className="text-[10px] font-mono uppercase tracking-widest text-text-muted mb-2">Watchlist Breadth · recent quotes</div>
           <div className="flex items-end gap-4">
             <div>
               <div className="text-2xl font-mono text-bull" data-testid="breadth-advancing">{movers.advancing}</div>

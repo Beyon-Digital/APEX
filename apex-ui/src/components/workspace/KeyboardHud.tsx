@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from 'react';
 
 const SHORTCUTS: { keys: string; action: string }[] = [
-  { keys: 'Space', action: 'Activate command bar' },
+  { keys: 'Space / Ctrl+K', action: 'Activate command bar (Ctrl+K works while typing)' },
+  { keys: '↑ / ↓ / Tab', action: 'Command history / suggestions / complete' },
+  { keys: 'Ctrl+Shift+K', action: 'Kill switch: halt trading, cancel live orders' },
   { keys: 'Esc', action: 'Close dialog / deactivate command bar' },
   { keys: '?', action: 'Toggle this help overlay' },
   { keys: 'Enter', action: 'Submit command / confirm dialog' },
@@ -10,6 +12,8 @@ const SHORTCUTS: { keys: string; action: string }[] = [
 const COMMANDS: { syntax: string; result: string }[] = [
   { syntax: 'AAPL', result: 'View symbol on chart' },
   { syntax: 'AAPL:BOOK', result: 'Symbol on a specific panel' },
+  { syntax: 'ADD AAPL MSFT', result: 'Add tickers to the watchlist' },
+  { syntax: 'RM AAPL', result: 'Remove a ticker from the watchlist' },
   { syntax: 'BUY AAPL 10', result: 'Market order' },
   { syntax: 'SELL AAPL 5 LIMIT 350', result: 'Limit order' },
   { syntax: ':NEWS / :SCANNER / :GRAPH', result: 'Jump to a panel' },

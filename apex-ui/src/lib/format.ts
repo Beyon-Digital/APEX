@@ -39,3 +39,9 @@ export function formatQuantity(value: number): string {
   }
   return value.toFixed(4);
 }
+
+/** JSON represents an infinite profit factor as null (no losing trades). */
+export function formatProfitFactor(value: number | null, wins: number, losses: number): string {
+  if (value === null || !Number.isFinite(value)) return wins > 0 && losses === 0 ? '∞' : '—';
+  return value.toFixed(2);
+}

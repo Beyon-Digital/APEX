@@ -5,6 +5,7 @@ import { StatusBar } from './components/workspace/StatusBar';
 import { TickerTape } from './components/workspace/TickerTape';
 import { KeyboardHud } from './components/workspace/KeyboardHud';
 import { CopilotDock } from './components/copilot/CopilotDock';
+import { VaultGate } from './components/settings/VaultGate';
 import { useDataSync } from './lib/useDataSync';
 import { useTauriEventBridge } from './hooks/useTauriEvents';
 import { useWorkspaceStore } from './stores/workspaceStore';
@@ -31,6 +32,7 @@ export default function App() {
       <StatusBar />
       <KeyboardHud />
       <CopilotDock />
+      <VaultGate />
     </div>
   );
 }

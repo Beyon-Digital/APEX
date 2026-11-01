@@ -168,8 +168,10 @@ impl TimescaleAdapter {
                 created_at  TIMESTAMPTZ NOT NULL,
                 updated_at  TIMESTAMPTZ NOT NULL,
                 broker_id   TEXT NOT NULL,
-                source      TEXT NOT NULL
+                source      TEXT NOT NULL,
+                rejection_reason TEXT
             );
+            ALTER TABLE orders ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders (symbol);
             CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status);
@@ -421,8 +423,8 @@ impl StoragePort for TimescaleAdapter {
             .execute(
                 "INSERT INTO orders
              (id, symbol, side, order_type, quantity, price, stop_price, status,
-              filled_qty, avg_price, created_at, updated_at, broker_id, source)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+              filled_qty, avg_price, created_at, updated_at, broker_id, source, rejection_reason)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
              ON CONFLICT (id) DO UPDATE SET
               side = EXCLUDED.side,
               order_type = EXCLUDED.order_type,
@@ -434,7 +436,8 @@ impl StoragePort for TimescaleAdapter {
               avg_price = EXCLUDED.avg_price,
               updated_at = EXCLUDED.updated_at,
               broker_id = EXCLUDED.broker_id,
-              source = EXCLUDED.source",
+              source = EXCLUDED.source,
+              rejection_reason = EXCLUDED.rejection_reason",
                 &[
                     &order.id.0,
                     &order.symbol.0,
@@ -450,6 +453,7 @@ impl StoragePort for TimescaleAdapter {
                     &order.updated_at,
                     &order.broker_id,
                     &order.source,
+                    &order.rejection_reason,
                 ],
             )
             .await
@@ -478,7 +482,7 @@ impl StoragePort for TimescaleAdapter {
         client
             .execute(
                 "UPDATE orders
-             SET status = $1, filled_qty = $2, avg_price = $3, updated_at = $4
+             SET status = $1, filled_qty = $2, avg_price = $3, updated_at = $4, rejection_reason = $6
              WHERE id = $5",
                 &[
                     &status_str,
@@ -486,6 +490,7 @@ impl StoragePort for TimescaleAdapter {
                     &order.avg_price,
                     &order.updated_at,
                     &order.id.0,
+                    &order.rejection_reason,
                 ],
             )
             .await
@@ -504,7 +509,7 @@ impl StoragePort for TimescaleAdapter {
 
         let mut query = String::from(
             "SELECT id, symbol, side, order_type, quantity, price, stop_price, status,
-                    filled_qty, avg_price, created_at, updated_at, broker_id, source
+                    filled_qty, avg_price, created_at, updated_at, broker_id, source, rejection_reason
              FROM orders WHERE 1=1",
         );
 
@@ -611,6 +616,7 @@ impl StoragePort for TimescaleAdapter {
                 updated_at: row.get(11),
                 broker_id: row.get(12),
                 source: row.get(13),
+                rejection_reason: row.get(14),
             });
         }
 

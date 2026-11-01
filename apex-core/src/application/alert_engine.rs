@@ -118,6 +118,7 @@ impl AlertEngine {
         }
         let mut rules = self.rules.write().await;
         rules.retain(|r| r.id != alert.id);
+        self.triggered.remove(&alert.id);
         rules.push(alert);
     }
 

@@ -466,6 +466,7 @@ impl ExecutionPort for AngelOneExecutionAdapter {
                     updated_at: Utc::now(),
                     broker_id: "angel_one".to_string(),
                     source: "api".to_string(),
+                    rejection_reason: None,
                 });
             }
         }

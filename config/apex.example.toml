@@ -24,6 +24,9 @@ data_dir = "data"
 [market_data]
 # Default market data adapter.  Built-in: "yahoo_finance"
 # Community adapters are loaded from `adapters/` directory.
+# Public exchange feeds are opt-in: select "binance" or "coinbase" to
+# enable that feed on restart. Yahoo remains available for ordinary watchlist
+# symbols. Binance accepts pairs such as BTC/USDT; Coinbase uses BTC-USD.
 adapter = "yahoo_finance"
 
 # Symbols to subscribe to on startup (watchlist seed).
@@ -255,10 +258,10 @@ max_tokens = 1024
 # ── Appearance ───────────────────────────────────────────────────────
 
 [appearance]
-# "dark" | "light"
-theme = "dark"
+# "terminal" | "dark" | "light"
+theme = "terminal"
 # "comfortable" | "compact"
-density = "comfortable"
+density = "compact"
 
 # ── LLM providers ────────────────────────────────────────────────────
 # OpenAI-compatible inference providers the Copilot/agentic loop can use.

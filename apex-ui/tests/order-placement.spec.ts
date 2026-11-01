@@ -39,24 +39,44 @@ test.describe('Order Placement and Execution Flow', () => {
     await expect(submitButton).toBeDisabled();
   });
 
-  test('should place a limit buy order', async ({ page }) => {
-    // Select order type first to show price input
+  test('explains paper limit triggers and enables a valid order', async ({ page }) => {
     await page.getByTestId('order-type-select').selectOption('LIMIT');
-
-    // Fill in order details
     await page.getByTestId('order-symbol-input').fill('BTCUSD');
     await page.getByTestId('order-quantity-input').fill('10');
     await page.getByTestId('order-price-input').fill('50000');
+    await expect(page.getByTestId('paper-order-trigger')).toContainText('at or below your limit');
+    await expect(page.getByTestId('order-submit-button')).toBeEnabled();
+    await page.getByTestId('order-side-sell').click();
+    await expect(page.getByTestId('paper-order-trigger')).toContainText('at or above your limit');
+  });
 
-    // Select buy side
-    await page.getByTestId('order-side-buy').click();
+  test('requires a positive quantity and accepts fractional quantities', async ({ page }) => {
+    await page.getByTestId('order-symbol-input').fill('BTCUSD');
+    const qty = page.getByTestId('order-quantity-input');
+    await qty.fill('0');
+    await expect(page.getByTestId('order-submit-button')).toBeDisabled();
+    await qty.fill('0.1');
+    await expect(page.getByTestId('order-submit-button')).toBeEnabled();
+  });
 
-    // Submit order
-    await page.getByTestId('order-submit-button').click();
+  test('shows separate stop and limit prices for stop-limit orders', async ({ page }) => {
+    await page.getByTestId('order-type-select').selectOption('STOP_LIMIT');
+    await expect(page.getByTestId('order-price-input')).toBeVisible();
+    await expect(page.getByTestId('order-stop-price-input')).toBeVisible();
+    await expect(page.getByTestId('paper-order-trigger')).toContainText('at or above your stop');
+    await expect(page.getByTestId('paper-order-trigger')).toContainText('at or below your limit');
+  });
 
-    // Verify order confirmation or wait for status change
-    const confirmation = page.getByTestId('order-confirmation');
-    await expect(confirmation).toBeVisible({ timeout: 5000 });
+  test('keeps the stop-limit action visible in a desktop-sized ticket', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.getByTestId('order-type-select').selectOption('STOP_LIMIT');
+    const panel = page.getByTestId('order-entry-panel');
+    const button = page.getByTestId('order-submit-button');
+    const panelBox = await panel.boundingBox();
+    const buttonBox = await button.boundingBox();
+    expect(panelBox).not.toBeNull();
+    expect(buttonBox).not.toBeNull();
+    expect(buttonBox!.y + buttonBox!.height).toBeLessThanOrEqual(panelBox!.y + panelBox!.height);
   });
 
   test('should place a market sell order', async ({ page }) => {
@@ -94,6 +114,6 @@ test.describe('Order Placement and Execution Flow', () => {
 
     // Verify submit button text changes
     const submitButton = page.getByTestId('order-submit-button');
-    await expect(submitButton).toContainText('SELL');
+    await expect(submitButton).toContainText('Sell');
   });
 });

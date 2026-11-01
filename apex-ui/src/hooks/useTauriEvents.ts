@@ -116,7 +116,7 @@ export function usePositionStream() {
           } else {
             next.push(event.payload);
           }
-          setPositions(next);
+          setPositions(next.filter((position) => position.quantity !== 0));
         });
         unlistenRef.current = unlisten;
       } catch {

@@ -65,8 +65,21 @@ impl DataQualityChecker {
             ));
         }
 
+        self.validate_tick_values(tick)
+    }
+
+    /// Validate the contents of a tick independently of its age. A market
+    /// close can be shown as a dated reference, but never as a live tick.
+    pub fn validate_tick_values(&self, tick: &Tick) -> Result<()> {
+        if tick
+            .open
+            .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > self.max_price)
+            || tick.change_pct.is_some_and(|value| !value.is_finite())
+        {
+            return Err(anyhow!("Invalid optional quote values"));
+        }
         // Check prices are reasonable
-        if tick.last <= 0.0 || tick.last > self.max_price {
+        if !tick.last.is_finite() || tick.last <= 0.0 || tick.last > self.max_price {
             return Err(anyhow!(
                 "Invalid last price: {} (must be > {} and < {})",
                 tick.last,
@@ -75,7 +88,7 @@ impl DataQualityChecker {
             ));
         }
 
-        if tick.bid <= 0.0 || tick.bid > self.max_price {
+        if !tick.bid.is_finite() || tick.bid <= 0.0 || tick.bid > self.max_price {
             return Err(anyhow!(
                 "Invalid bid price: {} (must be > {} and < {})",
                 tick.bid,
@@ -84,7 +97,7 @@ impl DataQualityChecker {
             ));
         }
 
-        if tick.ask <= 0.0 || tick.ask > self.max_price {
+        if !tick.ask.is_finite() || tick.ask <= 0.0 || tick.ask > self.max_price {
             return Err(anyhow!(
                 "Invalid ask price: {} (must be > {} and < {})",
                 tick.ask,

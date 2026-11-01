@@ -105,6 +105,7 @@ pub struct SimPosition {
     quantity: f64,
     avg_price: f64,
     entry_time: DateTime<Utc>,
+    entry_commission: f64,
 }
 
 /// Backtest engine — replays historical OHLCV bars through a signal
@@ -194,6 +195,15 @@ impl BacktestEngine {
             .filter_map(|(sym, bars)| bars.last().map(|b| (sym.clone(), b)))
             .collect();
         self.close_all_positions(&last_bars);
+        // The terminal point includes liquidation costs, matching final_equity.
+        if let Some(last) = self.equity_curve.last_mut() {
+            last.equity = self.cash;
+            last.drawdown = if self.peak_equity > 0.0 {
+                (self.peak_equity - self.cash).max(0.0) / self.peak_equity
+            } else {
+                0.0
+            };
+        }
 
         // Calculate final metrics
         let metrics = self.calculate_metrics();
@@ -243,6 +253,7 @@ impl BacktestEngine {
                     pos.avg_price =
                         (pos.avg_price * pos.quantity + fill_price * quantity) / new_qty;
                     pos.quantity = new_qty;
+                    pos.entry_commission += commission;
                 } else {
                     self.positions.insert(
                         symbol.0.clone(),
@@ -251,6 +262,7 @@ impl BacktestEngine {
                             quantity,
                             avg_price: fill_price,
                             entry_time: bar.time,
+                            entry_commission: commission,
                         },
                     );
                 }
@@ -269,11 +281,12 @@ impl BacktestEngine {
             }
             BacktestSignal::Sell { symbol, quantity } => {
                 let fill_price = bar.close * (1.0 - self.config.slippage_bps / 10_000.0);
-                let commission = fill_price * quantity * self.config.commission_bps / 10_000.0;
-
                 if let Some(pos) = self.positions.get_mut(&symbol.0) {
                     let sell_qty = quantity.min(pos.quantity);
-                    let pnl = (fill_price - pos.avg_price) * sell_qty - commission;
+                    let commission = fill_price * sell_qty * self.config.commission_bps / 10_000.0;
+                    let entry_fee = pos.entry_commission * sell_qty / pos.quantity;
+                    pos.entry_commission -= entry_fee;
+                    let pnl = (fill_price - pos.avg_price) * sell_qty - commission - entry_fee;
 
                     self.cash += fill_price * sell_qty - commission;
                     pos.quantity -= sell_qty;
@@ -302,7 +315,9 @@ impl BacktestEngine {
                     let fill_price = bar.close * (1.0 - self.config.slippage_bps / 10_000.0);
                     let commission =
                         fill_price * pos.quantity * self.config.commission_bps / 10_000.0;
-                    let pnl = (fill_price - pos.avg_price) * pos.quantity - commission;
+                    let pnl = (fill_price - pos.avg_price) * pos.quantity
+                        - commission
+                        - pos.entry_commission;
                     self.cash += fill_price * pos.quantity - commission;
 
                     self.trades.push(BacktestTrade {
@@ -327,10 +342,12 @@ impl BacktestEngine {
         for symbol in symbols {
             if let Some(bar) = last_bars.get(&symbol) {
                 if let Some(pos) = self.positions.remove(&symbol) {
-                    let fill_price = bar.close;
+                    let fill_price = bar.close * (1.0 - self.config.slippage_bps / 10_000.0);
                     let commission =
                         fill_price * pos.quantity * self.config.commission_bps / 10_000.0;
-                    let pnl = (fill_price - pos.avg_price) * pos.quantity - commission;
+                    let pnl = (fill_price - pos.avg_price) * pos.quantity
+                        - commission
+                        - pos.entry_commission;
                     self.cash += fill_price * pos.quantity - commission;
 
                     self.trades.push(BacktestTrade {
@@ -899,6 +916,47 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn terminal_equity_includes_liquidation_costs() {
+        let mut engine = BacktestEngine::new(BacktestConfig {
+            initial_capital: 1000.0,
+            commission_bps: 10.0,
+            slippage_bps: 10.0,
+            ..BacktestConfig::default()
+        });
+        let mut data = HashMap::new();
+        data.insert("AAPL".into(), make_bars("AAPL", &[(0, 100.0), (1, 110.0)]));
+        let result = engine
+            .run(&data, |symbol, bar, _, _| {
+                if bar.close == 100.0 {
+                    Some(BacktestSignal::Buy {
+                        symbol: Symbol(symbol.into()),
+                        quantity: 1.0,
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let expected = 1000.0 - 100.1 * 1.001 + 109.89 * 0.999;
+        assert!((result.metrics.final_equity - expected).abs() < 1e-8);
+        assert!(
+            (result
+                .trades
+                .iter()
+                .filter(|t| t.exit_time.is_some())
+                .map(|t| t.pnl)
+                .sum::<f64>()
+                - result.metrics.total_return)
+                .abs()
+                < 1e-8
+        );
+        assert_eq!(
+            result.equity_curve.last().unwrap().equity,
+            result.metrics.final_equity
+        );
     }
 
     #[test]

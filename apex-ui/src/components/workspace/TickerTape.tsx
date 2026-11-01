@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef } from 'react';
 import { useMarketStore } from '../../stores/marketStore';
 import { getQuote, subscribeSymbols } from '../../lib/tauri';
 import { formatPrice } from '../../lib/format';
+import { quoteAge } from '../../lib/quoteAge';
 
 const INDEX_SYMBOLS = ['^GSPC', '^IXIC', '^DJI', '^NSEI', 'BTC-USD', 'ETH-USD', 'GC=F', 'CL=F', 'EURUSD=X', 'USDINR=X'];
 
@@ -77,6 +78,7 @@ export const TickerTape: React.FC = () => {
               >
                 <span className="text-accent font-semibold">{INDEX_LABELS[symbol] ?? symbol}</span>
                 <span className="text-text-primary" data-numeric>{formatPrice(quote!.last)}</span>
+                {quoteAge(quote!.updated_at).stale && <span className="text-text-muted" title={quoteAge(quote!.updated_at).title}>{quoteAge(quote!.updated_at).label}</span>}
                 <span className={`${tone} font-semibold`}>
                   {arrow} {Math.abs(changePct).toFixed(2)}%
                 </span>

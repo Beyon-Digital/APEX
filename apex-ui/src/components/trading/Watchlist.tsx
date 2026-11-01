@@ -2,7 +2,10 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useMarketStore } from '../../stores/marketStore';
 import { PnlValue } from '../common/PnlValue';
 import { formatPrice } from '../../lib/format';
+import { quoteAge } from '../../lib/quoteAge';
 import type { QuoteDto } from '../../lib/types';
+import { SymbolSearch } from '../common/SymbolSearch';
+import { addSymbolToWatchlist } from '../../lib/watchlistActions';
 
 type SortKey = 'symbol' | 'last' | 'chg';
 
@@ -37,15 +40,15 @@ const WatchlistRow: React.FC<WatchlistRowProps> = React.memo(({ symbol, selected
         className={`border-b border-[var(--border-color)] cursor-pointer hover:bg-surface-2 transition-colors duration-100 ${selected ? 'bg-surface-2' : ''}`}
         data-testid={`watchlist-item-${symbol}`}
       >
-        <td className="px-3 py-1.5 font-mono text-sm font-medium" onClick={() => onSelect(symbol)}>{symbol}</td>
-        <td className="px-3 py-1.5 text-text-muted font-mono text-sm" colSpan={2} onClick={() => onSelect(symbol)}>—</td>
-        <td className="px-3 py-1.5 text-right">
+        <td className="px-1 py-1.5 font-mono text-xs font-medium whitespace-nowrap" onClick={() => onSelect(symbol)}>{symbol}</td>
+        <td className="px-1 py-1.5 text-text-muted font-mono text-xs" colSpan={2} onClick={() => onSelect(symbol)}>—</td>
+        <td className="px-1 py-1.5 text-right">
           <button
             onClick={(e) => {
               e.stopPropagation();
               onRemove(symbol);
             }}
-            className="text-red-500 hover:text-red-400 text-xs px-2 py-0.5"
+            className="text-red-500 hover:text-red-400 text-xs px-1 py-0.5"
             data-testid="watchlist-remove-button"
           >
             ✕
@@ -60,18 +63,21 @@ const WatchlistRow: React.FC<WatchlistRowProps> = React.memo(({ symbol, selected
       className={`border-b border-[var(--border-color)] hover:bg-surface-2 cursor-pointer transition-colors duration-100 ${selected ? 'bg-surface-2' : ''}`}
       data-testid={`watchlist-item-${symbol}`}
     >
-      <td className="px-3 py-1.5 font-mono text-sm font-medium" onClick={() => onSelect(symbol)}>{symbol}</td>
-      <td className={`px-3 py-1.5 font-mono text-sm text-right ${flashClass}`} data-testid={`watchlist-price-${symbol}`} data-numeric onClick={() => onSelect(symbol)}>{formatPrice(quote.last)}</td>
-      <td className="px-3 py-1.5 text-right" onClick={() => onSelect(symbol)}>
+      <td className="px-1 py-1.5 font-mono text-xs font-medium whitespace-nowrap" onClick={() => onSelect(symbol)}>{symbol}</td>
+      <td className={`px-1 py-1.5 font-mono text-xs text-right whitespace-nowrap ${flashClass}`} data-testid={`watchlist-price-${symbol}`} data-numeric onClick={() => onSelect(symbol)} title={quoteAge(quote.updated_at).title}>
+        {formatPrice(quote.last)}
+        {quoteAge(quote.updated_at).stale && <span className="block text-[10px] text-text-muted">{quoteAge(quote.updated_at).label}</span>}
+      </td>
+      <td className="px-1 py-1.5 text-right whitespace-nowrap" onClick={() => onSelect(symbol)}>
         <PnlValue value={quote.change_pct} type="percent" className="text-xs" />
       </td>
-      <td className="px-3 py-1.5 text-right">
+      <td className="px-1 py-1.5 text-right">
         <button
           onClick={(e) => {
             e.stopPropagation();
             onRemove(symbol);
           }}
-          className="text-red-500 hover:text-red-400 text-xs px-2 py-0.5"
+          className="text-red-500 hover:text-red-400 text-xs px-1 py-0.5"
           data-testid="watchlist-remove-button"
         >
           ✕
@@ -91,19 +97,18 @@ interface WatchlistProps {
 export const Watchlist: React.FC<WatchlistProps> = ({ onSelectSymbol, selectedSymbol }) => {
   const watchlist = useMarketStore((s) => s.watchlist);
   const quotes = useMarketStore((s) => s.quotes);
-  const addToWatchlist = useMarketStore((s) => s.addToWatchlist);
   const removeFromWatchlist = useMarketStore((s) => s.removeFromWatchlist);
   const [isAdding, setIsAdding] = useState(false);
-  const [newSymbol, setNewSymbol] = useState('');
+  const [addStatus, setAddStatus] = useState<{ kind: 'idle' | 'checking' | 'error'; message?: string }>({ kind: 'idle' });
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortAsc, setSortAsc] = useState(true);
 
-  const handleAdd = () => {
-    if (newSymbol.trim()) {
-      addToWatchlist(newSymbol.trim().toUpperCase());
-      setNewSymbol('');
-      setIsAdding(false);
-    }
+  // A symbol picked from search results is known-good. A hand-typed one must
+  // produce a quote before it is saved, so typos don't become dead rows.
+  const handlePick = async (symbol: string, known: boolean) => {
+    if (!known) setAddStatus({ kind: 'checking', message: `Checking ${symbol}…` });
+    const result = await addSymbolToWatchlist(symbol, known);
+    setAddStatus(result.ok ? { kind: 'idle' } : { kind: 'error', message: result.message });
   };
 
   const toggleSort = (key: SortKey) => {
@@ -143,7 +148,7 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onSelectSymbol, selectedSy
   const sortIndicator = (key: SortKey) =>
     sortKey === key ? (sortAsc ? ' ▲' : ' ▼') : '';
 
-  const headerClass = 'px-3 py-1.5 font-normal cursor-pointer select-none hover:text-text-secondary uppercase tracking-wider';
+  const headerClass = 'px-1 py-1.5 font-normal cursor-pointer select-none hover:text-text-secondary uppercase tracking-wider';
 
   return (
     <div className="flex flex-col h-full" data-testid="watchlist-panel">
@@ -162,24 +167,25 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onSelectSymbol, selectedSy
       </div>
 
       {isAdding && (
-        <div className="px-3 py-2 border-b border-[var(--border-color)] flex gap-2">
-          <input
-            type="text"
-            value={newSymbol}
-            onChange={(e) => setNewSymbol(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
-            placeholder="Symbol"
-            className="flex-1 px-2 py-1 text-sm bg-surface-0 border border-[var(--border-color)] rounded"
-            data-testid="watchlist-symbol-input"
+        <div className="border-b border-[var(--border-color)] px-3 py-2" data-testid="watchlist-add-form">
+          <SymbolSearch
             autoFocus
+            inputTestId="watchlist-symbol-input"
+            confirmTestId="watchlist-confirm-add"
+            localSymbols={watchlist}
+            onPick={handlePick}
+            onCancel={() => { setIsAdding(false); setAddStatus({ kind: 'idle' }); }}
           />
-          <button
-            onClick={handleAdd}
-            className="px-3 py-1 text-xs bg-primary-500 hover:bg-primary-600 text-white rounded"
-            data-testid="watchlist-confirm-add"
-          >
-            Add
-          </button>
+          {addStatus.kind !== 'idle' && (
+            <p
+              role={addStatus.kind === 'error' ? 'alert' : 'status'}
+              className={`mt-1 text-[11px] ${addStatus.kind === 'error' ? 'text-bear' : 'text-text-muted'}`}
+              data-testid="watchlist-add-status"
+            >
+              {addStatus.message}
+            </p>
+          )}
+          <p className="mt-1 text-[10px] text-text-muted">Type a ticker or company, ↑↓ to choose, Enter to add, Esc to close.</p>
         </div>
       )}
 
@@ -196,7 +202,7 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onSelectSymbol, selectedSy
               <th className={`${headerClass} text-right`} onClick={() => toggleSort('chg')} data-testid="watchlist-sort-chg">
                 Chg%{sortIndicator('chg')}
               </th>
-              <th className="px-3 py-1.5 text-right font-normal w-12"></th>
+              <th className="px-1 py-1.5 text-right font-normal"></th>
             </tr>
           </thead>
           <tbody>

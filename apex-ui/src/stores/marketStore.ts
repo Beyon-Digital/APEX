@@ -22,9 +22,15 @@ export const useMarketStore = create<MarketState>()(
 
       updateQuote: (quote: QuoteDto) => {
         set((state) => {
+          const time = Date.parse(quote.updated_at);
+          const previous = state.quotes.get(quote.symbol);
+          if (previous && Number.isFinite(Date.parse(previous.updated_at)) && (!Number.isFinite(time) || time < Date.parse(previous.updated_at))) return state;
           const newQuotes = new Map(state.quotes);
           newQuotes.set(quote.symbol, quote);
-          return { quotes: newQuotes, lastQuoteAt: Date.now() };
+          const lastQuoteAt = Number.isFinite(time) && time <= Date.now() + 5_000
+            ? Math.max(state.lastQuoteAt ?? 0, time)
+            : state.lastQuoteAt;
+          return { quotes: newQuotes, lastQuoteAt };
         });
       },
 

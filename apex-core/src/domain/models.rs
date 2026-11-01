@@ -107,6 +107,9 @@ pub struct Order {
     pub updated_at: DateTime<Utc>,
     pub broker_id: String,
     pub source: String,
+    /// Human-readable cause when an order is rejected.
+    #[serde(default)]
+    pub rejection_reason: Option<String>,
 }
 
 /// A trading position
@@ -166,6 +169,27 @@ pub struct NewOrderRequest {
     pub price: Option<f64>,
     pub stop_price: Option<f64>,
     pub tag: Option<String>,
+    /// Broker-specific order parameters (product, exchange, ...). Adapters
+    /// that don't use them ignore the field.
+    #[serde(default)]
+    pub broker_params: Option<BrokerOrderParams>,
+}
+
+/// Optional broker-specific order attributes, e.g. Zerodha's product/variety.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BrokerOrderParams {
+    /// Margin product, e.g. "CNC", "MIS", "NRML".
+    #[serde(default)]
+    pub product: Option<String>,
+    /// Exchange segment, e.g. "NSE", "BSE", "NFO".
+    #[serde(default)]
+    pub exchange: Option<String>,
+    /// Validity, e.g. "DAY", "IOC".
+    #[serde(default)]
+    pub validity: Option<String>,
+    /// Order variety, e.g. "regular", "amo".
+    #[serde(default)]
+    pub variety: Option<String>,
 }
 
 /// Parameters for modifying an existing order
@@ -335,6 +359,7 @@ mod tests {
             updated_at: Utc::now(),
             broker_id: "paper".into(),
             source: "manual".into(),
+            rejection_reason: None,
         };
         let json = serde_json::to_string(&order).unwrap();
         let deserialized: Order = serde_json::from_str(&json).unwrap();
@@ -352,6 +377,7 @@ mod tests {
             price: None,
             stop_price: None,
             tag: Some("strategy_1".into()),
+            broker_params: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let deserialized: NewOrderRequest = serde_json::from_str(&json).unwrap();

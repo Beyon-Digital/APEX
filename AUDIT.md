@@ -266,3 +266,231 @@ Rebuilt (`cargo build -p apex-tauri` — new IPC: create/list/delete/set_enabled
 **Verdict:** all four areas pass. Theme contrast/repaint/tints fixed; Automations CRUD+persistence works; Copilot trading tools execute real actions; chat history persists across restart. **No defects found.** (Note: 3 identical rules briefly appeared — self-inflicted, my console `create_automation` submitted multiple times; not an app bug. Paper position resets to 0 on backend restart — in-memory book, expected.)
 
 **Teardown:** deleted all test rules (`automations.json` → `[]`); left theme=light persisted.
+
+# Mac mini strategy audit — 29 October 2026
+
+Base: `93d801ad2f405b02faee4c33c52f8ce2dd3feb98` (`origin/main`, fast-forwarded on the Mac mini).
+Native Tauri/WebKit app using Vite at `localhost:3000`; real Yahoo data and the built-in paper adapter.
+Existing `.DS_Store` deletions were preserved. Local environment and database backups are under
+`/private/tmp/apex-audit-backup`; credentials were not included in the audit artifacts.
+
+## Reproduced defects and fixes
+
+| Priority | Reproduction / observed behavior | Change |
+|---|---|---|
+| P0 | Backtesting RSI or breakout silently ran inferred SMA/buy-and-hold behavior. | Replay executes the authored Python `on_bar` callbacks and validates their signals. |
+| P0 | IDE Run only initialized and stopped a strategy, with no live event loop. | Bounded paper worker dispatches fresh quote-sampled bars and routes signals through the order manager. |
+| P1 | Stop changed UI state; tab navigation discarded the running IDE. | Backend stop/list commands, session controls, and an IDE that mounts on first visit and then survives tab changes. |
+| P1 | Yahoo fetch time made old prices appear fresh; backward timestamps produced repeated/out-of-order bars during the first observation. | Preserve market timestamps and reject duplicate, backward, stale, and implausibly future quotes. |
+| P1 | Reusing an existing subscription could return an unrelated Robinhood authentication error. | Existing successful subscriptions satisfy idempotent starts. |
+| P1 | Chart history failed with `Invalid column type Real ... volume`. | SQLite reads both integer and floating-point volume values. |
+| P1 | Filled paper orders appeared in memory but journaling failed against the existing SQL side constraint. | Write canonical enum names; read canonical and legacy JSON-quoted values; support both in status queries. |
+| P1 | A filled exit left a stale open position in the UI. | Reconcile after fills, remove broker-closed positions, emit close events, and remove zero quantities in the frontend. |
+| P1 | An all-winning dedicated backtest crashed on `m.profit_factor.toFixed`. | Nullable profit-factor type and safe infinity/undefined formatting. |
+| P2 | Rust validation errors appeared as generic “Strategy backtest failed.” | Normalize native string errors to `Error` while preserving their message. |
+| P2 | The blotter displayed a market-order estimate instead of its actual fill. | Filled rows now show average execution price. |
+| P2 | Completing one session marked the IDE stopped while other workers remained active. | Display active paper-session count and make Stop target the selected session. |
+| P1 | Paper open P&L was stale, and paper realized fills did not update the daily-loss guard. | Mark positions from cached quotes, include fees in realized P&L, and synchronize paper results into risk tracking. |
+| P1 | Terminal backtest equity omitted liquidation costs; closed-trade P&L omitted entry commission. | Include both costs and make terminal equity match the final balance. |
+
+## Authored-strategy backtests
+
+Native IDE, BTC-USD daily bars, 29 April–29 October 2026: 183 bars, initial capital
+100,000 USD, quantity 1, commission 3 bps, slippage 2 bps. Values below are rounded
+as displayed by the native UI. These are software-validation results.
+
+| Strategy | Closed trades | Return | Final equity | Win rate | Sharpe | Max drawdown |
+|---|---:|---:|---:|---:|---:|---:|
+| SMA 10/30 | 3 | -1.96% | 98,041.53 | 33.33% | -0.15 | 9.29% |
+| RSI 14, 30/70 | 2 | 1.04% | 101,037.53 | 50% | 0.17 | 15.17% |
+| Previous-20-close breakout | 2 | 6.42% | 106,416.75 | 50% | 0.71 | 8.48% |
+
+Evidence: `docs/audits/2026-10-29/native-backtests.json` and strategy sources in its
+`strategies/` directory. The separate Python smoke replay used Yahoo's `range=6mo`
+endpoint (184 bars); its counts are in `authored-replay.json`. Independent cash
+and fee arithmetic over the captured 183-bar date range matches all three native
+final balances to the cent; see `verify_backtests.py`, `captured-history.json`, and
+`independent-verification.json` in the same audit directory.
+
+## Native live checks
+
+Created `audit_ux_created.py` through the native IDE, entered invalid Python,
+confirmed a concrete syntax error, repaired it, saved it, and reopened it after
+restart. Verified that quantity zero returns “Quantity must be positive,” and a
+reversed date range returns “Backtest start date must be earlier than the end date.”
+Missing-history requests return the Yahoo 404 error, and a one-day BTC range returns
+“Backtest requires at least two historical bars.” The dedicated all-winning
+backtest now renders profit factor ∞ and its result charts.
+Historical chart candles now render from the existing SQLite data.
+
+The corrected execution probe entered DOGE-USD and exited on the next bar.
+Both orders were `Filled`, broker `paper`, quantity 1, with canonical SQL enums:
+
+- Buy: `PAPER-b824099c-eaa5-4d57-96a9-df863c02655d`, fill 0.079705938.
+- Sell: `PAPER-b8b07f0d-dd9c-4f02-8916-377ba90450ed`, fill 0.079674062.
+
+The native positions panel returned to **0 open**. The probe was then stopped.
+Persisted order evidence is in `docs/audits/2026-10-29/paper-orders.json`.
+
+Final quant observation: **PASS**. Started SMA/BTC at 05:46:52 IST,
+RSI/ETH at 05:47:00 IST, and breakout/SOL at 05:47:07 IST. All three reached
+their 30-minute stops and were inactive by 06:17:47 IST, with **0 open positions**.
+No natural entry conditions fired. The inspected bar windows were strictly
+increasing. A frontend refresh and Clear reset the visible log during the run;
+those displayed counts are not total callback counts. An earlier observation was
+stopped after exposing the timestamp-ordering defect and is excluded from acceptance.
+See `live-observation.json`.
+
+On the delivered build, the controlled BTC hold probe entered at 06:19:14 IST.
+The positions panel marked P&L from updated quotes (observed **-53.43**), and the
+session display included the entry fee (**-24.33**). At 06:21:25 IST, **Stop selected**
+closed the open position and terminated the worker:
+
+- Entry: `PAPER-2658f171-7f08-4928-95ec-b75c29a2ea68`, 1 BTC-USD at 81,103.547466.
+- Stop exit: `PAPER-8ada84e6-a011-4c0a-ab2a-97542c49c499`, at 81,039.878782.
+- Native realized session P&L: **-112.31**, matching fill arithmetic including both
+  commissions (-112.3117118744 before display rounding).
+- Final native state: **no running workers, 0 open positions**. All four audit
+  orders are Filled; no audit orders remain pending. The earlier DOGE order history
+  survived the backend restart. See `stop-open-position.json` and `paper-orders.json`.
+
+## Validation and practical limits
+
+Rust workspace: 255 passing, five external-adapter tests intentionally ignored.
+Python: 25 passing. Browser suite: 69 passing, including the nullable profit-factor regression.
+Lint and TypeScript/Vite production build pass with Bun 1.3.11.
+The oversized native paper limit order was rejected with “Order value 1000000.00
+exceeds max allowed 500000.00,” without creating a journal entry.
+The final observation and stop-while-open outcomes are recorded above. Browser tests exercise mocked IPC; native results above use
+real backend commands, Python callbacks, data, and paper fills.
+
+Live bars are sampled from quotes with volume unavailable. Live workers support
+one subscribed symbol, 1m/5m/15m bars, and long/flat fixed-quantity execution.
+Backtests fill at the signal bar's close. Indicators currently provided by the
+worker are SMA and simple rolling-mean RSI; strategies can implement others.
+
+The default live paper account is 1,000,000 INR. Crypto quote amounts are treated
+as raw units; the paper adapter performs no FX conversion. Backtests above use
+an explicitly separate USD capital balance. Paper positions reset when the
+backend restarts; filled order history is now journaled.
+
+Follow-up: dated last-known quotes now appear with their age in the market
+surfaces, without entering the trading or strategy data pipeline. Unconfigured
+exchange WebSocket connections still produce noisy health/log failures despite
+the working Yahoo/paper path.
+
+
+## Delivered local build
+
+The native development bundle is `dist/APEX Audit.app`, with the executable also
+at `target/debug/apex-tauri`. The app and its Vite server at `localhost:3000` were
+left running on the Mac mini, with paper workers stopped. This development bundle
+loads the local frontend and project Python environment. For a subsequent normal
+start, use `bun run dev` from the repository root. Bun 1.3.11 is installed globally;
+the project virtualenv uses Python 3.12.14.
+
+All fixes remain in the local working tree for review. The existing five
+`.DS_Store` deletions were preserved.
+
+## UX and paper-trading follow-up — 30 October 2026
+
+The market-only paper-order limitation recorded in this section was superseded
+by the pending-order implementation described in the next section.
+
+The workspace now puts the primary research sections in a single navigation row
+and gives the Strategy IDE and Backtest the full workspace width. Strategy
+controls show paper size and session limits; backtest inputs have labels,
+validation, loading feedback, and warnings when inputs change after a run.
+The backtest table shows closed trades consistently with the headline count.
+Equity and drawdown charts size to their containers and respond to resizing.
+
+Order entry explains paper-account reset and currency behavior, accepts fractional
+quantities, and reports submitted status without claiming a fill. Open orders in
+the blotter can be cancelled. The paper adapter rejects unsupported non-market
+orders from every entry path, rather than leaving them indefinitely open. Paper
+market orders require a fresh quote and failed submissions leave no pending order.
+If a strategy's attempted exit cannot get a fresh price, its output states that
+the position remains open and needs manual closure when a fresh price returns.
+
+The rebuilt native app replayed the BTC-USD SMA strategy over 731 daily bars;
+the charts rendered and the headline and table both showed 13 closed trades.
+The rebuilt paper adapter then filled a 0.0001 BTC-USD buy and sell through the
+native order form. The blotter showed both as filled and the position count
+returned to zero. No real broker orders were placed.
+
+The Rust workspace suite and native debug build passed; the paper-adapter tests
+included stale and future quotes and unsupported order types. The full mocked-IPC
+browser suite passed 72 tests before the final chart and trade-table refinements;
+their targeted browser regressions passed afterward. Frontend lint and production
+build also passed. All changes remain local and uncommitted.
+
+## Pending orders and exchange feeds — 30 October 2026
+
+The paper adapter now supports market, limit, stop-market and stop-limit orders.
+It uses fresh last-trade prices, checks risk and funds again at execution, caps
+simulated limit fills at the limit, and serializes fills and cancellations.
+Stop-limit triggers latch before waiting for the limit. Open paper orders are
+session-only and prior-session open records are marked cancelled on restart.
+Rejected orders carry a reason in the blotter and journal. Paper funds and
+positions remain session-only; prices have no FX conversion.
+
+On the rebuilt native app, a 0.0001 BTC-USD buy limit, sell stop, buy stop-limit,
+and sell limit filled from live Yahoo prices. A second buy limit at 10,000 stayed
+open until cancelled. The final test state was zero open positions and no open
+test orders. Full IDs, prices and final journal states are recorded in
+`docs/audits/2026-10-29/pending-order-live-test.json`. The stop-limit test used
+immediately satisfied thresholds; a two-stage move through separate live prices
+was covered by automated tests rather than observed in that session.
+
+Public exchange feeds now start when explicitly selected, receive only supported
+symbols, and report real failures rather than presenting an unconnected socket
+as healthy. On the default native configuration the Health screen showed Yahoo
+and paper healthy, with no unconfigured exchange adapters. Binance and Coinbase
+live connectivity and PostgreSQL migration against a live server were not tested.
+
+Alert rules now persist across backend restarts, and restored price rules
+resubscribe to their symbols. The persistence, corrupt-file and failed-save cases
+have automated coverage; a native restart check was not completed. The native
+daily candlestick chart appeared blank with 500 bars loaded during that pass;
+the follow-up below records the repaint fix and native verification. The order ticket takes its grouping of side, type and
+price fields from the reviewed Coinbase and Binance web order screens on Mobbin,
+while retaining the APEX design system.
+
+## Daily chart and local Mac app — 30 October 2026
+
+The chart now forces a synchronous repaint after historical bars load and when
+the app returns to the foreground, preserving the visible range. On the native
+Mac app, RELIANCE.NS and AAPL daily candles rendered after switching symbols and
+reopening the chart. A cold launch of the rebuilt app displayed RELIANCE.NS
+daily candles with 500 bars loaded; see `native-daily-chart-fixed.jpeg`.
+
+The local `dist/APEX Audit.app` now embeds the built frontend rather than loading
+it from the Vite server. It was launched successfully at `tauri://localhost`
+with the old development server stopped. It continues to use this checkout's
+database, strategies, configuration and Python environment, so it is a local
+workspace-tied app rather than a portable release. Run
+`bash scripts/build-mac-audit.sh` to refresh it after future code changes.
+
+## Trading and strategy redesign — 30 October 2026
+
+The trading workspace places the order ticket beside the chart, with a compact
+watchlist and clearer order and position states. The strategy workspace groups
+paper controls, strategy files, editor, backtest setup and output. Design
+references reviewed on Mobbin included Kraken and Gemini order forms and the
+Snowflake and Browserbase editor layouts.
+
+The packaged editor previously attempted to load Monaco from a remote CDN,
+which the native app's content security policy blocks. Monaco and its worker are
+now bundled locally. The editor also keeps Space in the editor and saves the
+currently selected file when using the keyboard shortcut.
+
+The rebuilt native app displayed the trading layout and daily chart, and opened
+both an execution probe and the existing SMA crossover Python file in the
+syntax-highlighted editor. Screenshots are in
+`docs/audits/2026-10-29/native-trading-redesign.jpeg` and
+`docs/audits/2026-10-29/native-strategy-redesign.jpeg`. A browser suite passed
+76 tests before the final editor shortcut and watchlist refinements; targeted
+editor, shortcut, order and account checks passed after the relevant changes.
+The offline editor was also checked against the production content security
+policy. The native check observed file opening; editor changes and saves were
+exercised in browser tests.
