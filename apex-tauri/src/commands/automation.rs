@@ -168,6 +168,11 @@ pub async fn set_automation_enabled(
     Ok(state.automations.set_enabled(&id, enabled))
 }
 
+/// Rules do not fire for this long after launch.
+const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(45);
+/// Daily bars older than this (weekends and holidays included) are too stale to trade on.
+const MAX_BAR_AGE_DAYS: i64 = 6;
+
 /// Execute one due rule: model signal → order via OTM (risk-gated).
 async fn run_rule(
     rule: &AutomationRule,
@@ -180,6 +185,36 @@ async fn run_rule(
     // must stop trading the moment it's turned off.
     if let Err(e) = check_broker_allowed(state, &rule.broker_id) {
         return format!("blocked: {e}");
+    }
+
+    // Live rules need a connected broker; say so instead of failing inside the order path.
+    if rule.broker_id != "paper" {
+        let connected = state
+            .broker_connection(&rule.broker_id)
+            .map(|c| c.authenticated && c.execution_available)
+            .unwrap_or(false);
+        if !connected {
+            return format!(
+                "blocked: {} is not connected (unlock the vault and log in under Settings > Adapters)",
+                rule.broker_id
+            );
+        }
+    }
+
+    // Score on fresh daily bars, not whatever happens to be cached.
+    match crate::commands::data::load_bars(state, &rule.symbol, Some("d1"), 300).await {
+        Ok(bars) => match bars.last() {
+            Some(last) if (chrono::Utc::now() - last.time).num_days() <= MAX_BAR_AGE_DAYS => {}
+            Some(last) => {
+                return format!(
+                    "blocked: newest daily bar for {} is from {} (stale); refusing to trade on old data",
+                    rule.symbol,
+                    last.time.format("%Y-%m-%d")
+                )
+            }
+            None => return format!("blocked: no daily bars for {}", rule.symbol),
+        },
+        Err(e) => return format!("data error: {e}"),
     }
 
     let signal = match crate::commands::ml::model_signal_inner(
@@ -209,6 +244,25 @@ async fn run_rule(
         other => return format!("no-op: unrecognized signal {other}"),
     };
 
+    // Long/flat semantics: buy only when flat, sell only to exit a long. This stops
+    // a signal that stays "1" from pyramiding on every run and never shorts.
+    let held = state
+        .otm
+        .position(&rule.broker_id, &rule.symbol)
+        .filter(|p| p.quantity > 0.0 && p.side == OrderSide::Buy)
+        .map(|p| p.quantity)
+        .unwrap_or(0.0);
+    let quantity = match side {
+        OrderSide::Buy if held > 0.0 => {
+            return format!("no-op: already long {held} {}", rule.symbol);
+        }
+        OrderSide::Buy => rule.quantity,
+        OrderSide::Sell if held <= 0.0 => {
+            return format!("no-op: no {} position to exit", rule.symbol);
+        }
+        OrderSide::Sell => rule.quantity.min(held),
+    };
+
     let side_label = match side {
         OrderSide::Buy => "BUY",
         OrderSide::Sell => "SELL",
@@ -218,11 +272,18 @@ async fn run_rule(
         return format!("blocked: daily order cap reached ({cap})");
     }
 
+    if rule.broker_id == "paper" {
+        // Paper market orders fill against the latest quote.
+        if let Err(e) = state.ensure_quote(&rule.symbol).await {
+            return format!("order rejected: {e}");
+        }
+    }
+
     let order = NewOrderRequest {
         symbol: Symbol(rule.symbol.clone()),
         side: side.clone(),
         order_type: OrderType::Market,
-        quantity: rule.quantity,
+        quantity,
         price: None,
         stop_price: None,
         tag: Some(format!("automation:{}", rule.id)),
@@ -238,7 +299,7 @@ async fn run_rule(
             format!(
                 "placed {side} {qty} {sym} @ mkt (order {oid}) — signal={sig} prob={prob:.2}",
                 side = side_label,
-                qty = rule.quantity,
+                qty = quantity,
                 sym = rule.symbol,
                 oid = id.0,
                 sig = signal.signal,
@@ -254,11 +315,17 @@ async fn run_rule(
 pub fn spawn_automation_loop(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        // Give the user time to unlock the vault and look around before rules fire.
+        tokio::time::sleep(STARTUP_GRACE).await;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
             let state = app.state::<AppState>();
-            if !state.automations_cfg.enabled {
+            if !state.automations_cfg.enabled
+                || state
+                    .automations_paused
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 continue;
             }
             let due: Vec<AutomationRule> = state.automations.due_rules();

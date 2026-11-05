@@ -4,6 +4,7 @@ pub mod alerts;
 pub mod automation;
 pub mod brokers;
 pub mod copilot;
+pub mod copilot_tools;
 pub mod data;
 pub mod graph;
 pub mod health;

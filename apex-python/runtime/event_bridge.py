@@ -50,18 +50,28 @@ class Worker:
         elif op == "bar":
             raw = request["bar"]
             symbol = raw["symbol"]
-            closes = self.closes.setdefault(symbol, [])
-            closes.append(raw["close"])
-            # Populate the SDK cache before the callback, using past/current bars only.
+            # Prefix sums make every period O(1) per bar (they used to be re-summed,
+            # O(n^2) per bar, which made warm-up and backtests slow). Past and
+            # current bars only, so there is no look-ahead.
+            acc = self.closes.setdefault(symbol, {"c": [0.0], "g": [0.0], "l": [0.0], "last": None})
+            close = raw["close"]
+            change = 0.0 if acc["last"] is None else close - acc["last"]
+            acc["c"].append(acc["c"][-1] + close)
+            acc["g"].append(acc["g"][-1] + max(change, 0.0))
+            acc["l"].append(acc["l"][-1] + max(-change, 0.0))
+            acc["last"] = close
+            n = len(acc["c"]) - 1  # number of closes seen
+            cache = self.strategy._indicator_cache
             for period in range(2, 401):
-                sma = sum(closes[-period:]) / period if len(closes) >= period else math.nan
-                self.strategy._indicator_cache[("sma", symbol, (period,))] = sma
-                if len(closes) > period:
-                    changes = [b-a for a, b in zip(closes[-period-1:-1], closes[-period:])]
-                    gain = sum(max(x, 0) for x in changes) / period
-                    loss = sum(max(-x, 0) for x in changes) / period
-                    rsi = 100 - 100 / (1 + gain/loss) if loss else (100.0 if gain else 50.0)
-                    self.strategy._indicator_cache[("rsi", symbol, (period,))] = rsi
+                sma = (acc["c"][n] - acc["c"][n - period]) / period if n >= period else math.nan
+                cache[("sma", symbol, (period,))] = sma
+                if n > period:
+                    # The last `period` price changes: indices n-period .. n-1 of the change series.
+                    gain = (acc["g"][n] - acc["g"][n - period]) / period
+                    loss = (acc["l"][n] - acc["l"][n - period]) / period
+                    cache[("rsi", symbol, (period,))] = (
+                        100 - 100 / (1 + gain / loss) if loss else (100.0 if gain else 50.0)
+                    )
             self.strategy.on_bar(symbol, Bar(
                 symbol=symbol, timeframe=Timeframe(raw["timeframe"]),
                 open=raw["open"], high=raw["high"], low=raw["low"],

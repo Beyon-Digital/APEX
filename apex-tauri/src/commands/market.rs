@@ -104,6 +104,14 @@ pub async fn search_symbols(
     query: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<SymbolSearchResultDto>, String> {
+    search_symbols_inner(state.inner(), &query).await
+}
+
+/// Shared by the IPC command and the AI copilot.
+pub(crate) async fn search_symbols_inner(
+    state: &AppState,
+    query: &str,
+) -> Result<Vec<SymbolSearchResultDto>, String> {
     const LIMIT: usize = 12;
     let query = query.trim().to_string();
     if query.is_empty() {

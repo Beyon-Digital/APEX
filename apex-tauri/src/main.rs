@@ -43,6 +43,7 @@ fn main() {
                 // Start real-time event push from message bus → frontend
                 app_state.start_event_push(app_handle.clone());
 
+                let _ = app_state.app.set(app_handle.clone());
                 app_handle.manage(app_state);
             });
 
@@ -100,6 +101,7 @@ fn main() {
             strategy::run_strategy_file,
             commands::strategy_worker::stop_strategy_file,
             commands::strategy_worker::list_strategy_sessions,
+            commands::strategy_worker::list_strategy_session_details,
             strategy::run_strategy_backtest,
             ml::list_ml_models,
             ml::train_ml_model,

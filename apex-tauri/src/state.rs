@@ -71,6 +71,14 @@ pub struct AppState {
     brokers: RwLock<HashMap<String, BrokerRuntimeEntry>>,
     pub vault: Arc<Vault>,
     pub live_guard: LiveTradingGuard,
+    /// Set by the kill switch: the automation scheduler does nothing until the
+    /// halt is reset explicitly.
+    pub automations_paused: std::sync::atomic::AtomicBool,
+    /// Handle for tools that start sessions or push events to the UI. Set once at startup.
+    pub app: std::sync::OnceLock<tauri::AppHandle>,
+    /// Id of the copilot turn whose approvals and tool results are cached. A new
+    /// user message gets a new id, which clears both.
+    pub copilot_turn: std::sync::Mutex<Option<String>>,
     market_data_feed: String,
     pub started_at: Instant,
 }
@@ -290,6 +298,9 @@ impl AppState {
             brokers: RwLock::new(brokers),
             vault,
             live_guard: LiveTradingGuard::new(config.live.clone()),
+            automations_paused: std::sync::atomic::AtomicBool::new(false),
+            app: std::sync::OnceLock::new(),
+            copilot_turn: std::sync::Mutex::new(None),
             market_data_feed,
             started_at: Instant::now(),
         })
@@ -417,6 +428,26 @@ impl AppState {
         instruments.search(query, limit)
     }
 
+    /// Make sure a quote for `symbol` is flowing, subscribing it if needed. Paper
+    /// market orders fill against the latest quote, so callers use this before
+    /// ordering a symbol that may not be on the watchlist.
+    pub async fn ensure_quote(&self, symbol: &str) -> std::result::Result<(), String> {
+        if self.aggregator.get_cached_quote(symbol).is_some() {
+            return Ok(());
+        }
+        self.aggregator
+            .start(&[apex_core::domain::models::Symbol(symbol.to_string())])
+            .await
+            .map_err(|e| format!("Could not subscribe to {symbol}: {e}"))?;
+        for _ in 0..12 {
+            if self.aggregator.get_cached_quote(symbol).is_some() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        Err(format!("No live quote for {symbol} yet. Check the symbol and the data feed."))
+    }
+
     /// Submit an order, applying the live-trading safeguards to non-paper brokers.
     /// Paper orders pass straight through.
     pub async fn guarded_submit(
@@ -445,12 +476,17 @@ impl AppState {
         }
     }
 
-    /// Emergency stop: disarm live trading, halt the risk engine and cancel
-    /// every working live order APEX knows about.
+    /// Emergency stop: disarm live trading, halt the risk engine, pause
+    /// automations, stop strategy sessions and cancel every working live order
+    /// APEX knows about.
     pub async fn kill_switch(&self) -> (Vec<String>, Vec<String>) {
         use apex_core::domain::models::OrderStatus;
         self.live_guard.set_armed(false);
         self.risk.halt();
+        // Algos must not keep trading after an emergency stop.
+        self.automations_paused
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::commands::strategy_worker::stop_all_sessions();
         let working: Vec<_> = self
             .otm
             .open_orders()

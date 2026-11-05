@@ -42,6 +42,12 @@ pub async fn cancel_orphaned_paper_orders(storage: &dyn StoragePort) -> Result<u
     Ok(count)
 }
 
+/// Position map key: positions are tracked per broker so a paper position and a
+/// live position in the same symbol never overwrite each other.
+fn position_key(broker_id: &str, symbol: &str) -> String {
+    format!("{broker_id}|{symbol}")
+}
+
 /// Order & Trade Manager — manages all order lifecycle
 pub struct OrderTradeManager {
     risk_engine: Arc<RiskEngine>,
@@ -360,7 +366,7 @@ impl OrderTradeManager {
         }
 
         // 2. Update position
-        let symbol_key = fill.symbol.0.clone();
+        let symbol_key = position_key(&fill.broker_id, &fill.symbol.0);
         let pnl = if let Some(mut pos) = self.positions.get_mut(&symbol_key) {
             // Existing position — calculate P&L
             let pnl = match (&pos.side, &fill.side) {
@@ -397,7 +403,7 @@ impl OrderTradeManager {
             Topic::PositionUpdate,
             BusMessage::PositionData(
                 self.positions
-                    .get(&fill.symbol.0)
+                    .get(&symbol_key)
                     .map(|p| p.clone())
                     .unwrap_or_else(|| Position {
                         symbol: fill.symbol,
@@ -523,15 +529,15 @@ impl OrderTradeManager {
 
         let broker_positions = adapter.get_positions().await?;
 
-        let live_symbols: std::collections::HashSet<_> = broker_positions
+        let live_keys: std::collections::HashSet<_> = broker_positions
             .iter()
             .filter(|p| p.quantity != 0.0)
-            .map(|p| p.symbol.0.clone())
+            .map(|p| position_key(broker_id, &p.symbol.0))
             .collect();
         let closed: Vec<_> = self
             .positions
             .iter()
-            .filter(|p| p.broker_id == broker_id && !live_symbols.contains(p.key()))
+            .filter(|p| p.broker_id == broker_id && !live_keys.contains(p.key()))
             .map(|p| p.key().clone())
             .collect();
         for key in closed {
@@ -541,9 +547,12 @@ impl OrderTradeManager {
                     .publish(Topic::PositionUpdate, BusMessage::PositionData(position));
             }
         }
-        for broker_pos in broker_positions.into_iter().filter(|p| p.quantity != 0.0) {
-            self.positions
-                .insert(broker_pos.symbol.0.clone(), broker_pos.clone());
+        for mut broker_pos in broker_positions.into_iter().filter(|p| p.quantity != 0.0) {
+            broker_pos.broker_id = broker_id.to_string();
+            self.positions.insert(
+                position_key(broker_id, &broker_pos.symbol.0),
+                broker_pos.clone(),
+            );
             self.bus
                 .publish(Topic::PositionUpdate, BusMessage::PositionData(broker_pos));
         }
@@ -570,6 +579,13 @@ impl OrderTradeManager {
     /// Get all open orders
     pub fn open_orders(&self) -> Vec<Order> {
         self.open_orders.iter().map(|r| r.value().clone()).collect()
+    }
+
+    /// The position a given broker holds in `symbol`, if any.
+    pub fn position(&self, broker_id: &str, symbol: &str) -> Option<Position> {
+        self.positions
+            .get(&position_key(broker_id, symbol))
+            .map(|p| p.clone())
     }
 
     /// Get all positions
@@ -899,5 +915,28 @@ mod tests {
         *broker.status.lock().unwrap() = Some(live_order(OrderStatus::Filled, 10.0));
         otm.poll_live_orders().await;
         assert_eq!(otm.open_orders()[0].status, OrderStatus::Filled);
+    }
+
+    #[tokio::test]
+    async fn positions_are_tracked_per_broker() {
+        let bus = Arc::new(MessageBus::new());
+        let risk = Arc::new(RiskEngine::new(RiskConfig::default()));
+        let otm = OrderTradeManager::new(risk, bus);
+        let fill = |broker: &str, qty: f64| FillEvent {
+            order_id: OrderId(format!("{broker}-1")),
+            symbol: Symbol("RELIANCE.NS".into()),
+            side: OrderSide::Buy,
+            quantity: qty,
+            price: 100.0,
+            commission: 0.0,
+            filled_at: chrono::Utc::now(),
+            broker_id: broker.into(),
+        };
+        otm.handle_fill(fill("paper", 5.0)).await;
+        otm.handle_fill(fill("zerodha", 7.0)).await;
+        assert_eq!(otm.get_positions().len(), 2);
+        assert_eq!(otm.position("paper", "RELIANCE.NS").unwrap().quantity, 5.0);
+        assert_eq!(otm.position("zerodha", "RELIANCE.NS").unwrap().quantity, 7.0);
+        assert!(otm.position("binance", "RELIANCE.NS").is_none());
     }
 }

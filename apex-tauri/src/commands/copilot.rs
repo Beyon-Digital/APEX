@@ -2,7 +2,7 @@ use crate::commands::ml::ModelRegistry;
 use crate::commands::python_runtime;
 use crate::commands::scanner::ScanCriterionDto;
 use crate::commands::strategy::StrategyBacktestRequestDto;
-use crate::commands::{automation, data, ml, quant, scanner, strategy};
+use crate::commands::{automation, copilot_tools, data, ml, quant, scanner, strategy};
 use crate::dto::MLTrainingRequestDto;
 use crate::state::AppState;
 use crate::validation;
@@ -103,7 +103,8 @@ async fn dispatch_tool(
     pending: &mut Vec<PendingApprovalDto>,
 ) -> Option<Value> {
     let detail = trace_detail(name, args);
-    let gated = state.copilot.require_approval && WRITE_TOOLS.contains(&name);
+    let gated = state.copilot.require_approval
+        && (WRITE_TOOLS.contains(&name) || copilot_tools::EXTRA_WRITE_TOOLS.contains(&name));
 
     let result = if gated {
         let key = tool_approval_key(name, args);
@@ -126,6 +127,9 @@ async fn dispatch_tool(
             return None;
         } else {
             let r = exec_tool(name, args, state, models, runtime_paths).await;
+            // An approval is good for one execution. The result is cached only so the
+            // replay of this same turn does not fire the call a second time.
+            state.copilot_approvals.lock().unwrap().remove(&key);
             if let Ok(v) = &r {
                 state
                     .copilot_tool_cache
@@ -291,10 +295,11 @@ fn tool_schemas() -> Value {
         ("read_strategy", "Read a strategy .py file's source", json!({
             "type": "object", "properties": {"path": {"type": "string"}},
             "required": ["path"] })),
-        ("save_strategy", "Create or overwrite a strategy .py file (returns its path)", json!({
+        ("save_strategy", "Create a strategy .py file (returns its path). Refuses to replace an existing file unless overwrite=true.", json!({
             "type": "object", "properties": {
                 "path": {"type": "string"},
-                "content": {"type": "string"} },
+                "content": {"type": "string"},
+                "overwrite": {"type": "boolean", "default": false} },
             "required": ["path", "content"] })),
         ("run_backtest", "Backtest a strategy file on a symbol; returns metrics and equity summary", json!({
             "type": "object", "properties": {
@@ -386,17 +391,17 @@ fn tool_schemas() -> Value {
                 "id": {"type": "string"} },
             "required": ["id"] })),
     ];
-    Value::Array(
-        tools
-            .iter()
-            .map(|(name, desc, params)| {
-                json!({
-                    "type": "function",
-                    "function": {"name": name, "description": desc, "parameters": params},
-                })
+    let mut all: Vec<Value> = tools
+        .iter()
+        .map(|(name, desc, params)| {
+            json!({
+                "type": "function",
+                "function": {"name": name, "description": desc, "parameters": params},
             })
-            .collect(),
-    )
+        })
+        .collect();
+    all.extend(copilot_tools::extra_tool_schemas());
+    Value::Array(all)
 }
 
 fn parse_timeframe(s: &str) -> Timeframe {
@@ -434,6 +439,9 @@ async fn exec_tool(
     models: &ModelRegistry,
     runtime_paths: &python_runtime::RuntimePaths,
 ) -> Result<Value, String> {
+    if let Some(result) = copilot_tools::exec_extra(name, args, state, runtime_paths).await {
+        return result;
+    }
     match name {
         "get_quote" => {
             let sym = arg_str(args, "symbol")?.to_uppercase();
@@ -566,6 +574,12 @@ async fn exec_tool(
             let path = arg_str(args, "path")?;
             let content = arg_str(args, "content")?;
             let full = strategy::normalize_strategy_path(path, runtime_paths)?;
+            let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
+            if full.exists() && !overwrite {
+                return Err(format!(
+                    "{path} already exists; read it first, then pass overwrite=true to replace it"
+                ));
+            }
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
@@ -949,30 +963,10 @@ async fn exec_tool(
     }
 }
 
-/// Describe a tool call for the UI trace (name + compact arg summary).
+/// Describe a tool call for the approval card and trace. Shows every detail the
+/// user is agreeing to (side, quantity, price, broker, ...), not just the symbol.
 fn trace_detail(name: &str, args: &Value) -> String {
-    let pick = |keys: &[&str]| -> String {
-        keys.iter()
-            .filter_map(|k| {
-                args.get(*k).map(|v| {
-                    format!(
-                        "{k}={}",
-                        v.as_str()
-                            .map(String::from)
-                            .unwrap_or_else(|| v.to_string())
-                    )
-                })
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    match name {
-        "save_strategy" | "read_strategy" => pick(&["path"]),
-        "run_backtest" => pick(&["path", "symbol", "timeframe"]),
-        "train_ml_model" => pick(&["algorithm", "data_path", "target_column"]),
-        "get_regression" => pick(&["x_symbol", "y_symbol"]),
-        _ => pick(&["symbol", "timeframe", "path"]),
-    }
+    copilot_tools::describe_call(name, args)
 }
 
 // ── Chat-completions tool loop ──────────────────────────────────────
@@ -1078,11 +1072,23 @@ const MAX_AGENT_ROUNDS: usize = 10;
 pub async fn copilot_chat(
     message: String,
     history: Option<Vec<CopilotMessage>>,
+    turn_id: Option<String>,
     state: State<'_, AppState>,
     models: State<'_, ModelRegistry>,
     runtime_paths: State<'_, python_runtime::RuntimePaths>,
 ) -> Result<CopilotReply, String> {
     validation::validate_string_length(&message, "message")?;
+    // Approvals and cached tool results belong to one user turn. The UI re-sends
+    // the same turn id after an approval, so a later message that makes the same
+    // call (say, buying again) is a new turn and must not hit the old cache.
+    if let Some(turn) = &turn_id {
+        let mut current = state.copilot_turn.lock().unwrap();
+        if current.as_ref() != Some(turn) {
+            *current = Some(turn.clone());
+            state.copilot_tool_cache.lock().unwrap().clear();
+            state.copilot_approvals.lock().unwrap().clear();
+        }
+    }
     let provider = resolve_provider(&state)?;
 
     // ACP providers hand the prompt to an external agent process.
@@ -1102,50 +1108,7 @@ pub async fn copilot_chat(
         });
     }
 
-    // Live context for the system prompt.
-    let positions = state.otm.get_positions();
-    let quotes: Vec<String> = state
-        .aggregator
-        .quote_cache()
-        .iter()
-        .take(20)
-        .map(|e| {
-            let q = e.value();
-            format!("{} last={:.2} chg={:+.2}%", e.key(), q.last, q.change_pct)
-        })
-        .collect();
-    let pos_text: Vec<String> = positions
-        .iter()
-        .take(20)
-        .map(|p| {
-            format!(
-                "{} qty={:.0} avg={:.2} pnl={:+.2}",
-                p.symbol.0, p.quantity, p.avg_price, p.pnl
-            )
-        })
-        .collect();
-
-    let system_prompt = format!(
-        "You are APEX Copilot, an agentic assistant inside a local trading terminal. \
-         You have tools to read live market data, run scans/regressions/quant stats, \
-         write strategy files, backtest them, export OHLCV datasets, and train ML models. \
-         When asked to build or optimise a strategy or model, iterate: fetch data, write \
-         the strategy, run a backtest, inspect metrics, adjust, and re-run. \
-         Answer tersely, never invent prices — use tools or the live context below. \
-         This is decision support, not financial advice.\n\n\
-         LIVE WATCHLIST QUOTES:\n{}\n\nOPEN POSITIONS:\n{}\n\nSESSION P&L: {:.2}",
-        if quotes.is_empty() {
-            "(no quotes loaded)".into()
-        } else {
-            quotes.join("\n")
-        },
-        if pos_text.is_empty() {
-            "(no open positions)".into()
-        } else {
-            pos_text.join("\n")
-        },
-        state.risk.session_pnl(),
-    );
+    let system_prompt = copilot_tools::system_prompt(&state, &runtime_paths);
 
     let mut trace: Vec<ToolCallTrace> = Vec::new();
     let state_ref = state.inner();
@@ -1210,6 +1173,7 @@ pub async fn copilot_chat(
                 if calls.is_empty() {
                     break;
                 }
+                let mut awaiting = false;
                 for call in calls {
                     input.push(call.clone());
                     let name = call.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -1234,13 +1198,19 @@ pub async fn copilot_chat(
                     )
                     .await
                     else {
-                        break 'rounds;
+                        // Pending approval: keep going so every gated call in this
+                        // round reaches the user, then stop after the round.
+                        awaiting = true;
+                        continue;
                     };
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": call_id,
                         "output": payload.to_string(),
                     }));
+                }
+                if awaiting {
+                    break 'rounds;
                 }
             }
             Ok(CopilotReply {
@@ -1300,6 +1270,7 @@ pub async fn copilot_chat(
                     break;
                 }
                 messages.push(msg);
+                let mut awaiting = false;
                 for call in calls {
                     let fname = call
                         .get("function")
@@ -1328,12 +1299,18 @@ pub async fn copilot_chat(
                     )
                     .await
                     else {
-                        break 'rounds;
+                        // Pending approval: keep going so every gated call in this
+                        // round reaches the user, then stop after the round.
+                        awaiting = true;
+                        continue;
                     };
                     messages.push(json!({
                         "role": "tool", "tool_call_id": id,
                         "content": payload.to_string(),
                     }));
+                }
+                if awaiting {
+                    break 'rounds;
                 }
             }
             Ok(CopilotReply {

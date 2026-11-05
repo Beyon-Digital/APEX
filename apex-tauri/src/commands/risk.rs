@@ -16,5 +16,9 @@ pub async fn get_risk_status(state: State<'_, AppState>) -> Result<RiskStatusDto
 #[tauri::command]
 pub async fn reset_halt(state: State<'_, AppState>) -> Result<(), String> {
     state.risk.reset_halt();
+    // Resume algos that the kill switch paused; they were stopped for safety.
+    state
+        .automations_paused
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
