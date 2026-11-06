@@ -1,9 +1,9 @@
-use super::{ml_datasets, ml_estimators, ml_expr, ml_features, python_runtime};
+use super::{ml_datasets, ml_estimators, ml_expr, ml_features, ml_recipes, python_runtime};
 use crate::dto::{
     CustomFeatureDto, HoldoutDto,
     CvFoldDto, FeatureImportanceDto, LabelSpecDto, MLModelDto, MLTrainingRequestDto,
     MLTrainingResultDto, ModelDetailDto, ModelSignalHistoryDto, ModelSignalPointDto,
-    ModelUsageDto, TradingSummaryDto,
+    ModelUsageDto, RecipeDto, TradingSummaryDto,
 };
 use crate::state::AppState;
 use crate::validation;
@@ -325,6 +325,7 @@ pub(crate) fn build_detail(
         context_symbols: field(&raw, "context_symbols").unwrap_or_default(),
         fee_pct: field(&raw, "fee_pct").unwrap_or(0.0),
         estimator_file: field(&raw, "estimator_file"),
+        recipe: field::<RecipeDto>(&raw, "recipe"),
     })
 }
 
@@ -556,6 +557,25 @@ pub(crate) fn prepare_training(
         payload["estimator_path"] = serde_json::json!(path.to_string_lossy());
     }
 
+    if request.algorithm == ml_estimators::RECIPE_ALGORITHM {
+        let name = request
+            .recipe
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .ok_or_else(|| "algorithm `recipe` needs a recipe name (save one in the algorithm builder first)".to_string())?;
+        let recipe = ml_recipes::load_recipe(runtime_paths.work_root(), name)?;
+        // The saved file may have been edited by hand; the structural rules apply again. The deep
+        // check needs Python and runs in `train_core_with`.
+        let issues = ml_recipes::structural_issues(&recipe);
+        if !issues.is_empty() {
+            return Err(format!("Algorithm `{name}` is not valid: {}", ml_recipes::join_issues(&issues)));
+        }
+        // Parameters live in the recipe, so nothing the request carried applies.
+        payload["hyperparams"] = serde_json::json!({});
+        payload["recipe"] = serde_json::to_value(&recipe).map_err(|e| format!("Failed to encode the recipe: {e}"))?;
+        payload["recipe_name"] = serde_json::json!(name);
+    }
+
     let data_path;
     if let Some(name) = &request.dataset {
         let dir = ml_datasets::datasets_dir(runtime_paths);
@@ -646,7 +666,17 @@ pub(crate) async fn train_ml_model_inner(
     state: &AppState,
     actor: &str,
 ) -> Result<MLTrainingResultDto, String> {
-    let algorithm = request.algorithm.clone();
+    let algorithm = match (request.algorithm.as_str(), request.recipe.as_deref()) {
+        (ml_estimators::RECIPE_ALGORITHM, Some(name)) => {
+            let label = ml_recipes::load_recipe(runtime_paths.work_root(), name)
+                .ok()
+                .map(|r| r.label)
+                .filter(|l| !l.trim().is_empty())
+                .unwrap_or_else(|| name.to_string());
+            format!("algorithm {label}")
+        }
+        _ => request.algorithm.clone(),
+    };
     let source_label = request
         .dataset
         .clone()
@@ -693,8 +723,15 @@ pub(crate) async fn train_core_with(
     let prepared = prepare_training(request, models_dir, runtime_paths, actor)?;
 
     // Keys and values are checked against the installed estimator before a trainer is started.
-    let catalog = ml_estimators::fetch_algorithms(runtime_paths).await?;
-    ml_estimators::validate_with_catalog(&catalog, &request.algorithm, &request.hyperparams)?;
+    if request.algorithm == ml_estimators::RECIPE_ALGORITHM {
+        // Every member's parameters go through the catalog validator inside the recipe check.
+        let recipe: RecipeDto = serde_json::from_value(prepared.payload["recipe"].clone())
+            .map_err(|e| format!("Failed to read the recipe: {e}"))?;
+        ml_recipes::require_valid(runtime_paths, &recipe).await?;
+    } else {
+        let catalog = ml_estimators::fetch_algorithms(runtime_paths).await?;
+        ml_estimators::validate_with_catalog(&catalog, &request.algorithm, &request.hyperparams)?;
+    }
 
     let python = python_runtime::resolve_python_executable(
         runtime_paths,
@@ -2085,6 +2122,251 @@ mod tests {
         let err = block_on(train_core(&request, &models, &paths, "user")).unwrap_err();
         assert!(err.contains("fit()"), "{err}");
         assert!(fs::read_dir(&models).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── Algorithm recipes ────────────────────────────────────────────
+
+    fn sample_recipe(name: &str) -> RecipeDto {
+        serde_json::from_value(json!({
+            "name": name, "label": "Scaled forest", "description": "",
+            "steps": [{"kind": "standard_scaler", "params": {}}],
+            "model": {"kind": "single", "algorithm": "random_forest", "params": {"n_estimators": 15, "max_depth": 4}},
+            "calibrate": "none"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn old_requests_and_metadata_load_without_recipe_fields() {
+        let r: MLTrainingRequestDto = serde_json::from_str(r#"{"algorithm":"random_forest","dataset":"d"}"#).unwrap();
+        assert!(r.recipe.is_none());
+        assert!(serde_json::to_value(&r).unwrap().get("recipe").is_none(), "unset recipe is not serialized");
+        let r: MLTrainingRequestDto = serde_json::from_str(r#"{"algorithm":"recipe","dataset":"d","recipe":"mine"}"#).unwrap();
+        assert_eq!(r.recipe.as_deref(), Some("mine"));
+
+        let dir = temp("detail-recipe");
+        let id = write_old_model(&dir);
+        let old = build_detail(&dir, &id, vec![]).unwrap();
+        assert!(old.recipe.is_none());
+        assert!(serde_json::to_value(&old).unwrap()["recipe"].is_null(), "the UI reads recipe: null");
+
+        let mut doc: Value = serde_json::from_str(OLD_METADATA).unwrap();
+        doc["algorithm"] = json!("recipe");
+        doc["recipe_name"] = json!("mine");
+        doc["recipe"] = serde_json::to_value(sample_recipe("mine")).unwrap();
+        fs::write(dir.join(format!("{id}.json")), doc.to_string()).unwrap();
+        let d = build_detail(&dir, &id, vec![]).unwrap();
+        assert_eq!(d.algorithm, "recipe");
+        assert_eq!(d.recipe.as_ref().unwrap().label, "Scaled forest");
+        assert!(load_registered_models(&dir).unwrap().iter().any(|m| m.model_id == id && m.algorithm == "recipe"));
+
+        // A recipe that does not parse never hides the model.
+        doc["recipe"] = json!({"name": "mine", "model": {"kind": "bagging"}});
+        fs::write(dir.join(format!("{id}.json")), doc.to_string()).unwrap();
+        assert!(build_detail(&dir, &id, vec![]).unwrap().recipe.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_training_builds_the_payload_for_a_saved_recipe_and_refuses_a_missing_one() {
+        let root = temp("prepare-recipe");
+        let paths = python_runtime::RuntimePaths::for_test(&root);
+        let models = root.join("models");
+        build_dataset_files(&paths, "dsr", &["AAPL"], 120);
+
+        let mut req: MLTrainingRequestDto = serde_json::from_value(json!({
+            "algorithm": "recipe", "dataset": "dsr", "recipe": "mine", "trade_mode": "long_short",
+            "holdout_pct": 20.0, "random_state": 5, "n_splits": 4,
+            // Parameters live in the recipe; whatever the request carries is dropped.
+            "hyperparams": {"n_estimators": 999}
+        }))
+        .unwrap();
+        let err = prepare_training(&req, &models, &paths, "user").unwrap_err();
+        assert!(err.contains("`mine` not found"), "{err}");
+
+        ml_recipes::write_recipe(&root, &sample_recipe("mine")).unwrap();
+        let p = prepare_training(&req, &models, &paths, "user").unwrap();
+        assert_eq!(p.payload["algorithm"], "recipe");
+        assert_eq!(p.payload["recipe_name"], "mine");
+        assert_eq!(p.payload["recipe"]["label"], "Scaled forest");
+        assert_eq!(p.payload["recipe"]["model"]["kind"], "single");
+        assert_eq!(p.payload["recipe"]["steps"][0]["kind"], "standard_scaler");
+        assert_eq!(p.payload["hyperparams"], json!({}), "hyperparams are forced empty");
+        assert_eq!(p.payload["trade_mode"], "long_short");
+        assert_eq!(p.payload["holdout_pct"], 20.0);
+        assert_eq!(p.payload["random_state"], 5);
+        assert_eq!(p.payload["n_splits"], 4);
+        assert_eq!(p.payload["dataset"], "dsr");
+        assert_eq!(p.payload["horizon_bars"], 5);
+        assert!(p.payload.get("estimator_path").is_none());
+
+        // The recipe name is required, and must be a name (no path tricks).
+        req.recipe = None;
+        assert!(prepare_training(&req, &models, &paths, "user").unwrap_err().contains("recipe name"));
+        req.recipe = Some("  ".into());
+        assert!(prepare_training(&req, &models, &paths, "user").unwrap_err().contains("recipe name"));
+        for bad in ["../mine", "mine.json", "Mine", "a/b"] {
+            req.recipe = Some(bad.into());
+            assert!(prepare_training(&req, &models, &paths, "user").is_err(), "{bad}");
+        }
+
+        // A recipe name on another algorithm is ignored; the other algorithms are untouched.
+        let mut plain: MLTrainingRequestDto = serde_json::from_str(r#"{"algorithm":"random_forest","dataset":"dsr","recipe":"mine","hyperparams":{"n_estimators":7}}"#).unwrap();
+        let p = prepare_training(&plain, &models, &paths, "user").unwrap();
+        assert!(p.payload.get("recipe").is_none() && p.payload.get("recipe_name").is_none());
+        assert_eq!(p.payload["hyperparams"], json!({"n_estimators": 7}));
+        plain.algorithm = "custom".into();
+        assert!(prepare_training(&plain, &models, &paths, "user").unwrap_err().contains("estimator_file"));
+
+        // A hand-edited recipe file that breaks the structural rules is refused with its problems.
+        let file = ml_recipes::recipes_dir(&root).join("mine.json");
+        let mut doc: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        doc["model"] = json!({"kind": "voting", "voting": "soft", "members": [{"algorithm": "custom", "params": {}}]});
+        fs::write(&file, doc.to_string()).unwrap();
+        req.recipe = Some("mine".into());
+        let err = prepare_training(&req, &models, &paths, "user").unwrap_err();
+        assert!(err.contains("model.members") && err.contains("model.members[0].algorithm"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A work root whose apex-python holds only the given stub modules (and the real virtualenv),
+    /// to test what Rust sends and how it reads the answers without the real Python code.
+    fn stub_python_root(name: &str, files: &[(&str, &str)]) -> Option<(PathBuf, python_runtime::RuntimePaths, PathBuf)> {
+        let repo = python_runtime::repo_root().unwrap();
+        let venv = repo.join("apex-python").join(".venv");
+        if !venv.join("bin").join("python").exists() {
+            eprintln!("skipping: apex-python virtualenv not found");
+            return None;
+        }
+        #[cfg(not(unix))]
+        return None;
+        let root = temp(name);
+        let ml = root.join("apex-python").join("ml");
+        fs::create_dir_all(&ml).unwrap();
+        fs::write(ml.join("__init__.py"), "").unwrap();
+        for (file, text) in files {
+            fs::write(ml.join(file), text).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&venv, root.join("apex-python").join(".venv")).unwrap();
+        let paths = python_runtime::RuntimePaths::for_test(&root);
+        let models = root.join("models");
+        fs::create_dir_all(&models).unwrap();
+        Some((root, paths, models))
+    }
+
+    const STUB_RECIPES: &str = r#"
+import json, sys
+if sys.argv[1] == "blocks":
+    print(json.dumps({"steps": [], "members": [], "limits": {}}))
+else:
+    assert sys.argv[2] == "--json" and len(sys.argv) == 4, sys.argv
+    recipe = json.loads(sys.argv[3])
+    errors = []
+    if recipe["label"] == "reject me":
+        errors = [{"path": "steps[0].params.k", "message": "k too big"}, {"path": "model.members[1]", "message": "twice"}]
+    print("noise before")
+    print(json.dumps({"ok": not errors, "errors": errors, "warnings": [], "steps": len(recipe["steps"]), "models": 1, "est_model_mb": 1.5}))
+"#;
+
+    /// Records the payload it gets and answers like the real trainer. There is no ml.catalog here:
+    /// asking the algorithm catalog about "recipe" would fail the run.
+    const STUB_TRAINER: &str = r#"
+import json, sys
+payload = json.loads(sys.argv[sys.argv.index("--config-json") + 1])
+open(payload["output_dir"] + "/payload.json", "w").write(json.dumps(payload))
+print(json.dumps({"model_id": "m_stub", "algorithm": "recipe", "metrics": {"accuracy": 0.6}, "feature_names": ["a"],
+    "created_at": "2026-01-01T00:00:00+00:00", "model_path": "x", "metadata_path": "y", "data_path": payload["data_path"], "target_column": "target"}))
+"#;
+
+    #[test]
+    fn a_recipe_is_deep_checked_then_the_trainer_gets_the_recipe_and_its_name() {
+        let Some((root, paths, models)) = stub_python_root("stub-recipe", &[("recipes.py", STUB_RECIPES), ("trainer.py", STUB_TRAINER)]) else { return };
+        build_dataset_files(&paths, "dst", &["AAA"], 150);
+        ml_recipes::write_recipe(&root, &sample_recipe("mine")).unwrap();
+        let request: MLTrainingRequestDto = serde_json::from_value(json!({
+            "algorithm": "recipe", "dataset": "dst", "recipe": "mine", "hyperparams": {"n_estimators": 3}
+        }))
+        .unwrap();
+        let r = block_on(train_core(&request, &models, &paths, "user")).unwrap();
+        assert_eq!(r.model_id, "m_stub");
+        let seen: Value = serde_json::from_str(&fs::read_to_string(models.join("payload.json")).unwrap()).unwrap();
+        assert_eq!(seen["algorithm"], "recipe");
+        assert_eq!(seen["recipe_name"], "mine");
+        assert_eq!(seen["recipe"]["model"]["algorithm"], "random_forest");
+        assert_eq!(seen["hyperparams"], json!({}));
+        assert_eq!(seen["horizon_bars"], 5);
+
+        // The deep check can refuse: nothing is trained and every problem is named.
+        let mut rejected = sample_recipe("rejected");
+        rejected.label = "reject me".into();
+        ml_recipes::write_recipe(&root, &rejected).unwrap();
+        fs::remove_file(models.join("payload.json")).unwrap();
+        let bad: MLTrainingRequestDto = serde_json::from_value(json!({"algorithm": "recipe", "dataset": "dst", "recipe": "rejected"})).unwrap();
+        let err = block_on(train_core(&bad, &models, &paths, "user")).unwrap_err();
+        assert_eq!(err, "steps[0].params.k: k too big; model.members[1]: twice");
+        assert!(!models.join("payload.json").exists(), "the trainer never started");
+
+        // Saving goes through the same check and writes nothing when it fails.
+        let err = block_on(ml_recipes::require_valid(&paths, &rejected)).unwrap_err();
+        assert!(err.contains("k too big"), "{err}");
+        let check = block_on(ml_recipes::check_recipe(&paths, &sample_recipe("fine"))).unwrap();
+        assert!(check.ok && check.steps == 1 && check.est_model_mb == Some(1.5));
+        let blocks = block_on(ml_recipes::fetch_building_blocks(&paths)).unwrap();
+        assert!(blocks["steps"].is_array());
+
+        // Saving goes through the check and writes the file; a failed check writes nothing.
+        let state = block_on(crate::state::AppState::init(paths.clone())).expect("test AppState");
+        let saved = block_on(ml_recipes::save_inner(&state, &paths, &sample_recipe("kept"), "user")).unwrap();
+        assert!(saved.updated_at.is_some());
+        let err = block_on(ml_recipes::save_inner(&state, &paths, &rejected, "user")).unwrap_err();
+        assert!(err.contains("k too big"));
+        assert!(ml_recipes::load_recipe(&root, "kept").is_ok());
+        assert!(ml_recipes::delete_inner(&state, &root, "kept", "user").unwrap());
+        assert!(!ml_recipes::delete_inner(&state, &root, "kept", "user").unwrap());
+        // (The activity entries are only written when a Tauri app handle exists, so they are not asserted here.)
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn training_with_a_recipe_works_end_to_end_and_the_detail_keeps_a_copy() {
+        let Some((root, paths, models)) = python_root("recipe-e2e") else { return };
+        if !python_runtime::repo_root().unwrap().join("apex-python").join("ml").join("recipes.py").exists() {
+            eprintln!("skipping: apex-python/ml/recipes.py not found");
+            return;
+        }
+        build_dataset_files(&paths, "rc", &["AAA", "BBB"], 900);
+        let recipe: RecipeDto = serde_json::from_value(json!({
+            "name": "ens", "label": "Forest and linear", "description": "e2e",
+            "steps": [{"kind": "standard_scaler", "params": {}}, {"kind": "select_k_best", "params": {"k": 4, "score": "f_classif"}}],
+            "model": {"kind": "stacking", "blocks": 3,
+                "members": [{"algorithm": "random_forest", "params": {"n_estimators": 10, "max_depth": 3}},
+                            {"algorithm": "logistic_regression", "params": {}}],
+                "final": {"algorithm": "logistic_regression", "params": {}}},
+            "calibrate": "none"
+        }))
+        .unwrap();
+        let state = block_on(crate::state::AppState::init(paths.clone())).expect("test AppState");
+        let saved = block_on(ml_recipes::save_inner(&state, &paths, &recipe, "user")).unwrap();
+        assert!(saved.created_at.is_some());
+        assert_eq!(ml_recipes::list_recipe_files(&root).len(), 1);
+
+        let request: MLTrainingRequestDto = serde_json::from_value(json!({
+            "algorithm": "recipe", "dataset": "rc", "recipe": "ens", "n_splits": 3, "holdout_pct": 15.0
+        }))
+        .unwrap();
+        let r = block_on(train_core(&request, &models, &paths, "user")).unwrap();
+        assert_eq!(r.status, "completed");
+        let d = build_detail(&models, &r.model_id, vec![]).unwrap();
+        assert_eq!(d.algorithm, "recipe");
+        assert_eq!(d.recipe.as_ref().map(|r| r.name.as_str()), Some("ens"));
+        assert_eq!(d.cv_folds.len(), 3);
+
+        // Deleting the saved recipe leaves the model and its copy alone.
+        assert!(ml_recipes::remove_recipe(&root, "ens").unwrap());
+        let d = build_detail(&models, &r.model_id, vec![]).unwrap();
+        assert_eq!(d.recipe.unwrap().label, "Forest and linear");
         let _ = fs::remove_dir_all(&root);
     }
 }

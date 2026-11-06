@@ -22,6 +22,9 @@ Evaluation notes
 * ``holdout_pct`` removes the last share of the time steps before cross-validation (with an
   embargo of ``horizon_bars`` steps), fits the final model on the rest only, and scores the
   hold-out once, so that number never influenced any choice.
+* Recipes (``algorithm="recipe"``) assemble library parts without code, see :mod:`ml.recipes`.
+  Their stacker and calibrator are time-aware and are told how many rows a label reaches ahead
+  (:meth:`ModelTrainer._embargo_rows`).  ``hyperparams`` must be empty for a recipe.
 * Custom estimators (``algorithm="custom"``) are imported from a user file, see
   :mod:`ml.estimators`.  The file is copied next to the model so scoring keeps working if the
   original is edited or deleted.
@@ -51,7 +54,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from ml import catalog
+from ml import catalog, recipes
 from ml.catalog import DEFAULT_SEED, MAX_SEED, check_model_size, validate_hyperparams  # noqa: F401 - re-exported
 from ml.estimators import (
     LabelEncodedClassifier,
@@ -100,6 +103,10 @@ class TrainingConfig:
     #: custom estimator: file name (``my_model.py``) and the absolute path it is read from
     estimator_file: str | None = None
     estimator_path: str | None = None
+    #: algorithm "recipe": the RecipeDto (steps + model) to build, and the saved recipe's name.
+    #: The full spec is stored in the model's metadata so the model outlives the saved recipe.
+    recipe: dict[str, Any] | None = None
+    recipe_name: str | None = None
 
 
 @dataclass
@@ -130,6 +137,7 @@ class Prepared:
     n_steps: int
 
 
+RECIPE = "recipe"
 TRADE_MODES = ("long_flat", "long_short")
 MAX_HOLDOUT_PCT = 40
 
@@ -177,7 +185,8 @@ class ModelTrainer:
             "Starting training run: algorithm=%s source=%s trade_mode=%s holdout=%s%%",
             config.algorithm, config.source, config.trade_mode, config.holdout_pct,
         )
-        hyperparams = validate_hyperparams(config.algorithm, config.hyperparams)
+        recipe = self._prepare_recipe(config)
+        hyperparams = {} if recipe is not None else validate_hyperparams(config.algorithm, config.hyperparams)
         if not 2 <= config.n_splits <= 20:
             raise ValueError("n_splits must be between 2 and 20")
         if config.trade_mode not in TRADE_MODES:
@@ -200,7 +209,10 @@ class ModelTrainer:
 
         usable_rows = len(data.y)
         # Refuse a configuration that cannot fit in memory before spending time on it.
-        check_model_size(config.algorithm, hyperparams, usable_rows, int(len(set(data.y.tolist()))))
+        if recipe is not None:
+            recipes.check_model_size(recipe, usable_rows, int(len(set(data.y.tolist()))))
+        else:
+            check_model_size(config.algorithm, hyperparams, usable_rows, int(len(set(data.y.tolist()))))
         holdout_data = None
         split_info = None
         if config.holdout_pct > 0:
@@ -220,7 +232,10 @@ class ModelTrainer:
         label_kind = self._label_kind(config, np.unique(np.concatenate([data.y, holdout_data.y])) if holdout_data else classes)
 
         hyperparams = self._with_seed(config, hyperparams)
-        factory = self._model_factory(config, hyperparams, classes, estimator)
+        if recipe is not None:
+            factory = self._recipe_factory(recipe, hyperparams, self._embargo_rows(data))
+        else:
+            factory = self._model_factory(config, hyperparams, classes, estimator)
         folds, metrics, trading_periods = self._evaluate(factory, data, config, label_kind)
 
         model = factory()
@@ -232,11 +247,14 @@ class ModelTrainer:
             holdout = self._score_holdout(model, holdout_data, config, label_kind, split_info)
 
         trading = self._summarise_trading(trading_periods, config)
-        importances = self._importances(model, data.feature_names)
+        importances = (
+            recipes.importances(model, data.feature_names, data.x) if recipe is not None
+            else self._importances(model, data.feature_names)
+        )
         duration = round(time.perf_counter() - started, 2)
         return self._register(
             model, data, metrics, folds, trading, importances, hyperparams, duration, config, buffer,
-            holdout=holdout, estimator=estimator, total_rows=usable_rows,
+            holdout=holdout, estimator=estimator, total_rows=usable_rows, recipe=recipe,
         )
 
     # ------------------------------------------------------------------
@@ -248,7 +266,9 @@ class ModelTrainer:
         """Fill in ``random_state`` for estimators that take one, so runs repeat exactly."""
         out = dict(hyperparams)
         seed = DEFAULT_SEED if config.random_state is None else int(config.random_state)
-        if config.algorithm == catalog.CUSTOM:
+        if config.algorithm == RECIPE:
+            out["random_state"] = seed  # recorded in the metadata; the recipe's members take it as their default
+        elif config.algorithm == catalog.CUSTOM:
             out.setdefault("random_state", seed)
         elif "random_state" in catalog.param_specs(config.algorithm):
             out.setdefault("random_state", seed)
@@ -271,6 +291,47 @@ class ModelTrainer:
             raise ValueError(f"{config.estimator_file} changed while it was being loaded; run the training again")
         return {"name": config.estimator_file, "path": str(path), "bytes": data, "sha256": sha,
                 "module_name": module_name, "module": module}
+
+    @staticmethod
+    def _prepare_recipe(config: TrainingConfig) -> dict[str, Any] | None:
+        """The checked, normalised recipe for ``algorithm="recipe"``; None for every other algorithm."""
+        if config.algorithm != RECIPE:
+            if config.recipe is not None:
+                raise ValueError("a recipe can only be used with algorithm 'recipe'")
+            return None
+        if not isinstance(config.recipe, dict):
+            raise ValueError("algorithm 'recipe' needs a recipe (build one in the Train tab first)")
+        if config.hyperparams:
+            raise ValueError("hyperparams must be empty for a recipe; set each model's parameters inside the recipe")
+        spec = recipes.prepare(config.recipe)  # the trainer accepts an unsaved draft without a name
+        if config.recipe_name:
+            spec["name"] = str(config.recipe_name)
+        return spec
+
+    @staticmethod
+    def _embargo_rows(data: Prepared) -> int:
+        """How many rows ahead (in the chronological row order) a row's label reaches.
+
+        Rows are sorted by time, then symbol, so with several symbols the rows of one time step are
+        next to each other and a label that is ``horizon`` bars long reaches ``horizon`` *steps*
+        ahead, which is about ``horizon * symbols`` rows, and more when a symbol has gaps. Rather
+        than guess, count it: for every row, the rows after it whose time step is at or before the
+        step where its label is decided, and take the maximum. A time-aware stacker or calibrator
+        that leaves this many rows between its training rows and the rows it predicts never
+        trains on a label that overlaps them. The count over the full data is an upper bound for
+        any fold, because fold training rows are a subset in the same order.
+        """
+        n = len(data.step)
+        if n == 0:
+            return 0
+        reach = np.searchsorted(data.step, data.label_end, side="right") - 1 - np.arange(n)
+        return int(max(int(reach.max()), 0))
+
+    @staticmethod
+    def _recipe_factory(recipe: dict[str, Any], hyperparams: dict[str, Any], embargo_rows: int) -> Callable[[], BaseEstimator]:
+        """Builder of fresh, unfitted recipe models (one per fold, one for the end)."""
+        seed = hyperparams.get("random_state", DEFAULT_SEED)
+        return lambda: recipes.build(recipe, embargo_rows=embargo_rows, random_state=seed)
 
     def _model_factory(
         self, config: TrainingConfig, hyperparams: dict[str, Any], classes: np.ndarray, estimator: dict[str, Any] | None
@@ -712,6 +773,7 @@ class ModelTrainer:
         holdout: dict[str, Any] | None = None,
         estimator: dict[str, Any] | None = None,
         total_rows: int | None = None,
+        recipe: dict[str, Any] | None = None,
     ) -> TrainedModel:
         """Persist model with joblib + companion metadata json and log."""
         out_dir = Path(config.output_dir)
@@ -757,6 +819,9 @@ class ModelTrainer:
 
         meta = config.dataset_meta or {}
         effective = dict(hyperparams)
+        seed_used = effective.get("random_state")
+        if recipe is not None:
+            effective.pop("random_state", None)  # a recipe has no top-level hyperparameters
         metadata = {
             "model_id": model_id,
             "algorithm": config.algorithm,
@@ -788,11 +853,12 @@ class ModelTrainer:
             "trading": trading,
             "trade_mode": config.trade_mode,
             "holdout": holdout,
-            "random_state": effective.get("random_state"),
+            "random_state": seed_used,
             # Copied from the dataset so inference can recompute the same features.
             "custom_features": list(meta.get("custom_features") or []),
             "context_symbols": list(meta.get("context_symbols") or []),
             "fee_pct": float(meta.get("fee_pct") or 0.0),
+            **({"recipe": recipe, "recipe_name": recipe.get("name") or config.recipe_name} if recipe is not None else {}),
             **({"estimator_file": None} if estimator is None else {}),
             **estimator_meta,
         }

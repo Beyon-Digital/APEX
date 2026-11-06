@@ -345,6 +345,13 @@ fn resolve_provider(state: &AppState) -> Result<ResolvedProvider, String> {
 
 // ── Tool schemas (OpenAI function-calling format) ───────────────────
 
+/// The algorithm ids `train_ml_model` accepts: the built-in ones plus `recipe`.
+fn train_algorithm_ids() -> Vec<&'static str> {
+    let mut ids = ml_estimators::ALGORITHMS.to_vec();
+    ids.push(ml_estimators::RECIPE_ALGORITHM);
+    ids
+}
+
 fn tool_schemas() -> Value {
     let tools = [
         ("get_quote", "Latest quote for a watchlist symbol", json!({
@@ -405,9 +412,10 @@ fn tool_schemas() -> Value {
             "required": ["symbol"] })),
         ("list_ml_models", "List trained ML models with metrics", json!({
             "type": "object", "properties": {} })),
-        ("train_ml_model", "Train an ML model with time-series cross-validation. Best path: build_dataset, then train_ml_model {algorithm, dataset}. Returns model_id, metrics, trading result against buy and hold, and flags for weak spots; read get_model for per-fold detail. Use holdout_pct to also score a final untouched stretch. Alternatively give data_path, target_column and feature_columns for a CSV you already have with a label column. list_algorithms shows every algorithm with its hyperparameters. algorithm `custom` trains the Python estimator file estimator_file and needs the user's approval.", json!({
+        ("train_ml_model", "Train an ML model with time-series cross-validation. Best path: build_dataset, then train_ml_model {algorithm, dataset}. Returns model_id, metrics, trading result against buy and hold, and flags for weak spots; read get_model for per-fold detail. Use holdout_pct to also score a final untouched stretch. Alternatively give data_path, target_column and feature_columns for a CSV you already have with a label column. list_algorithms shows every algorithm with its hyperparameters. algorithm `custom` trains the Python estimator file estimator_file and needs the user's approval. algorithm `recipe` trains a saved algorithm recipe (list_recipes) named in `recipe`; its parameters live in the recipe, so hyperparams is ignored, and it needs no extra approval.", json!({
             "type": "object", "properties": {
-                "algorithm": {"type": "string", "enum": ml_estimators::ALGORITHMS},
+                "algorithm": {"type": "string", "enum": train_algorithm_ids()},
+                "recipe": {"type": "string", "description": "with algorithm recipe: the name of a saved recipe from list_recipes / save_recipe"},
                 "dataset": {"type": "string", "description": "name of a dataset from build_dataset; supplies data_path, target and features"},
                 "feature_columns": {"type": "array", "items": {"type": "string"}, "description": "optional subset of the dataset's features; required with data_path"},
                 "hyperparams": {"type": "object", "description": "constructor parameters of the algorithm, by name (see list_algorithms for the names and defaults); out-of-range values are rejected with the allowed range. For `custom` they are passed to make_estimator(params)"},
@@ -821,8 +829,18 @@ async fn exec_tool(
                     .unwrap_or_default()
             };
             let text = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let algorithm = arg_str(args, "algorithm")?.to_string();
+            let recipe = optional_str(args, "recipe")?;
+            if algorithm == ml_estimators::RECIPE_ALGORITHM {
+                if recipe.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                    return Err("algorithm `recipe` needs `recipe`, the name of a saved recipe; see list_recipes".into());
+                }
+            } else if recipe.is_some() {
+                return Err("`recipe` is only used with algorithm `recipe`".into());
+            }
+            let hyperparams = if algorithm == ml_estimators::RECIPE_ALGORITHM { Default::default() } else { hyperparams };
             let req = MLTrainingRequestDto {
-                algorithm: arg_str(args, "algorithm")?.to_string(),
+                algorithm,
                 data_path: text("data_path"),
                 target_column: text("target_column"),
                 feature_columns: strings("feature_columns"),
@@ -839,6 +857,7 @@ async fn exec_tool(
                 trade_mode: optional_str(args, "trade_mode")?,
                 holdout_pct: optional_number(args, "holdout_pct")?,
                 estimator_file: optional_str(args, "estimator_file")?,
+                recipe: recipe.map(|r| r.trim().to_string()),
                 random_state: optional_integer(args, "random_state")?,
             };
             if req.algorithm == "custom" {
@@ -1612,9 +1631,11 @@ mod ml_tool_tests {
         for algo in &algos {
             assert!(ml_estimators::validate_algorithm_id(algo).is_ok(), "{algo} is not a valid algorithm");
         }
-        assert_eq!(algos, ml_estimators::ALGORITHMS);
+        let mut expected = ml_estimators::ALGORITHMS.to_vec();
+        expected.push("recipe");
+        assert_eq!(algos, expected, "the built-in algorithms plus recipe");
         assert!(algos.contains(&"custom") && algos.contains(&"extra_trees") && algos.contains(&"hist_gradient_boosting"));
-        for field in ["trade_mode", "holdout_pct", "random_state", "estimator_file"] {
+        for field in ["trade_mode", "holdout_pct", "random_state", "estimator_file", "recipe"] {
             assert!(train.get(field).is_some(), "train_ml_model should accept `{field}`");
         }
         assert_eq!(train["trade_mode"]["enum"], json!(["long_flat", "long_short"]));
@@ -1723,6 +1744,7 @@ mod ml_tool_tests {
 #[cfg(test)]
 mod approval_flow_tests {
     use super::*;
+    use super::super::{ml_datasets, ml_expr, ml_recipes};
     use copilot_tools::test_support::{state as test_state, write_estimator, ESTIMATOR};
 
     type Run = (Option<Value>, Vec<ToolCallTrace>, Vec<PendingApprovalDto>);
@@ -1909,6 +1931,235 @@ mod approval_flow_tests {
         write_estimator(&paths2, "mine.py", ESTIMATOR);
         let _ = exec_tool("train_ml_model", &json!({"algorithm": "random_forest", "dataset": "d", "estimator_file": "mine.py"}), &state2, &ml::ModelRegistry::new(&paths2), &paths2).await;
         assert!(state2.copilot_trusted_files.lock().unwrap().is_empty());
+    }
+
+    fn voting_recipe(name: &str) -> Value {
+        json!({
+            "name": name, "label": "Calm vote", "description": "scaled forest and linear model",
+            "steps": [{"kind": "standard_scaler", "params": {}}],
+            "model": {"kind": "voting", "voting": "soft", "members": [
+                {"algorithm": "random_forest", "params": {"n_estimators": 10, "max_depth": 3}},
+                {"algorithm": "logistic_regression", "params": {}}]},
+            "calibrate": "none"
+        })
+    }
+
+    /// A two-symbol dataset built by the real builder, so the CSV and its sidecar agree.
+    fn write_dataset(paths: &python_runtime::RuntimePaths, name: &str) {
+        use super::super::ml_features::tests::synthetic_bars;
+        let req: crate::dto::BuildDatasetRequestDto = serde_json::from_value(json!({
+            "name": name, "symbols": ["AAA", "BBB"], "timeframe": "1d", "bars": 700,
+            "features": ["ret_1", "ret_5", "rsi_14", "vol_10", "macd_hist"],
+            "label": {"horizon_bars": 5, "kind": "direction", "threshold_pct": 0.0}
+        }))
+        .unwrap();
+        let req = ml_datasets::normalize_request(&req).unwrap();
+        let series = vec![("AAA".to_string(), synthetic_bars(700)), ("BBB".to_string(), synthetic_bars(685))];
+        let rel = ml_datasets::relative_csv_path(paths, name);
+        let (csv, info) = ml_datasets::assemble_with(&req, &series, &ml_expr::Context::new(), "user", &rel, chrono::Utc::now()).unwrap();
+        ml_datasets::write_dataset(&ml_datasets::datasets_dir(paths), &csv, &info).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_mode_refuses_recipe_writes_and_training_but_answers_the_reads() {
+        let (state, paths) = test_state("flow-recipe-ask").await;
+        for (name, args) in [
+            ("save_recipe", voting_recipe("calm_vote")),
+            ("delete_recipe", json!({"name": "calm_vote"})),
+            ("train_ml_model", json!({"algorithm": "recipe", "recipe": "calm_vote", "dataset": "d"})),
+        ] {
+            let (out, trace, pending) = run(&state, &paths, ChatMode::Ask, name, args).await;
+            let out = out.unwrap_or_else(|| panic!("{name} should answer, not pause"));
+            assert!(out["error"].as_str().unwrap().contains("Ask mode"), "{name}: {out}");
+            assert!(pending.is_empty() && !trace[0].ok, "{name}");
+        }
+        assert!(!paths.work_root().join("algorithms").exists(), "refused calls write nothing");
+
+        let (listed, trace, pending) = run(&state, &paths, ChatMode::Ask, "list_recipes", json!({})).await;
+        let listed = listed.unwrap();
+        assert_eq!((listed["count"].as_u64(), pending.len(), trace[0].ok), (Some(0), 0, true), "{listed}");
+        let (missing, trace, _) = run(&state, &paths, ChatMode::Ask, "get_recipe", json!({"name": "nope"})).await;
+        assert!(missing.unwrap()["error"].as_str().unwrap().contains("not found") && !trace[0].ok);
+        // Checks that need no Python still answer in Ask: a bad name is reported with its path.
+        let mut bad = voting_recipe("Bad Name");
+        bad["label"] = json!("x");
+        let (checked, _, pending) = run(&state, &paths, ChatMode::Ask, "validate_recipe", bad).await;
+        let checked = checked.unwrap();
+        assert_eq!(checked["ok"], false, "{checked}");
+        assert!(checked["errors"].as_array().unwrap().iter().any(|e| e["path"] == "name"), "{checked}");
+        assert!(pending.is_empty());
+        let (junk, _, _) = run(&state, &paths, ChatMode::Ask, "validate_recipe", json!({"name": "x"})).await;
+        assert!(junk.unwrap()["error"].as_str().unwrap().contains("invalid recipe"));
+    }
+
+    #[tokio::test]
+    async fn review_mode_asks_before_saving_deleting_or_training_a_recipe_and_the_cards_say_what_happens() {
+        let (state, paths) = test_state("flow-recipe-review").await;
+        let (out, trace, pending) = run(&state, &paths, ChatMode::Review, "save_recipe", voting_recipe("calm_vote")).await;
+        assert!(out.is_none() && pending.len() == 1, "nothing is saved before approval");
+        assert!(pending[0].detail.starts_with("Save algorithm recipe calm_vote"), "{}", pending[0].detail);
+        assert!(pending[0].detail.contains("standard_scaler then soft voting of random_forest, logistic_regression"), "{}", pending[0].detail);
+        assert!(pending[0].detail.contains("no code runs"), "{}", pending[0].detail);
+        assert!(!pending[0].key.contains("#estimator"), "recipes use the plain approval key: {}", pending[0].key);
+        assert!(trace[0].detail.ends_with("awaiting approval"), "{}", trace[0].detail);
+        assert!(!paths.work_root().join("algorithms").exists());
+
+        let (out, _, pending) = run(&state, &paths, ChatMode::Review, "delete_recipe", json!({"name": "calm_vote"})).await;
+        assert!(out.is_none() && pending[0].detail.starts_with("Delete algorithm recipe calm_vote"), "{:?}", pending);
+
+        let train = json!({"algorithm": "recipe", "recipe": "calm_vote", "dataset": "d", "hyperparams": {"max_depth": 9}, "holdout_pct": 20});
+        let (out, _, pending) = run(&state, &paths, ChatMode::Review, "train_ml_model", train.clone()).await;
+        assert!(out.is_none() && pending.len() == 1);
+        assert_eq!(pending[0].detail, "Train algorithm recipe calm_vote on dataset d [20% hold-out]");
+        assert!(!pending[0].detail.contains("custom") && !pending[0].detail.contains("Python"), "no code-approval wording: {}", pending[0].detail);
+
+        // Approved once, the call runs; the missing recipe is reported as an error, not a crash.
+        state.copilot_approvals.lock().unwrap().insert(pending[0].key.clone());
+        let (out, trace, pending) = run(&state, &paths, ChatMode::Review, "train_ml_model", train).await;
+        assert!(pending.is_empty());
+        let err = out.unwrap()["error"].as_str().unwrap().to_string();
+        assert!(err.contains("calm_vote") && err.contains("not found"), "{err}");
+        assert!(!trace[0].ok);
+    }
+
+    #[tokio::test]
+    async fn recipe_training_arguments_are_checked_before_anything_runs() {
+        let (state, paths) = test_state("flow-recipe-args").await;
+        let models = ml::ModelRegistry::new(&paths);
+        for (args, needle) in [
+            (json!({"algorithm": "recipe", "dataset": "d"}), "needs `recipe`"),
+            (json!({"algorithm": "recipe", "recipe": "  ", "dataset": "d"}), "needs `recipe`"),
+            (json!({"algorithm": "random_forest", "recipe": "calm_vote", "dataset": "d"}), "only used with algorithm `recipe`"),
+            (json!({"algorithm": "recipe", "recipe": 5, "dataset": "d"}), "must be a string"),
+        ] {
+            let err = exec_tool("train_ml_model", &args, &state, &models, &paths).await.unwrap_err();
+            assert!(err.contains(needle), "{args}: {err}");
+        }
+        // Agent mode runs a recipe training without asking; only the missing recipe stops it.
+        let (out, _, pending) = run(&state, &paths, ChatMode::Agent, "train_ml_model", json!({"algorithm": "recipe", "recipe": "gone", "dataset": "d"})).await;
+        assert!(pending.is_empty(), "no approval for a declarative recipe");
+        assert!(out.unwrap()["error"].as_str().unwrap().contains("not found"));
+        assert!(state.copilot_trusted_files.lock().unwrap().is_empty(), "recipes never touch the estimator trust list");
+    }
+
+    #[tokio::test]
+    async fn invalid_recipes_are_refused_without_writing_anything() {
+        let (state, paths) = test_state("flow-recipe-invalid").await;
+        // Structural problems are found before Python is needed.
+        let mut too_few = voting_recipe("calm_vote");
+        too_few["model"]["members"] = json!([{"algorithm": "random_forest"}]);
+        let mut custom_member = voting_recipe("calm_vote");
+        custom_member["model"]["members"][0]["algorithm"] = json!("custom");
+        let mut bad_name = voting_recipe("../evil");
+        bad_name["label"] = json!("evil");
+        for (args, needle) in [(too_few, "model.members"), (custom_member, "algorithm"), (bad_name, "name")] {
+            let (out, trace, _) = run(&state, &paths, ChatMode::Agent, "save_recipe", args.clone()).await;
+            let err = out.unwrap()["error"].as_str().unwrap().to_string();
+            assert!(err.contains(needle), "{args}: {err}");
+            assert!(!trace[0].ok);
+        }
+        assert!(ml_recipes::list_recipe_files(paths.work_root()).is_empty());
+        assert!(!paths.work_root().join("algorithms").join("evil.json").exists());
+        let (gone, _, _) = run(&state, &paths, ChatMode::Agent, "delete_recipe", json!({"name": "calm_vote"})).await;
+        assert!(gone.unwrap()["error"].as_str().unwrap().contains("no algorithm recipe"));
+    }
+
+    #[tokio::test]
+    async fn agent_mode_never_silently_replaces_a_saved_recipe() {
+        let (state, paths) = test_state("flow-recipe-collision").await;
+        let mine: crate::dto::RecipeDto = serde_json::from_value(voting_recipe("calm_vote")).unwrap();
+        ml_recipes::write_recipe(paths.work_root(), &mine).unwrap();
+        let before = std::fs::read_to_string(paths.work_root().join("algorithms/calm_vote.json")).unwrap();
+
+        let mut other = voting_recipe("calm_vote");
+        other["label"] = json!("Agent version");
+        let (out, trace, pending) = run(&state, &paths, ChatMode::Agent, "save_recipe", other).await;
+        let err = out.unwrap()["error"].as_str().unwrap().to_string();
+        assert!(pending.is_empty() && !trace[0].ok);
+        assert!(err.contains("already saved") && err.contains("overwrite"), "{err}");
+        let after = std::fs::read_to_string(paths.work_root().join("algorithms/calm_vote.json")).unwrap();
+        assert_eq!(before, after, "the user's recipe is untouched");
+        assert!(ml_recipes::recipe_exists(paths.work_root(), "calm_vote"));
+    }
+
+    #[tokio::test]
+    async fn a_recipe_is_built_checked_saved_trained_and_deleted_through_the_tools() {
+        let Some((state, paths)) = copilot_tools::test_support::state_with_python("flow-recipe-e2e").await else { return };
+        let (blocks, _, _) = run(&state, &paths, ChatMode::Ask, "recipe_building_blocks", json!({})).await;
+        let blocks = blocks.unwrap();
+        assert!(blocks["steps"].as_array().unwrap().iter().any(|s| s["kind"] == "clip_outliers" && s["params"]["upper_pct"] == 99), "{blocks}");
+        assert!(blocks["members"].as_array().unwrap().iter().any(|m| m == "random_forest"));
+        assert!(blocks["limits"]["max_members"].is_number());
+        assert!(blocks.to_string().len() < 6000, "trimmed for the model");
+
+        // A typo in a member's parameter is caught by the same validator as normal training.
+        let mut typo = voting_recipe("calm_vote");
+        typo["model"]["members"][0]["params"] = json!({"n_estimatorz": 5});
+        let (checked, _, _) = run(&state, &paths, ChatMode::Ask, "validate_recipe", typo.clone()).await;
+        let checked = checked.unwrap();
+        assert_eq!(checked["ok"], false, "{checked}");
+        assert!(checked.to_string().contains("n_estimatorz"), "{checked}");
+        let (refused, trace, _) = run(&state, &paths, ChatMode::Agent, "save_recipe", typo).await;
+        assert!(refused.unwrap()["error"].as_str().unwrap().contains("n_estimatorz") && !trace[0].ok);
+        assert!(ml_recipes::list_recipe_files(paths.work_root()).is_empty(), "an invalid recipe is not saved");
+
+        let (checked, _, _) = run(&state, &paths, ChatMode::Ask, "validate_recipe", voting_recipe("calm_vote")).await;
+        let checked = checked.unwrap();
+        assert_eq!((checked["ok"].as_bool(), checked["models"].as_u64()), (Some(true), Some(2)), "{checked}");
+        assert!(checked["next"].as_str().unwrap().contains("save_recipe"));
+        assert!(ml_recipes::list_recipe_files(paths.work_root()).is_empty(), "validate never writes");
+
+        let (saved, trace, pending) = run(&state, &paths, ChatMode::Agent, "save_recipe", voting_recipe("calm_vote")).await;
+        let saved = saved.unwrap();
+        assert!(pending.is_empty() && trace[0].ok, "{saved}");
+        assert_eq!((saved["saved"].as_bool(), saved["model"].as_str(), saved["steps"].as_u64()), (Some(true), Some("voting"), Some(1)), "{saved}");
+        assert!(paths.work_root().join("algorithms/calm_vote.json").exists());
+        assert_eq!(saved["replaced"], false, "{saved}");
+        let mut again = voting_recipe("calm_vote");
+        again["label"] = json!("Calm vote v2");
+        let (refused, _, _) = run(&state, &paths, ChatMode::Agent, "save_recipe", again.clone()).await;
+        assert!(refused.unwrap()["error"].as_str().unwrap().contains("already saved"));
+        again["overwrite"] = json!(true);
+        let (replaced, _, _) = run(&state, &paths, ChatMode::Agent, "save_recipe", again).await;
+        let replaced = replaced.unwrap();
+        assert_eq!((replaced["saved"].as_bool(), replaced["replaced"].as_bool()), (Some(true), Some(true)), "{replaced}");
+
+        let (listed, _, _) = run(&state, &paths, ChatMode::Ask, "list_recipes", json!({})).await;
+        let listed = listed.unwrap();
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["recipes"][0]["algorithms"], json!(["random_forest", "logistic_regression"]));
+        assert!(listed["recipes"][0].get("model_params").is_none() && listed["recipes"][0]["steps"][0] == "standard_scaler");
+        let (full, _, _) = run(&state, &paths, ChatMode::Ask, "get_recipe", json!({"name": "calm_vote"})).await;
+        let full = full.unwrap();
+        assert_eq!(full["model"]["members"][0]["params"]["n_estimators"], 10, "{full}");
+        assert!(full["created_at"].is_string());
+
+        // Train it: hyperparams are ignored for a recipe, and no approval is asked in Agent mode.
+        write_dataset(&paths, "rcp");
+        let train = json!({"algorithm": "recipe", "recipe": "calm_vote", "dataset": "rcp", "n_splits": 3, "holdout_pct": 15,
+                           "hyperparams": {"not_a_param": 1}});
+        let (trained, trace, pending) = run(&state, &paths, ChatMode::Agent, "train_ml_model", train).await;
+        let trained = trained.unwrap();
+        assert!(pending.is_empty() && trace[0].ok, "{trained}");
+        let model_id = trained["model_id"].as_str().unwrap_or_else(|| panic!("no model_id: {trained}")).to_string();
+        assert!(model_id.starts_with("recipe_"), "{model_id}");
+        assert!(trained["holdout"].is_object() && trained["metrics"]["accuracy"].is_number(), "{trained}");
+
+        let (model, _, _) = run(&state, &paths, ChatMode::Ask, "get_model", json!({"model_id": model_id})).await;
+        let model = model.unwrap();
+        assert_eq!(model["algorithm"], "recipe", "{model}");
+        assert_eq!(model["recipe"]["name"], "calm_vote");
+        assert_eq!(model["recipe"]["model"]["members"][1]["algorithm"], "logistic_regression");
+        assert_eq!(model["hyperparams"], json!({}), "{model}");
+
+        // Deleting the recipe leaves the model and its copy of the spec alone.
+        let (gone, _, _) = run(&state, &paths, ChatMode::Agent, "delete_recipe", json!({"name": "calm_vote"})).await;
+        assert_eq!(gone.unwrap()["deleted"], "calm_vote");
+        assert!(!paths.work_root().join("algorithms/calm_vote.json").exists());
+        let (model, _, _) = run(&state, &paths, ChatMode::Ask, "get_model", json!({"model_id": model_id})).await;
+        assert_eq!(model.unwrap()["recipe"]["name"], "calm_vote");
+        let (again, _, _) = run(&state, &paths, ChatMode::Agent, "delete_recipe", json!({"name": "calm_vote"})).await;
+        assert!(again.unwrap()["error"].as_str().unwrap().contains("no algorithm recipe"));
     }
 
     #[test]

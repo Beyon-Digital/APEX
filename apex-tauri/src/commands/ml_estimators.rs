@@ -34,8 +34,12 @@ pub const ALGORITHMS: &[&str] = &[
     "custom",
 ];
 
+/// The id a training request uses to train a saved algorithm recipe (see `ml_recipes`). Not in
+/// [`ALGORITHMS`], which lists what the Copilot may name directly.
+pub const RECIPE_ALGORITHM: &str = "recipe";
+
 pub fn validate_algorithm_id(algorithm: &str) -> Result<(), String> {
-    if ALGORITHMS.contains(&algorithm) {
+    if ALGORITHMS.contains(&algorithm) || algorithm == RECIPE_ALGORITHM {
         Ok(())
     } else {
         Err(format!("Unknown algorithm: {algorithm}. Valid: {}", ALGORITHMS.join(", ")))

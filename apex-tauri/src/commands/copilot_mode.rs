@@ -289,6 +289,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recipe_tools_are_classified_and_ask_keeps_only_the_reads() {
+        let reads = ["list_recipes", "get_recipe", "recipe_building_blocks", "validate_recipe"];
+        let writes = ["save_recipe", "delete_recipe"];
+        for t in reads {
+            assert!(!is_write_tool(t), "{t} only reads");
+        }
+        for t in writes {
+            assert!(is_write_tool(t), "{t} changes state");
+        }
+        let all = Value::Array(copilot_tools::extra_tool_schemas());
+        let names = |v: &Value| -> Vec<String> {
+            v.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str().map(String::from)).collect()
+        };
+        let ask = names(&tools_for_mode(all.clone(), ChatMode::Ask));
+        for t in reads {
+            assert!(ask.contains(&t.to_string()), "{t} stays in Ask");
+        }
+        for t in writes {
+            assert!(!ask.contains(&t.to_string()), "{t} hidden in Ask");
+            assert!(names(&all).contains(&t.to_string()), "{t} exists");
+        }
+    }
+
+    #[tokio::test]
+    async fn training_a_recipe_follows_the_normal_mode_rules_and_needs_no_extra_approval() {
+        let (state, paths) = copilot_tools::test_support::state("mode-recipe").await;
+        let recipe = json!({"algorithm": "recipe", "recipe": "calm_vote", "dataset": "d", "hyperparams": {"x": 1}});
+        let gated = |mode| requires_approval(mode, "train_ml_model", &recipe, &state, &paths);
+        assert!(gated(ChatMode::Review), "Review asks before any training");
+        assert!(!gated(ChatMode::Agent), "a recipe runs no custom code, so Agent runs it freely");
+        assert!(refused_in_ask("train_ml_model", &recipe, &state, &paths), "Ask refuses all training");
+        assert!(!copilot_tools::is_custom_training("train_ml_model", &recipe));
+        assert!(!copilot_tools::needs_approval("train_ml_model", &recipe, &state, &paths), "no estimator-style approval");
+        assert_eq!(copilot_tools::approval_key_suffix("train_ml_model", &recipe, &paths), "");
+        // Saving and deleting recipes: Review asks, Agent runs on its own (paper-class research).
+        for tool in ["save_recipe", "delete_recipe"] {
+            let args = json!({"name": "calm_vote"});
+            assert!(requires_approval(ChatMode::Review, tool, &args, &state, &paths), "{tool} in Review");
+            assert!(!requires_approval(ChatMode::Agent, tool, &args, &state, &paths), "{tool} in Agent");
+            assert!(refused_in_ask(tool, &args, &state, &paths), "{tool} in Ask");
+        }
+    }
+
     #[tokio::test]
     async fn custom_training_needs_approval_in_review_and_agent_until_trusted_and_is_refused_in_ask() {
         let (state, paths) = copilot_tools::test_support::state("mode-custom").await;

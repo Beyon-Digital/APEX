@@ -10,12 +10,12 @@
 
 use super::python_runtime::RuntimePaths;
 use super::{
-    copilot_tools, copilot_web, graph, health, market, ml, ml_datasets, ml_estimators, ml_features, news, notebook, orderbook,
-    quant,
+    copilot_tools, copilot_web, graph, health, market, ml, ml_datasets, ml_estimators, ml_features, ml_recipes, news, notebook,
+    orderbook, quant,
 };
 use crate::dto::{
     BuildDatasetRequestDto, DatasetInfoDto, MLTrainingResultDto, ModelDetailDto, NotebookCellDto, NotebookDocumentDto,
-    NotebookRunRequestDto,
+    NotebookRunRequestDto, RecipeDto, RecipeModelDto,
 };
 use std::path::Path;
 use crate::state::AppState;
@@ -33,6 +33,8 @@ pub const WRITE_TOOLS: &[&str] = &[
     "fetch_symbol_history",
     "save_estimator_file",
     "delete_estimator_file",
+    "save_recipe",
+    "delete_recipe",
 ];
 
 const MAX_NOTEBOOK_CELLS: usize = 50;
@@ -41,6 +43,49 @@ const OUTPUT_CHARS: usize = 6_000;
 
 fn tool(name: &str, description: &str, parameters: Value) -> Value {
     json!({"type": "function", "function": {"name": name, "description": description, "parameters": parameters}})
+}
+
+/// Properties shared by a voting/stacking member and the final estimator of a stack.
+fn member_schema(weight: bool) -> Value {
+    let mut props = json!({
+        "algorithm": {"type": "string", "enum": ml_recipes::MEMBER_ALGORITHMS, "description": "a built-in algorithm (xgboost only when installed); never custom or recipe"},
+        "params": {"type": "object", "description": "hyperparameters by name, validated like train_ml_model's (see list_algorithms)"}});
+    if weight {
+        props["weight"] = json!({"type": "number", "description": "voting weight (default 1)"});
+    }
+    json!({"type": "object", "properties": props, "required": ["algorithm"]})
+}
+
+/// The arguments of `save_recipe` and `validate_recipe`: the recipe itself.
+fn recipe_schema() -> Value {
+    json!({"type": "object", "properties": {
+        "name": {"type": "string", "description": "[a-z][a-z0-9_]{0,40}; an existing name is only replaced with overwrite: true"},
+        "label": {"type": "string", "description": "short display name (required, max 80 chars)"},
+        "description": {"type": "string", "description": "what the recipe is for (max 1000 chars)"},
+        "steps": {"type": "array", "maxItems": ml_recipes::MAX_STEPS, "description": "preprocessing, applied in order and fitted on the training rows only",
+            "items": {"type": "object", "properties": {
+                "kind": {"type": "string", "description": "a step kind from recipe_building_blocks, e.g. standard_scaler, clip_outliers, select_k_best, pca"},
+                "params": {"type": "object"}}, "required": ["kind"]}},
+        "model": {"type": "object", "description": "single {algorithm, params} | voting {voting: soft|hard, members: 2-6} | stacking {members: 2-6, final: {algorithm, params}, blocks: 3-8}",
+            "properties": {
+                "kind": {"type": "string", "enum": ["single", "voting", "stacking"]},
+                "algorithm": {"type": "string", "enum": ml_recipes::MEMBER_ALGORITHMS, "description": "single only"},
+                "params": {"type": "object", "description": "single only"},
+                "voting": {"type": "string", "enum": ["soft", "hard"], "description": "voting only"},
+                "members": {"type": "array", "items": member_schema(true), "description": "voting and stacking (weights count in voting only)"},
+                "final": member_schema(false),
+                "blocks": {"type": "integer", "description": "stacking only: 3-8 time blocks"}},
+            "required": ["kind"]},
+        "calibrate": {"type": "string", "enum": ["none", "sigmoid", "isotonic"], "default": "none", "description": "probability calibration on a later slice of the training rows; ignored for hard voting"}},
+        "required": ["name", "label", "model"]})
+}
+
+/// `save_recipe` takes the recipe plus the `overwrite` flag that allows replacing a saved one.
+fn save_recipe_schema() -> Value {
+    let mut schema = recipe_schema();
+    schema["properties"]["overwrite"] = json!({"type": "boolean", "default": false,
+        "description": "must be true to replace a saved recipe of the same name; without it a name that already exists is refused (see list_recipes / get_recipe)"});
+    schema
 }
 
 /// OpenAI function-calling definitions for these tools.
@@ -228,6 +273,41 @@ pub fn schemas() -> Vec<Value> {
             json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
         ),
         tool(
+            "list_recipes",
+            "The saved algorithm recipes (name, label, description, preprocessing steps, model kind, member algorithms, calibration). \
+             Train one with train_ml_model {algorithm: \"recipe\", recipe: <name>, dataset}. Use get_recipe for the full spec.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        tool(
+            "get_recipe",
+            "One saved algorithm recipe in full: steps, model, member parameters, calibration.",
+            json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
+        ),
+        tool(
+            "recipe_building_blocks",
+            "What a recipe can be made of: the preprocessing step kinds with their parameter names, defaults and allowed values, the \
+             member algorithms, and the limits (steps, members, stacking blocks). Member parameters are the ones list_algorithms shows.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        tool(
+            "validate_recipe",
+            "Check a recipe without saving it. Returns ok, errors (each with the path of the problem, e.g. steps[1].params.k), warnings \
+             (for example a missing scaler before logistic regression), the number of models and a size estimate. Run it before save_recipe.",
+            recipe_schema(),
+        ),
+        tool(
+            "save_recipe",
+            "Save an algorithm recipe (it is checked first and refused when invalid). A name that already exists is refused unless \
+             overwrite is true, so check list_recipes first and never replace a recipe the user built unless asked. A recipe only assembles built-in \
+             parts, so no code runs and training with it needs no extra approval. Train it with train_ml_model {algorithm: \"recipe\", recipe: <name>}.",
+            save_recipe_schema(),
+        ),
+        tool(
+            "delete_recipe",
+            "Delete a saved algorithm recipe. Models already trained with it keep their own copy of the spec.",
+            json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
+        ),
+        tool(
             "list_datasets",
             "List the ML datasets that were built: name, rows, symbols, timeframe, features, label and class counts.",
             json!({"type": "object", "properties": {}}),
@@ -315,6 +395,17 @@ pub fn describe(name: &str, args: &Value) -> Option<String> {
             )
         }
         "delete_estimator_file" => format!("Delete estimator file {}", s("name")),
+        "list_recipes" => "List saved algorithm recipes".to_string(),
+        "get_recipe" => format!("Read algorithm recipe {}", s("name")),
+        "recipe_building_blocks" => "List the algorithm recipe building blocks".to_string(),
+        "validate_recipe" => format!("Check algorithm recipe {}: {}", s("name"), recipe_text(args)),
+        "save_recipe" => format!(
+            "Save algorithm recipe {}{}: {}. It only assembles built-in parts; no code runs.",
+            s("name"),
+            if args.get("overwrite").and_then(Value::as_bool).unwrap_or(false) { " (replaces a saved one with this name)" } else { "" },
+            recipe_text(args)
+        ),
+        "delete_recipe" => format!("Delete algorithm recipe {} (models already trained with it keep their copy)", s("name")),
         "list_datasets" => "List ML datasets".to_string(),
         "preview_dataset" => format!("Preview dataset {}", s("name")),
         "get_model" => format!("Read model {}", s("model_id")),
@@ -380,7 +471,10 @@ pub fn describe(name: &str, args: &Value) -> Option<String> {
                     format!(", {}", parts.join(" "))
                 })
                 .unwrap_or_default();
+            let recipe_run = args.get("algorithm").and_then(|v| v.as_str()) == Some("recipe");
+            let hyper = if recipe_run { String::new() } else { hyper };
             let algorithm = match args.get("algorithm").and_then(|v| v.as_str()) {
+                Some("recipe") => format!("algorithm recipe {}", args.get("recipe").and_then(|v| v.as_str()).unwrap_or("?")),
                 Some("custom") => format!(
                     "custom estimator {} (runs its Python)",
                     args.get("estimator_file").and_then(|v| v.as_str()).unwrap_or("?")
@@ -403,6 +497,56 @@ pub fn describe(name: &str, args: &Value) -> Option<String> {
         }
         _ => return None,
     })
+}
+
+/// One line for an approval card: the steps and the model of a recipe given as tool arguments.
+/// Works on the raw arguments, so a malformed recipe still gets a card instead of a blank one.
+fn recipe_text(args: &Value) -> String {
+    let spec = match args.get("model") {
+        Some(_) => args,
+        None => args.get("recipe").unwrap_or(args),
+    };
+    let steps: Vec<&str> = spec
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|st| st.get("kind").and_then(|k| k.as_str())).collect())
+        .unwrap_or_default();
+    let steps = if steps.is_empty() { "no preprocessing".to_string() } else { steps.join(" > ") };
+    let model = spec.get("model").map(model_text).unwrap_or_else(|| "?".into());
+    let calibrate = spec
+        .get("calibrate")
+        .and_then(|v| v.as_str())
+        .filter(|c| *c != "none")
+        .map(|c| format!(", {c} calibration"))
+        .unwrap_or_default();
+    format!("{steps} then {model}{calibrate}")
+}
+
+fn algorithm_ids(members: Option<&Value>) -> String {
+    members
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|m| m.get("algorithm").and_then(|x| x.as_str())).collect::<Vec<_>>().join(", "))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "?".into())
+}
+
+fn model_text(model: &Value) -> String {
+    let single = |v: &Value| v.get("algorithm").and_then(|x| x.as_str()).unwrap_or("?").to_string();
+    match model.get("kind").and_then(|v| v.as_str()) {
+        Some("single") => single(model),
+        Some("voting") => format!(
+            "{} voting of {}",
+            model.get("voting").and_then(|v| v.as_str()).unwrap_or("soft"),
+            algorithm_ids(model.get("members"))
+        ),
+        Some("stacking") => format!(
+            "stacking of {} into {} ({} blocks)",
+            algorithm_ids(model.get("members")),
+            model.get("final").map(single).unwrap_or_else(|| "?".into()),
+            model.get("blocks").and_then(|v| v.as_u64()).map(|b| b.to_string()).unwrap_or_else(|| "?".into())
+        ),
+        _ => "?".to_string(),
+    }
 }
 
 fn app(state: &AppState) -> Result<&tauri::AppHandle, String> {
@@ -790,6 +934,16 @@ pub fn key_results(d: &ModelDetailDto) -> serde_json::Map<String, Value> {
     out
 }
 
+/// The recipe a model was trained with: the full spec when it is small, otherwise the summary.
+fn recipe_for_model(r: &RecipeDto) -> Value {
+    match serde_json::to_value(r) {
+        Ok(v) if v.to_string().len() <= MAX_RECIPE_SPEC_SHOWN => v,
+        _ => recipe_summary(r),
+    }
+}
+
+const MAX_RECIPE_SPEC_SHOWN: usize = 3_000;
+
 /// A model trimmed for the model's context: no log tail, 8 importances, notes cut short.
 pub fn model_summary(d: &ModelDetailDto) -> Value {
     let mut out = key_results(d);
@@ -833,6 +987,7 @@ pub fn model_summary(d: &ModelDetailDto) -> Value {
         ("context_symbols", json!(d.context_symbols)),
         ("fee_pct", json!(d.fee_pct)),
         ("estimator_file", json!(d.estimator_file)),
+        ("recipe", d.recipe.as_ref().map(recipe_for_model).unwrap_or(Value::Null)),
         ("feature_count", json!(d.feature_names.len())),
         ("folds", json!(folds)),
         ("top_importances", json!(importances)),
@@ -916,7 +1071,145 @@ pub async fn exec_ml(
         "list_estimator_files" => list_estimators(args, state, paths),
         "save_estimator_file" => save_estimator(args, state, paths),
         "delete_estimator_file" => delete_estimator(args, state, paths),
+        "list_recipes" => {
+            let list = ml_recipes::list_recipe_files(paths.work_root());
+            Ok(json!({"count": list.len(), "recipes": list.iter().map(recipe_summary).collect::<Vec<_>>(),
+                      "note": "Train one with train_ml_model {algorithm: \"recipe\", recipe: <name>, dataset}. get_recipe shows the full spec."}))
+        }
+        "get_recipe" => match req_str(args, "name") {
+            Ok(n) => ml_recipes::load_recipe(paths.work_root(), n).and_then(|r| to_value(&r)),
+            Err(e) => Err(e),
+        },
+        "recipe_building_blocks" => ml_recipes::fetch_building_blocks(paths).await.map(|b| blocks_summary(&b)),
+        "validate_recipe" => match recipe_from_args(args) {
+            Ok(recipe) => match ml_recipes::check_recipe(paths, &recipe).await {
+                Ok(check) => to_value(&check).map(|mut v| {
+                    if check.ok {
+                        v["next"] = json!("Looks valid. save_recipe stores it; then train_ml_model {algorithm: \"recipe\", recipe: <name>, dataset}.");
+                    }
+                    v
+                }),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        },
+        "save_recipe" => match recipe_from_args(args) {
+            Ok(recipe) => {
+                let overwrite = args.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+                let replaced = ml_recipes::recipe_exists(paths.work_root(), &recipe.name);
+                if replaced && !overwrite {
+                    Err(format!(
+                        "an algorithm named `{0}` is already saved. Nothing was changed. Pick another name, or send overwrite: true to replace it \
+                         (get_recipe {0} shows the current spec).",
+                        recipe.name
+                    ))
+                } else {
+                    ml_recipes::save_inner(state, paths, &recipe, "copilot").await.map(|saved| {
+                        json!({
+                            "name": saved.name, "saved": true, "replaced": replaced, "label": saved.label,
+                            "steps": saved.steps.len(), "model": model_kind(&saved.model),
+                            "updated_at": saved.updated_at,
+                            "next": format!("train_ml_model {{algorithm: \"recipe\", recipe: \"{}\", dataset}}. Compare it with baseline_accuracy and the hold-out.", saved.name),
+                        })
+                    })
+                }
+            }
+            Err(e) => Err(e),
+        },
+        "delete_recipe" => match req_str(args, "name") {
+            Ok(n) => match ml_recipes::delete_inner(state, paths.work_root(), n, "copilot") {
+                Ok(true) => Ok(json!({"deleted": n})),
+                Ok(false) => Err(format!("no algorithm recipe named `{n}`; see list_recipes")),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        },
         _ => return None,
+    })
+}
+
+const MAX_RECIPE_DESCRIPTION_SHOWN: usize = 300;
+
+fn model_kind(model: &RecipeModelDto) -> &'static str {
+    match model {
+        RecipeModelDto::Single { .. } => "single",
+        RecipeModelDto::Voting { .. } => "voting",
+        RecipeModelDto::Stacking { .. } => "stacking",
+    }
+}
+
+/// A recipe's arguments as a [`RecipeDto`]. The timestamps belong to the store, so a value the
+/// model sends for them is dropped. The recipe may also arrive wrapped in a `recipe` key.
+fn recipe_from_args(args: &Value) -> Result<RecipeDto, String> {
+    let mut raw = match (args.get("model"), args.get("recipe")) {
+        (None, Some(inner @ Value::Object(_))) => inner.clone(),
+        _ => args.clone(),
+    };
+    let obj = raw.as_object_mut().ok_or("arguments must be an object")?;
+    obj.remove("created_at");
+    obj.remove("updated_at");
+    serde_json::from_value(raw).map_err(|e| format!("invalid recipe: {e}. Give name, label, steps (optional) and model {{kind, ...}}; see validate_recipe"))
+}
+
+/// A recipe trimmed for the model's context: what it is made of, not every parameter.
+pub fn recipe_summary(r: &RecipeDto) -> Value {
+    let (members, extra): (Vec<&str>, Value) = match &r.model {
+        RecipeModelDto::Single { algorithm, .. } => (vec![algorithm.as_str()], json!({})),
+        RecipeModelDto::Voting { voting, members } => {
+            (members.iter().map(|m| m.algorithm.as_str()).collect(), json!({"voting": voting}))
+        }
+        RecipeModelDto::Stacking { members, final_estimator, blocks } => (
+            members.iter().map(|m| m.algorithm.as_str()).collect(),
+            json!({"final": final_estimator.algorithm, "blocks": blocks}),
+        ),
+    };
+    let mut out = json!({
+        "name": r.name, "label": r.label,
+        "description": r.description.chars().take(MAX_RECIPE_DESCRIPTION_SHOWN).collect::<String>(),
+        "steps": r.steps.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>(),
+        "model": model_kind(&r.model), "algorithms": members, "calibrate": r.calibrate,
+        "updated_at": r.updated_at,
+    });
+    if let (Some(o), Some(e)) = (out.as_object_mut(), extra.as_object()) {
+        o.extend(e.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    out
+}
+
+/// The building blocks trimmed for the model: per step kind the parameter defaults and allowed
+/// values, the member algorithm ids and the limits. Labels and help text stay in the UI.
+pub fn blocks_summary(blocks: &Value) -> Value {
+    let steps: Vec<Value> = blocks
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|st| {
+                    let mut params = serde_json::Map::new();
+                    let mut allowed = serde_json::Map::new();
+                    for p in st.get("params").and_then(|v| v.as_array()).into_iter().flatten() {
+                        let Some(key) = p.get("key").and_then(|v| v.as_str()) else { continue };
+                        params.insert(key.to_string(), p.get("default").cloned().unwrap_or(Value::Null));
+                        if let Some(choices) = p.get("choices").and_then(|v| v.as_array()) {
+                            let list: Vec<&str> = choices.iter().filter_map(|c| c.as_str()).collect();
+                            allowed.insert(key.to_string(), json!(list.join("|")));
+                        } else if let (Some(min), Some(max)) = (p.get("min"), p.get("max")) {
+                            allowed.insert(key.to_string(), json!(format!("{min} to {max}")));
+                        }
+                    }
+                    json!({"kind": st.get("kind"), "description": st.get("description"), "params": params, "allowed": allowed})
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let members: Vec<Value> = blocks
+        .get("members")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|m| m.get("id").cloned()).collect())
+        .unwrap_or_default();
+    json!({
+        "steps": steps, "members": members, "limits": blocks.get("limits"),
+        "note": "Steps run in order on the training rows only. Member parameters are the ones list_algorithms shows. A scaler step helps logistic_regression.",
     })
 }
 
@@ -1153,6 +1446,157 @@ mod tests {
         for tool in ["list_feature_catalog", "list_datasets", "preview_dataset", "get_model"] {
             assert!(!WRITE_TOOLS.contains(&tool), "{tool} is read-only");
         }
+    }
+
+    fn voting_recipe_args() -> Value {
+        json!({
+            "name": "calm_vote", "label": "Calm vote", "description": "scaled forest and linear",
+            "steps": [{"kind": "clip_outliers", "params": {"lower_pct": 1, "upper_pct": 99}}, {"kind": "standard_scaler"}],
+            "model": {"kind": "voting", "voting": "soft", "members": [
+                {"algorithm": "random_forest", "params": {"n_estimators": 50}, "weight": 2},
+                {"algorithm": "logistic_regression"}]},
+            "calibrate": "sigmoid"
+        })
+    }
+
+    #[test]
+    fn recipe_schemas_are_well_formed_and_split_into_reads_and_writes() {
+        let schemas = schemas();
+        let by_name = |n: &str| schemas.iter().find(|s| s["function"]["name"] == n).unwrap_or_else(|| panic!("{n} has no schema")).clone();
+        for name in ["list_recipes", "get_recipe", "recipe_building_blocks", "validate_recipe", "save_recipe", "delete_recipe"] {
+            let f = &by_name(name)["function"];
+            assert!(!f["description"].as_str().unwrap_or("").is_empty(), "{name}");
+            assert_eq!(f["parameters"]["type"], "object", "{name}");
+            for field in f["parameters"]["required"].as_array().into_iter().flatten() {
+                assert!(f["parameters"]["properties"].get(field.as_str().unwrap()).is_some(), "{name}: required {field} is not a property");
+            }
+        }
+        for write in ["save_recipe", "delete_recipe"] {
+            assert!(WRITE_TOOLS.contains(&write), "{write} changes state");
+        }
+        for read in ["list_recipes", "get_recipe", "recipe_building_blocks", "validate_recipe"] {
+            assert!(!WRITE_TOOLS.contains(&read), "{read} is read-only");
+        }
+        // save and validate take the same recipe, and the model's kinds and member ids are the backend's.
+        let mut save_params = by_name("save_recipe")["function"]["parameters"].clone();
+        assert_eq!(save_params["properties"]["overwrite"]["type"], "boolean");
+        save_params["properties"].as_object_mut().unwrap().remove("overwrite");
+        assert_eq!(save_params, by_name("validate_recipe")["function"]["parameters"]);
+        let recipe = &by_name("save_recipe")["function"]["parameters"];
+        assert_eq!(recipe["required"], json!(["name", "label", "model"]));
+        assert_eq!(recipe["properties"]["model"]["properties"]["kind"]["enum"], json!(["single", "voting", "stacking"]));
+        let member_ids = recipe["properties"]["model"]["properties"]["members"]["items"]["properties"]["algorithm"]["enum"].as_array().unwrap();
+        assert!(member_ids.iter().all(|v| v != "custom" && v != "recipe"), "members are built-in algorithms only");
+        assert!(member_ids.iter().any(|v| v == "random_forest"));
+        assert_eq!(recipe["properties"]["calibrate"]["enum"], json!(["none", "sigmoid", "isotonic"]));
+        // Every schema the tool set offers must also serialise as one JSON document.
+        assert!(serde_json::to_string(&schemas).is_ok());
+    }
+
+    #[test]
+    fn recipe_cards_say_what_is_assembled_and_that_no_code_runs() {
+        let save = describe("save_recipe", &voting_recipe_args()).unwrap();
+        assert!(save.starts_with("Save algorithm recipe calm_vote"), "{save}");
+        assert!(save.contains("clip_outliers > standard_scaler"), "{save}");
+        assert!(save.contains("soft voting of random_forest, logistic_regression"), "{save}");
+        assert!(save.contains("sigmoid calibration") && save.contains("no code runs") && !save.contains("replaces"), "{save}");
+        let mut with_overwrite = voting_recipe_args();
+        with_overwrite["overwrite"] = json!(true);
+        assert!(describe("save_recipe", &with_overwrite).unwrap().contains("replaces a saved one"));
+
+        let stack = describe("save_recipe", &json!({"name": "st", "model": {"kind": "stacking", "blocks": 4,
+            "members": [{"algorithm": "extra_trees"}, {"algorithm": "gradient_boosting"}], "final": {"algorithm": "logistic_regression"}}})).unwrap();
+        assert!(stack.contains("no preprocessing then stacking of extra_trees, gradient_boosting into logistic_regression (4 blocks)"), "{stack}");
+        let single = describe("validate_recipe", &json!({"name": "s", "model": {"kind": "single", "algorithm": "xgboost"}})).unwrap();
+        assert!(single.starts_with("Check algorithm recipe s") && single.contains("then xgboost"), "{single}");
+        // A recipe wrapped in a `recipe` key, or with nothing usable, still gets a card.
+        assert!(describe("save_recipe", &json!({"name": "w", "recipe": voting_recipe_args()})).unwrap().contains("voting"));
+        assert!(describe("save_recipe", &json!({})).unwrap().contains("Save algorithm recipe ?"));
+
+        assert_eq!(describe("delete_recipe", &json!({"name": "calm_vote"})).unwrap(), "Delete algorithm recipe calm_vote (models already trained with it keep their copy)");
+        assert_eq!(describe("get_recipe", &json!({"name": "a"})).unwrap(), "Read algorithm recipe a");
+        assert_eq!(describe("list_recipes", &json!({})).unwrap(), "List saved algorithm recipes");
+
+        let train = describe("train_ml_model", &json!({"algorithm": "recipe", "recipe": "calm_vote", "dataset": "spy_5d",
+            "hyperparams": {"max_depth": 3}, "holdout_pct": 20})).unwrap();
+        assert_eq!(train, "Train algorithm recipe calm_vote on dataset spy_5d [20% hold-out]", "hyperparams are ignored for a recipe");
+        let plain = describe("train_ml_model", &json!({"algorithm": "random_forest", "dataset": "d", "hyperparams": {"max_depth": 3}})).unwrap();
+        assert_eq!(plain, "Train random_forest on dataset d, max_depth=3");
+    }
+
+    #[test]
+    fn recipe_arguments_become_a_recipe_and_store_owned_fields_are_dropped() {
+        let mut args = voting_recipe_args();
+        args["created_at"] = json!("2001-01-01T00:00:00Z");
+        args["updated_at"] = json!("2001-01-01T00:00:00Z");
+        let r = recipe_from_args(&args).unwrap();
+        assert_eq!((r.name.as_str(), r.steps.len(), r.calibrate.as_str()), ("calm_vote", 2, "sigmoid"));
+        assert!(r.created_at.is_none() && r.updated_at.is_none(), "timestamps belong to the store");
+        assert!(matches!(r.model, RecipeModelDto::Voting { ref members, .. } if members.len() == 2 && members[0].weight == Some(2.0)));
+        let wrapped = recipe_from_args(&json!({"recipe": voting_recipe_args()})).unwrap();
+        assert_eq!(wrapped.name, "calm_vote");
+        let stacked = recipe_from_args(&json!({"name": "s", "label": "S", "model": {"kind": "stacking", "blocks": 3,
+            "members": [{"algorithm": "random_forest"}, {"algorithm": "extra_trees"}], "final": {"algorithm": "logistic_regression"}}})).unwrap();
+        assert!(matches!(stacked.model, RecipeModelDto::Stacking { blocks: 3, .. }));
+        // Malformed input names the problem instead of panicking.
+        for bad in [json!({"name": "x"}), json!({"name": "x", "model": {"kind": "bagging"}}), json!({"name": 3, "model": {"kind": "single", "algorithm": "xgboost"}}), json!("text")] {
+            let e = recipe_from_args(&bad).unwrap_err();
+            assert!(!e.is_empty(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn recipe_lists_and_building_blocks_are_trimmed_for_the_model() {
+        let r = recipe_from_args(&voting_recipe_args()).unwrap();
+        let s = recipe_summary(&r);
+        assert_eq!(s["steps"], json!(["clip_outliers", "standard_scaler"]));
+        assert_eq!((s["model"].as_str(), s["voting"].as_str(), s["calibrate"].as_str()), (Some("voting"), Some("soft"), Some("sigmoid")));
+        assert_eq!(s["algorithms"], json!(["random_forest", "logistic_regression"]));
+        assert!(s.get("params").is_none() && s["steps"][0].is_string(), "parameters stay out of the list");
+        let mut long = r.clone();
+        long.description = "d".repeat(2000);
+        assert_eq!(recipe_summary(&long)["description"].as_str().unwrap().chars().count(), MAX_RECIPE_DESCRIPTION_SHOWN);
+        let stack = recipe_from_args(&json!({"name": "s", "label": "S", "model": {"kind": "stacking", "blocks": 5,
+            "members": [{"algorithm": "random_forest"}, {"algorithm": "extra_trees"}], "final": {"algorithm": "logistic_regression"}}})).unwrap();
+        let s = recipe_summary(&stack);
+        assert_eq!((s["final"].as_str(), s["blocks"].as_u64()), (Some("logistic_regression"), Some(5)));
+
+        let blocks = json!({
+            "steps": [
+                {"kind": "quantile_transformer", "label": "Q", "group": "scale", "description": "rank", "params": [
+                    {"key": "output_distribution", "type": "choice", "default": "uniform", "choices": ["uniform", "normal"], "help": "long help text"},
+                    {"key": "n_quantiles", "type": "int", "default": 200, "min": 10, "max": 2000, "help": "more help"}]},
+                {"kind": "robust_scaler", "label": "R", "description": "robust", "params": []}],
+            "members": [{"id": "random_forest", "label": "RF", "description": "trees"}, {"id": "xgboost", "label": "X", "description": "boost"}],
+            "limits": {"max_steps": 8, "max_members": 6}});
+        let t = blocks_summary(&blocks);
+        assert_eq!(t["members"], json!(["random_forest", "xgboost"]));
+        assert_eq!(t["steps"][0]["params"], json!({"output_distribution": "uniform", "n_quantiles": 200}));
+        assert_eq!(t["steps"][0]["allowed"], json!({"output_distribution": "uniform|normal", "n_quantiles": "10 to 2000"}));
+        assert_eq!(t["steps"][1]["params"], json!({}));
+        assert_eq!(t["limits"]["max_members"], 6);
+        assert!(!t.to_string().contains("long help text"), "help text stays in the UI");
+    }
+
+    #[test]
+    fn a_model_trained_with_a_recipe_shows_it_in_get_model() {
+        let mut d = detail();
+        assert!(model_summary(&d)["recipe"].is_null());
+        d.algorithm = "recipe".into();
+        d.recipe = Some(recipe_from_args(&voting_recipe_args()).unwrap());
+        let m = model_summary(&d);
+        assert_eq!(m["algorithm"], "recipe");
+        assert_eq!(m["recipe"]["name"], "calm_vote");
+        assert_eq!(m["recipe"]["model"]["kind"], "voting", "a small spec is shown in full");
+        // A huge one is cut down to its summary.
+        let mut big = d.recipe.clone().unwrap();
+        big.description = "x".repeat(900);
+        for i in 0..40 {
+            big.steps.push(serde_json::from_value(json!({"kind": "clip_outliers", "params": {format!("k{i}"): "y".repeat(100)}})).unwrap());
+        }
+        d.recipe = Some(big);
+        let m = model_summary(&d);
+        assert!(m["recipe"]["model"].is_string() && m["recipe"]["steps"].as_array().unwrap().len() == 42, "{}", m["recipe"]);
     }
 
     #[test]

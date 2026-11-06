@@ -19,6 +19,7 @@ pub mod ml_expr;
 pub mod ml_datasets;
 pub mod ml_estimators;
 pub mod ml_features;
+pub mod ml_recipes;
 pub mod news;
 pub mod notebook;
 pub mod orderbook;

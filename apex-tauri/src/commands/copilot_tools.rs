@@ -565,6 +565,13 @@ pub const ML_WORKFLOW: &str = "ML WORKFLOW (building a model for automated tradi
 - Choose the data: list_symbol_data shows what is stored, fetch_symbol_history downloads more. Add your own formulas as custom_features, but check each with check_expression first, keep them trailing-window (past bars only) and set fee_pct to the real round-trip cost.\n\
 - Train with holdout_pct (for example 20) so the last stretch of time is scored once, untouched by tuning. Compare the hold-out result and the cross-validated result against the baseline; a gap between them means overfitting. list_algorithms shows every algorithm and its hyperparameters. The `custom` algorithm trains a Python estimator file you write with save_estimator_file, and the user must approve running it.";
 
+/// Algorithm recipes, for the system prompt.
+pub const RECIPE_NOTE: &str = "ALGORITHM RECIPES\n\
+- When one built-in algorithm is not enough, build a recipe: preprocessing steps, then one model, a voting ensemble or a stack. list_recipes shows saved ones; recipe_building_blocks shows the parts.\n\
+- Scale features for linear models, clip_outliers for heavy tails, voting for stability, stacking when the members disagree. Run validate_recipe, fix what it reports, then save_recipe with a clear name.\n\
+- Train it with train_ml_model {algorithm: \"recipe\", recipe: name, dataset, holdout_pct}; no approval beyond the mode rules, since it runs no custom code. Judge it against baseline_accuracy and the hold-out like any model; extra parts raise overfitting risk.\n\
+- Stacking trains its final estimator on earlier data and predicts later data, so the oldest rows get no stacked prediction and it needs more rows than a single model.";
+
 /// Shorting rules for the system prompt.
 pub const SHORTING_NOTE: &str = "SHORTING\n\
 - Automations are long/flat unless create_automation is given allow_short=true. It is opt-in: leave it off unless the user asks, and try it on the paper broker first.\n\
@@ -636,6 +643,7 @@ pub fn system_prompt(state: &AppState, paths: &RuntimePaths, mode: super::copilo
          - If something looks wrong or the user asks to stop everything, call kill_switch.\n\
          - Answer tersely. This is decision support, not financial advice.\n\n\
          {ml_workflow}\n\n\
+         {recipes}\n\n\
          {shorting}\n\n\
          STATUS\n\
          risk_halted={} session_pnl={:.2} max_daily_loss={:.0}\n\
@@ -667,6 +675,7 @@ pub fn system_prompt(state: &AppState, paths: &RuntimePaths, mode: super::copilo
         if files.is_empty() { "(none)".to_string() } else { files.join(", ") },
         mode_note = mode.prompt_note(),
         ml_workflow = ML_WORKFLOW,
+        recipes = RECIPE_NOTE,
         shorting = SHORTING_NOTE,
     )
 }
@@ -691,6 +700,8 @@ pub mod audit {
         "fetch_symbol_history",
         "save_estimator_file",
         "delete_estimator_file",
+        "save_recipe",
+        "delete_recipe",
     ];
 
     /// How a tool call turns into log entries.
@@ -751,6 +762,8 @@ pub mod audit {
             "fetch_symbol_history" => class("dataset", "dataset.fetch", SelfRecording, true),
             "save_estimator_file" => class("system", "estimator.save", SelfRecording, false),
             "delete_estimator_file" => class("system", "estimator.delete", SelfRecording, false),
+            "save_recipe" => class("system", "recipe.save", SelfRecording, false),
+            "delete_recipe" => class("system", "recipe.delete", SelfRecording, false),
             _ => return None,
         })
     }
@@ -1225,6 +1238,22 @@ pub(crate) mod test_support {
         (state, paths)
     }
 
+    /// [`state`] with the project's Python sources linked into the work root, or `None` (the test
+    /// is then skipped) when there is no virtualenv or the recipe CLI is missing.
+    pub async fn state_with_python(name: &str) -> Option<(AppState, RuntimePaths)> {
+        let src = crate::commands::python_runtime::repo_root().ok()?.join("apex-python");
+        if !src.join(".venv").join("bin").join("python").exists() || !src.join("ml").join("recipes.py").exists() {
+            eprintln!("skipping: apex-python virtualenv or ml/recipes.py not found");
+            return None;
+        }
+        #[cfg(not(unix))]
+        return None;
+        let (state, paths) = state(name).await;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&src, paths.work_root().join("apex-python")).ok()?;
+        Some((state, paths))
+    }
+
     pub fn write_estimator(paths: &RuntimePaths, name: &str, content: &str) {
         let dir = paths.work_root().join("estimators");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1379,6 +1408,40 @@ mod tests {
             assert!(ML_WORKFLOW.contains(needle), "ML workflow should mention `{needle}`");
         }
         assert!(ML_WORKFLOW.lines().count() <= 15, "{} lines", ML_WORKFLOW.lines().count());
+    }
+
+    #[test]
+    fn recipe_tools_are_logged_once_by_their_own_function_and_the_reads_record_nothing() {
+        for (tool, action) in [("save_recipe", "recipe.save"), ("delete_recipe", "recipe.delete")] {
+            let c = audit::classify(tool).unwrap_or_else(|| panic!("{tool} has no class"));
+            assert_eq!((c.kind, c.action, c.rule, c.informational), ("system", action, audit::Rule::SelfRecording, false), "{tool}");
+            assert!(audit::SELF_RECORDING.contains(&tool), "{tool}");
+            // Neither a success nor a failure may add a second entry from the dispatcher.
+            assert!(audit::plan(tool, &json!({"name": "r"}), &Ok(json!({"saved": true})), None).is_none(), "{tool} success logged twice");
+            assert!(audit::plan(tool, &json!({"name": "r"}), &Err("nope".into()), None).is_none(), "{tool} failure logged twice");
+        }
+        for read in ["list_recipes", "get_recipe", "recipe_building_blocks", "validate_recipe"] {
+            assert!(audit::classify(read).is_none(), "{read} records nothing");
+        }
+    }
+
+    #[test]
+    fn the_recipe_note_is_short_and_covers_the_advice() {
+        assert!(RECIPE_NOTE.lines().count() <= 5, "{} lines", RECIPE_NOTE.lines().count());
+        for needle in [
+            "validate_recipe", "save_recipe", "train_ml_model", "recipe_building_blocks", "Scale features", "clip_outliers", "voting",
+            "stacking", "baseline_accuracy", "hold-out", "earlier data", "predicts later data",
+        ] {
+            assert!(RECIPE_NOTE.contains(needle), "the recipe note should mention `{needle}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_system_prompt_carries_the_recipe_note() {
+        let (state, paths) = test_support::state("prompt-recipes").await;
+        let prompt = system_prompt(&state, &paths, super::super::copilot_mode::ChatMode::Agent);
+        assert!(prompt.contains("ALGORITHM RECIPES") && prompt.contains("validate_recipe"));
+        assert!(prompt.contains("ML WORKFLOW") && prompt.contains("SHORTING"), "the other notes stay");
     }
 
     #[test]

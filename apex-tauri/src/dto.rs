@@ -472,6 +472,9 @@ pub struct MLTrainingRequestDto {
     /// Required when `algorithm` is "custom": a file saved with `save_estimator_file`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimator_file: Option<String>,
+    /// Required when `algorithm` is "recipe": the name of a saved recipe (see `ml_recipes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
     /// Seed for estimators that take one. Omitted: a fixed default, so runs repeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub random_state: Option<i64>,
@@ -492,6 +495,7 @@ impl Default for MLTrainingRequestDto {
             trade_mode: None,
             holdout_pct: None,
             estimator_file: None,
+            recipe: None,
             random_state: None,
         }
     }
@@ -736,6 +740,9 @@ pub struct ModelDetailDto {
     pub fee_pct: f64,
     /// Name of the custom estimator file when `algorithm` is "custom".
     pub estimator_file: Option<String>,
+    /// The recipe this model was built from when `algorithm` is "recipe" (a copy).
+    #[serde(default)]
+    pub recipe: Option<RecipeDto>,
 }
 
 // ── Algorithm catalog and custom estimators ──────────────────────────
@@ -1180,4 +1187,117 @@ pub struct SymbolFeedDto {
     /// The feed the user pinned, if any (None = automatic).
     pub preferred: Option<String>,
     pub options: Vec<FeedOptionDto>,
+}
+
+// ── Algorithm recipes ────────────────────────────────────────────────
+
+/// Parameters of a step or member: a JSON object, keys sorted when written.
+pub type RecipeParams = serde_json::Map<String, serde_json::Value>;
+
+/// `#[serde(default)]` only covers a missing key. The Python validator also accepts an explicit
+/// `null` (and language models often send one), so a `null` reads as the default too.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn null_as_none_calibration<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_else(default_calibrate))
+}
+
+/// One preprocessing step, e.g. `{"kind": "standard_scaler", "params": {}}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeStepDto {
+    pub kind: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub params: RecipeParams,
+}
+
+/// A member model of a voting or stacking recipe (or the final estimator of a stack).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeMemberDto {
+    pub algorithm: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub params: RecipeParams,
+    /// Voting only; the trainer treats a missing weight as 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipeModelDto {
+    Single {
+        algorithm: String,
+        #[serde(default, deserialize_with = "null_as_default")]
+        params: RecipeParams,
+    },
+    Voting {
+        /// "soft" | "hard"
+        voting: String,
+        members: Vec<RecipeMemberDto>,
+    },
+    /// Time-aware stacking: members are fitted on expanding windows and their out-of-fold
+    /// predictions train `final`.
+    Stacking {
+        members: Vec<RecipeMemberDto>,
+        #[serde(rename = "final")]
+        final_estimator: RecipeMemberDto,
+        blocks: usize,
+    },
+}
+
+fn default_calibrate() -> String {
+    "none".into()
+}
+
+/// An algorithm assembled from library parts, saved as `<work root>/algorithms/<name>.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeDto {
+    /// `[a-z][a-z0-9_]{0,40}`
+    pub name: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub label: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub description: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub steps: Vec<RecipeStepDto>,
+    pub model: RecipeModelDto,
+    /// "none" | "sigmoid" | "isotonic"
+    #[serde(default = "default_calibrate", deserialize_with = "null_as_none_calibration")]
+    pub calibrate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeIssueDto {
+    /// Where in the recipe, e.g. `steps[1].params.k` or `model.members[2]`.
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeCheckDto {
+    pub ok: bool,
+    #[serde(default)]
+    pub errors: Vec<RecipeIssueDto>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub steps: usize,
+    /// Number of fitted models (members plus the final estimator for stacking).
+    #[serde(default)]
+    pub models: usize,
+    /// Pessimistic size estimate for a typical dataset; null when unknown.
+    #[serde(default)]
+    pub est_model_mb: Option<f64>,
 }
