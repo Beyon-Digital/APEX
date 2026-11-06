@@ -47,7 +47,12 @@ export const SymbolSearch: React.FC<SymbolSearchProps> = ({
       const typed = query.trim();
       if (!typed) return;
       const exact = options.find((o) => o.symbol.toUpperCase() === typed.toUpperCase());
-      const choice = exact ?? (open ? options[active] : undefined);
+      // A highlighted suggestion is only taken if it still matches what is typed.
+      const highlighted = open ? options[active] : undefined;
+      const stillMatches = highlighted
+        && (highlighted.symbol.toUpperCase().includes(typed.toUpperCase())
+          || highlighted.name.toUpperCase().includes(typed.toUpperCase()));
+      const choice = exact ?? (stillMatches ? highlighted : undefined);
       if (choice) commit(choice.symbol, true);
       else commit(typed, false);
     } else if (event.key === 'Escape') {

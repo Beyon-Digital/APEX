@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMarketStore } from '../../stores/marketStore';
 import { PnlValue } from '../common/PnlValue';
 import { formatPrice } from '../../lib/format';
@@ -6,17 +6,22 @@ import { quoteAge } from '../../lib/quoteAge';
 import type { QuoteDto } from '../../lib/types';
 import { SymbolSearch } from '../common/SymbolSearch';
 import { addSymbolToWatchlist } from '../../lib/watchlistActions';
+import { getSymbolFeeds } from '../../lib/tauri';
+import type { SymbolFeedDto } from '../../lib/types';
+import { FeedPicker } from './FeedPicker';
 
 type SortKey = 'symbol' | 'last' | 'chg';
 
 interface WatchlistRowProps {
   symbol: string;
+  feed: SymbolFeedDto | undefined;
+  onFeedChanged: () => void;
   selected: boolean;
   onSelect: (symbol: string) => void;
   onRemove: (symbol: string) => void;
 }
 
-const WatchlistRow: React.FC<WatchlistRowProps> = React.memo(({ symbol, selected, onSelect, onRemove }) => {
+const WatchlistRow: React.FC<WatchlistRowProps> = React.memo(({ symbol, feed, onFeedChanged, selected, onSelect, onRemove }) => {
   const quote = useMarketStore((s) => s.quotes.get(symbol));
   const prevLast = useRef<number | null>(null);
   const [flash, setFlash] = useState<'up' | 'down' | null>(null);
@@ -42,6 +47,7 @@ const WatchlistRow: React.FC<WatchlistRowProps> = React.memo(({ symbol, selected
       >
         <td className="px-1 py-1.5 font-mono text-xs font-medium whitespace-nowrap" onClick={() => onSelect(symbol)}>{symbol}</td>
         <td className="px-1 py-1.5 text-text-muted font-mono text-xs" colSpan={2} onClick={() => onSelect(symbol)}>—</td>
+        <td className="px-1 py-1.5 text-center"><FeedPicker symbol={symbol} feed={feed} onChanged={onFeedChanged} /></td>
         <td className="px-1 py-1.5 text-right">
           <button
             onClick={(e) => {
@@ -71,6 +77,7 @@ const WatchlistRow: React.FC<WatchlistRowProps> = React.memo(({ symbol, selected
       <td className="px-1 py-1.5 text-right whitespace-nowrap" onClick={() => onSelect(symbol)}>
         <PnlValue value={quote.change_pct} type="percent" className="text-xs" />
       </td>
+      <td className="px-1 py-1.5 text-center"><FeedPicker symbol={symbol} feed={feed} onChanged={onFeedChanged} /></td>
       <td className="px-1 py-1.5 text-right">
         <button
           onClick={(e) => {
@@ -100,6 +107,20 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onSelectSymbol, selectedSy
   const removeFromWatchlist = useMarketStore((s) => s.removeFromWatchlist);
   const [isAdding, setIsAdding] = useState(false);
   const [addStatus, setAddStatus] = useState<{ kind: 'idle' | 'checking' | 'error'; message?: string }>({ kind: 'idle' });
+  const [feeds, setFeeds] = useState<Record<string, SymbolFeedDto>>({});
+  const loadFeeds = useCallback(async () => {
+    try {
+      const list = await getSymbolFeeds(watchlist);
+      if (Array.isArray(list)) setFeeds(Object.fromEntries(list.map((f) => [f.symbol, f])));
+    } catch {
+      // Feed info is a nicety; the watchlist works without it.
+    }
+  }, [watchlist]);
+  useEffect(() => {
+    void loadFeeds();
+    const timer = setInterval(() => void loadFeeds(), 6000);
+    return () => clearInterval(timer);
+  }, [loadFeeds]);
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortAsc, setSortAsc] = useState(true);
 
@@ -202,6 +223,7 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onSelectSymbol, selectedSy
               <th className={`${headerClass} text-right`} onClick={() => toggleSort('chg')} data-testid="watchlist-sort-chg">
                 Chg%{sortIndicator('chg')}
               </th>
+              <th className="px-1 py-1.5 text-center font-normal" title="Data source for each ticker. Click a badge to choose the feed.">Src</th>
               <th className="px-1 py-1.5 text-right font-normal"></th>
             </tr>
           </thead>
@@ -210,6 +232,8 @@ export const Watchlist: React.FC<WatchlistProps> = ({ onSelectSymbol, selectedSy
               <WatchlistRow
                 key={symbol}
                 symbol={symbol}
+                feed={feeds[symbol]}
+                onFeedChanged={() => void loadFeeds()}
                 selected={symbol === selectedSymbol}
                 onSelect={onSelectSymbol ?? (() => {})}
                 onRemove={removeFromWatchlist}

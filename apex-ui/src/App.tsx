@@ -4,16 +4,17 @@ import { CommandBar } from './components/workspace/CommandBar';
 import { StatusBar } from './components/workspace/StatusBar';
 import { TickerTape } from './components/workspace/TickerTape';
 import { KeyboardHud } from './components/workspace/KeyboardHud';
-import { CopilotDock } from './components/copilot/CopilotDock';
 import { VaultGate } from './components/settings/VaultGate';
 import { useDataSync } from './lib/useDataSync';
 import { useTauriEventBridge } from './hooks/useTauriEvents';
+import { useArtifactEvents } from './hooks/useArtifactEvents';
 import { useWorkspaceStore } from './stores/workspaceStore';
 import { syncAppearance } from './lib/appearance';
 
 export default function App() {
   useDataSync();
   useTauriEventBridge();
+  useArtifactEvents();
 
   useEffect(() => {
     void syncAppearance();
@@ -31,7 +32,6 @@ export default function App() {
       </main>
       <StatusBar />
       <KeyboardHud />
-      <CopilotDock />
       <VaultGate />
     </div>
   );

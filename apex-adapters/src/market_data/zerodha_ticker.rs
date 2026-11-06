@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Instant;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use apex_core::domain::models::{Symbol, Tick};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
@@ -27,6 +28,12 @@ const MAX_INSTRUMENTS: usize = 3000;
 /// After this many consecutive WebSocket failures, poll `/quote` instead.
 const POLL_FALLBACK_AFTER: u32 = 3;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Kite sends a heartbeat about once a second; this long with no frame at all
+/// means the connection died silently (sleep/wake, Wi-Fi change, NAT drop).
+const STALE_AFTER: Duration = Duration::from_secs(15);
+/// A session shorter than this counts as a failure even if it ended cleanly, so a
+/// server that accepts and immediately closes cannot cause a hot reconnect loop.
+const STABLE_AFTER: Duration = Duration::from_secs(30);
 /// `/quote` accepts up to 500 instruments per request.
 const QUOTE_BATCH: usize = 200;
 
@@ -47,6 +54,8 @@ pub struct TickerHub {
     started: AtomicBool,
     connected: AtomicBool,
     failures: AtomicU32,
+    stopped: AtomicBool,
+    stop_signal: Notify,
 }
 
 impl TickerHub {
@@ -59,7 +68,31 @@ impl TickerHub {
             started: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             failures: AtomicU32::new(0),
+            stopped: AtomicBool::new(false),
+            stop_signal: Notify::new(),
         })
+    }
+
+    /// Stop the background connection and drop the session's credentials. After this
+    /// the hub never reconnects; called when the adapter is replaced or the vault locks.
+    pub fn shutdown(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.stop_signal.notify_waiters();
+        self.session.clear_token();
+        self.subscribers.lock().unwrap().clear();
+        self.connected.store(false, Ordering::Relaxed);
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Sleep that wakes immediately on shutdown.
+    async fn pause(&self, duration: Duration) {
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => {}
+            _ = self.stop_signal.notified() => {}
+        }
     }
 
     pub fn is_started(&self) -> bool {
@@ -112,9 +145,12 @@ impl TickerHub {
     async fn run(self: Arc<Self>, mut commands: mpsc::UnboundedReceiver<Command>) {
         let mut backoff = Duration::from_secs(1);
         loop {
+            if self.is_stopped() {
+                break;
+            }
             if !self.session.is_authenticated() {
                 self.connected.store(false, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                self.pause(Duration::from_secs(3)).await;
                 continue;
             }
             if self.is_polling() {
@@ -125,19 +161,28 @@ impl TickerHub {
                 } else {
                     self.failures.fetch_add(1, Ordering::Relaxed);
                 }
-                tokio::time::sleep(POLL_INTERVAL).await;
+                self.pause(POLL_INTERVAL).await;
                 continue;
             }
-            match self.session_once(&mut commands).await {
-                Ok(()) => backoff = Duration::from_secs(1),
-                Err(error) => {
-                    let n = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
-                    warn!(%error, attempt = n, "KiteTicker connection failed");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                }
-            }
+            let started_at = Instant::now();
+            let result = self.session_once(&mut commands).await;
             self.connected.store(false, Ordering::Relaxed);
+            if self.is_stopped() {
+                break;
+            }
+            if started_at.elapsed() >= STABLE_AFTER {
+                // It ran for a while, so whatever ended it is a fresh problem.
+                self.failures.store(0, Ordering::Relaxed);
+                backoff = Duration::from_secs(1);
+            } else {
+                let n = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+                match &result {
+                    Err(error) => warn!(%error, attempt = n, "KiteTicker connection failed"),
+                    Ok(()) => warn!(attempt = n, "KiteTicker closed quickly; backing off"),
+                }
+                self.pause(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
         }
     }
 
@@ -150,24 +195,31 @@ impl TickerHub {
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
         info!("KiteTicker connected");
         self.connected.store(true, Ordering::Relaxed);
-        self.failures.store(0, Ordering::Relaxed);
+        let mut last_frame = Instant::now();
 
         let tokens = self.all_tokens();
         if !tokens.is_empty() {
             send_subscription(&mut ws, &tokens).await?;
         }
 
-        let mut idle_check = tokio::time::interval(Duration::from_secs(20));
+        let mut idle_check = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
-                message = ws.next() => match message {
-                    Some(Ok(Message::Binary(frame))) => self.dispatch_frame(&frame),
-                    Some(Ok(Message::Text(text))) => self.handle_text(&text),
-                    Some(Ok(Message::Ping(data))) => ws.send(Message::Pong(data)).await?,
-                    Some(Ok(Message::Close(_))) | None => return Ok(()),
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => return Err(error.into()),
-                },
+                _ = self.stop_signal.notified() => {
+                    let _ = ws.close(None).await;
+                    return Ok(());
+                }
+                message = ws.next() => {
+                    last_frame = Instant::now();
+                    match message {
+                        Some(Ok(Message::Binary(frame))) => self.dispatch_frame(&frame),
+                        Some(Ok(Message::Text(text))) => self.handle_text(&text),
+                        Some(Ok(Message::Ping(data))) => ws.send(Message::Pong(data)).await?,
+                        Some(Ok(Message::Close(_))) | None => return Ok(()),
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => return Err(error.into()),
+                    }
+                }
                 command = commands.recv() => match command {
                     Some(Command::Subscribe(tokens)) if !tokens.is_empty() => {
                         send_subscription(&mut ws, &tokens).await?;
@@ -176,10 +228,20 @@ impl TickerHub {
                     None => return Ok(()),
                 },
                 _ = idle_check.tick() => {
+                    if self.is_stopped() {
+                        let _ = ws.close(None).await;
+                        return Ok(());
+                    }
                     // A token cleared by a TokenException elsewhere ends the session.
                     if !self.session.is_authenticated() {
                         let _ = ws.close(None).await;
                         return Ok(());
+                    }
+                    if last_frame.elapsed() > STALE_AFTER {
+                        return Err(anyhow::anyhow!(
+                            "no data from KiteTicker for {}s; reconnecting",
+                            last_frame.elapsed().as_secs()
+                        ));
                     }
                     if self.all_tokens().is_empty() && self.subscribers.lock().unwrap().is_empty() {
                         debug!("KiteTicker has no subscribers; staying connected for order updates");

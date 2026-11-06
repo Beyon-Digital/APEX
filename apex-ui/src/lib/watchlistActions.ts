@@ -1,4 +1,4 @@
-import { getQuote, subscribeSymbols } from './tauri';
+import { getQuote, subscribeSymbols, unsubscribeSymbols } from './tauri';
 import { useMarketStore } from '../stores/marketStore';
 
 export interface WatchlistResult {
@@ -42,6 +42,8 @@ export async function addSymbolToWatchlist(rawSymbol: string, known: boolean): P
   } catch {
     // fall through to the not-found message
   }
+  // It never produced a quote, so stop the feed from polling a non-existent ticker.
+  void unsubscribeSymbols([symbol]).catch(() => undefined);
   return {
     ok: false,
     message: `Couldn't find a live quote for ${symbol}. Pick a result from the list or check the ticker.`,

@@ -32,6 +32,15 @@ pub trait MarketDataPort: Send + Sync {
     fn priority(&self) -> u8 {
         1
     }
+    /// Whether `unsubscribe` really stops delivering ticks for those symbols. When
+    /// false the stream keeps running, so the aggregator keeps treating the
+    /// symbols as subscribed (re-adding one must not open a second stream).
+    fn releases_on_unsubscribe(&self) -> bool {
+        false
+    }
+    /// Stop background tasks and drop credentials. Called when the adapter is
+    /// replaced or removed.
+    fn shutdown(&self) {}
     /// Subscribe to real-time tick data for the given symbols
     async fn subscribe(&self, symbols: &[Symbol]) -> Result<TickStream>;
     /// Unsubscribe from tick data for the given symbols

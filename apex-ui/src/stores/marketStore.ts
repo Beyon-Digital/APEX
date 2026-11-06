@@ -6,6 +6,9 @@ interface MarketState {
   quotes: Map<string, QuoteDto>;
   watchlist: string[];
   lastQuoteAt: number | null;
+  /** Data feed pinned per symbol (adapter id). Absent = automatic. */
+  providerPrefs: Record<string, string>;
+  setProviderPref: (symbol: string, adapterId: string | null) => void;
   updateQuote: (quote: QuoteDto) => void;
   setWatchlist: (symbols: string[]) => void;
   addToWatchlist: (symbol: string) => void;
@@ -19,12 +22,25 @@ export const useMarketStore = create<MarketState>()(
       quotes: new Map(),
       watchlist: ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'INFY.NS', 'AAPL', 'MSFT', 'GOOGL'],
       lastQuoteAt: null,
+      providerPrefs: {},
+
+      setProviderPref: (symbol, adapterId) => {
+        set((state) => {
+          const next = { ...state.providerPrefs };
+          if (adapterId) next[symbol] = adapterId;
+          else delete next[symbol];
+          return { providerPrefs: next };
+        });
+      },
 
       updateQuote: (quote: QuoteDto) => {
         set((state) => {
           const time = Date.parse(quote.updated_at);
           const previous = state.quotes.get(quote.symbol);
-          if (previous && Number.isFinite(Date.parse(previous.updated_at)) && (!Number.isFinite(time) || time < Date.parse(previous.updated_at))) return state;
+          // A pinned feed is the user's explicit choice. A delayed feed's timestamps are older
+          // than the live quote it replaced, and ignoring them would freeze the row.
+          const pinned = Boolean(state.providerPrefs[quote.symbol]);
+          if (!pinned && previous && Number.isFinite(Date.parse(previous.updated_at)) && (!Number.isFinite(time) || time < Date.parse(previous.updated_at))) return state;
           const newQuotes = new Map(state.quotes);
           newQuotes.set(quote.symbol, quote);
           const lastQuoteAt = Number.isFinite(time) && time <= Date.now() + 5_000
@@ -46,16 +62,18 @@ export const useMarketStore = create<MarketState>()(
       },
 
       removeFromWatchlist: (symbol: string) => {
-        set((state) => ({
-          watchlist: state.watchlist.filter((s) => s !== symbol),
-        }));
+        set((state) => {
+          const providerPrefs = { ...state.providerPrefs };
+          delete providerPrefs[symbol];
+          return { watchlist: state.watchlist.filter((s) => s !== symbol), providerPrefs };
+        });
       },
 
       getQuote: (symbol: string) => get().quotes.get(symbol),
     }),
     {
       name: 'market-storage',
-      partialize: (state) => ({ watchlist: state.watchlist }),
+      partialize: (state) => ({ watchlist: state.watchlist, providerPrefs: state.providerPrefs }),
     }
   )
 );

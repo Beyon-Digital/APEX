@@ -76,3 +76,90 @@ html, body, #root {
 .price-flash-down {
     animation: price-flash-down 700ms ease-out;
 }
+
+/* ---- Tiled workspace: resize handles, placeholder, maximize ----
+   Handles come from react-resizable (all eight directions). Its default corner-triangle artwork is
+   replaced: edges are thin strips straddling the tile border (3px outside, 3px inside), corners are
+   small squares with an L marker. Both light up when the tile or the handle is hovered, so they are
+   discoverable without covering tile content. Selectors are longer than the library's on purpose. */
+.layout > .react-grid-item > .react-resizable-handle {
+  position: absolute;
+  z-index: 5;
+  width: auto;
+  height: auto;
+  margin: 0;
+  padding: 0;
+  transform: none;
+  background: transparent;
+  background-image: none;
+  touch-action: none;
+  transition: background-color 120ms ease;
+}
+.layout > .react-grid-item > .react-resizable-handle::after {
+  content: none;
+}
+.layout > .react-grid-item > .react-resizable-handle-n,
+.layout > .react-grid-item > .react-resizable-handle-s { left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+.layout > .react-grid-item > .react-resizable-handle-e,
+.layout > .react-grid-item > .react-resizable-handle-w { top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+.layout > .react-grid-item > .react-resizable-handle-n { top: -3px; bottom: auto; }
+.layout > .react-grid-item > .react-resizable-handle-s { bottom: -3px; top: auto; }
+.layout > .react-grid-item > .react-resizable-handle-w { left: -3px; right: auto; }
+.layout > .react-grid-item > .react-resizable-handle-e { right: -3px; left: auto; }
+.layout > .react-grid-item > .react-resizable-handle-nw,
+.layout > .react-grid-item > .react-resizable-handle-ne,
+.layout > .react-grid-item > .react-resizable-handle-sw,
+.layout > .react-grid-item > .react-resizable-handle-se { z-index: 6; width: 10px; height: 10px; }
+.layout > .react-grid-item > .react-resizable-handle-nw { top: -3px; left: -3px; right: auto; bottom: auto; cursor: nwse-resize; }
+.layout > .react-grid-item > .react-resizable-handle-se { bottom: -3px; right: -3px; top: auto; left: auto; cursor: nwse-resize; }
+.layout > .react-grid-item > .react-resizable-handle-ne { top: -3px; right: -3px; left: auto; bottom: auto; cursor: nesw-resize; }
+.layout > .react-grid-item > .react-resizable-handle-sw { bottom: -3px; left: -3px; right: auto; top: auto; cursor: nesw-resize; }
+.layout > .react-grid-item > .react-resizable-handle-nw::after,
+.layout > .react-grid-item > .react-resizable-handle-ne::after,
+.layout > .react-grid-item > .react-resizable-handle-sw::after,
+.layout > .react-grid-item > .react-resizable-handle-se::after {
+  content: '';
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  border: 0 solid rgb(var(--color-accent-rgb) / 0.35);
+  pointer-events: none;
+}
+.layout > .react-grid-item > .react-resizable-handle-nw::after { top: 2px; left: 2px; border-width: 2px 0 0 2px; }
+.layout > .react-grid-item > .react-resizable-handle-ne::after { top: 2px; right: 2px; border-width: 2px 2px 0 0; }
+.layout > .react-grid-item > .react-resizable-handle-sw::after { bottom: 2px; left: 2px; border-width: 0 0 2px 2px; }
+.layout > .react-grid-item > .react-resizable-handle-se::after { bottom: 2px; right: 2px; border-width: 0 2px 2px 0; }
+.layout > .react-grid-item:hover > .react-resizable-handle-n,
+.layout > .react-grid-item:hover > .react-resizable-handle-s,
+.layout > .react-grid-item:hover > .react-resizable-handle-e,
+.layout > .react-grid-item:hover > .react-resizable-handle-w { background: rgb(var(--color-accent-rgb) / 0.18); }
+.layout > .react-grid-item > .react-resizable-handle:hover,
+.layout > .react-grid-item.resizing > .react-resizable-handle { background: rgb(var(--color-accent-rgb) / 0.55); }
+.layout > .react-grid-item:hover > .react-resizable-handle::after,
+.layout > .react-grid-item > .react-resizable-handle:hover::after { border-color: rgb(var(--color-accent-rgb) / 0.9); }
+.layout > .react-grid-item.resizing { box-shadow: 0 0 0 1px var(--color-accent); }
+
+.layout > .react-grid-item.react-grid-placeholder {
+  background: rgb(var(--color-accent-rgb) / 0.2);
+  border: 1px dashed var(--color-accent);
+  opacity: 1;
+  /* The placeholder appears on mouse-down, on top of the tile. Without this, mouse-up lands on it and no click or double-click reaches the header. */
+  pointer-events: none;
+}
+
+/* Maximized: the tile is fixed over the workspace area (see TiledWorkspace); the others are hidden but stay in the layout. */
+.layout > .react-grid-item.tile-maximized {
+  position: fixed !important;
+  transform: none !important;
+  transition: none !important;
+  top: var(--max-top, 0) !important;
+  left: var(--max-left, 0) !important;
+  width: var(--max-w, 100%) !important;
+  height: var(--max-h, 100%) !important;
+  z-index: 30;
+}
+.layout > .react-grid-item.tile-maximized > .react-resizable-handle { display: none; }
+.layout > .react-grid-item.tile-hidden { visibility: hidden; pointer-events: none; }
+/* A collapsed tile is one row tall: its side handles span the whole edge (there are no corner handles). */
+.layout > .react-grid-item.tile-collapsed > .react-resizable-handle-e,
+.layout > .react-grid-item.tile-collapsed > .react-resizable-handle-w { top: 0; bottom: 0; }

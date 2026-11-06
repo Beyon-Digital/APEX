@@ -1,5 +1,13 @@
 import { AdapterManager } from '../settings/AdapterManager';
-import React, { useCallback, useEffect, useState } from 'react';
+import { ChatGptCard } from '../settings/ChatGptCard';
+import { CopilotTile } from '../copilot/CopilotTile';
+import { ActivityPanel } from '../activity/ActivityPanel';
+import { CopilotSidePanel } from '../copilot/CopilotSidePanel';
+import { ProviderKeyField } from '../settings/ProviderKeyField';
+import { SymbolField } from '../common/SymbolField';
+import { DataFeedsOverview } from '../settings/DataFeedsOverview';
+import { useLiveStore } from '../../stores/liveStore';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Watchlist } from '../trading/Watchlist';
 import { DataBrowser } from '../trading/DataBrowser';
 import { OrderEntry } from '../trading/OrderEntry';
@@ -20,9 +28,12 @@ import { BacktestPanel } from '../strategy/BacktestPanel';
 import { ErrorBoundary } from '../common/ErrorBoundary';
 import { addAlert, clearBrokerSession, getAlertRules, getAppSettings, listBrokerConnections, removeAlert, saveAppSettings, setBrokerSession, subscribeSymbols, zerodhaLogin } from '../../lib/tauri';
 import { applyAppearance } from '../../lib/appearance';
+import { DeletedObjects } from '../audit/DeletedObjects';
+import { VersionHistory } from '../audit/VersionHistory';
 import type { AlertRuleDto, AppSettingsDto, AppSettingsUpdateDto, BrokerConnectionDto, LlmProviderWriteDto } from '../../lib/types';
 import { useMarketStore } from '../../stores/marketStore';
 import { useBrokerStore } from '../../stores/brokerStore';
+import { useArtifactStore } from '../../stores/artifactStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { VALID_TABS, type CenterTab } from './workspaceTabs';
 import { TiledWorkspace } from './TiledWorkspace';
@@ -33,6 +44,16 @@ import type { PanelId, TileItem } from './panels';
 const StrategyIDE = React.lazy(() => import('../strategy/StrategyIDE').then((module) => ({ default: module.StrategyIDE })));
 
 type AlertCondition = 'price_above' | 'price_below';
+
+type SettingsTab = 'accounts' | 'data' | 'ai' | 'trading' | 'general';
+
+const SETTINGS_TABS: { id: SettingsTab; label: string; hint: string }[] = [
+  { id: 'accounts', label: 'Accounts', hint: 'Brokers, data keys, login' },
+  { id: 'data', label: 'Market data', hint: 'Feeds and providers' },
+  { id: 'ai', label: 'AI Copilot', hint: 'ChatGPT, API providers' },
+  { id: 'trading', label: 'Trading', hint: 'Live safeguards, risk' },
+  { id: 'general', label: 'General', hint: 'Look and storage' },
+];
 
 const CENTER_TABS: { id: CenterTab; label: string }[] = [
   { id: 'chart', label: 'Chart' },
@@ -49,6 +70,7 @@ const CENTER_TABS: { id: CenterTab; label: string }[] = [
   { id: 'data', label: 'Stored Data' },
   { id: 'automations', label: 'Automations' },
   { id: 'notebook', label: 'Notebook' },
+  { id: 'activity', label: 'Activity' },
   { id: 'health', label: 'Health' },
 ];
 
@@ -173,6 +195,8 @@ export const Workspace: React.FC = () => {
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [showLoadDialog, setShowLoadDialog] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('accounts');
+  const liveStatus = useLiveStore((s) => s.status);
   const [layoutName, setLayoutName] = useState('');
   const [saveConfirmation, setSaveConfirmation] = useState(false);
   const [loadConfirmation, setLoadConfirmation] = useState(false);
@@ -208,6 +232,24 @@ export const Workspace: React.FC = () => {
     if (useWorkspaceStore.getState().viewMode === 'tiles') ensureTile(tab);
   }, [ensureTile]);
 
+  const toggleCopilot = useWorkspaceStore((s) => s.toggleCopilot);
+  const copilotSideOpen = useWorkspaceStore((s) => s.copilotSideOpen);
+  const copilotShown = useWorkspaceStore((s) =>
+    s.viewMode === 'focus' ? s.copilotSideOpen : s.tiles.some((t) => t.i === 'copilot'));
+
+  // Ctrl/Cmd+Shift+A toggles the Copilot, even while typing or inside the code editor.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.key.toLowerCase() === 'a') {
+        event.preventDefault();
+        event.stopPropagation();
+        useWorkspaceStore.getState().toggleCopilot();
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
+
   // React to CommandBar dispatches
   const commandSymbol = useWorkspaceStore((s) => s.commandSymbol);
   const commandTab = useWorkspaceStore((s) => s.commandTab);
@@ -221,17 +263,16 @@ export const Workspace: React.FC = () => {
     }
   }, [commandSymbol, setCommandSymbol]);
 
-  const setCopilotOpen = useWorkspaceStore((s) => s.setCopilotOpen);
-
   useEffect(() => {
     if (!commandTab) return;
     if (commandTab === 'copilot') {
-      setCopilotOpen(true);
+      // Never a centre tab: a tile in tiles mode, the docked side panel in focus mode.
+      useWorkspaceStore.getState().showCopilot();
     } else if ((VALID_TABS as readonly string[]).includes(commandTab)) {
       selectTab(commandTab as CenterTab);
     }
     setCommandTab(null);
-  }, [commandTab, selectTab, setCommandTab, setCopilotOpen]);
+  }, [commandTab, selectTab, setCommandTab]);
 
   const refreshBrokerConnections = useCallback(async () => {
     try {
@@ -251,6 +292,16 @@ export const Workspace: React.FC = () => {
       setSettingsError(null);
     } catch (err) {
       setSettingsError(err instanceof Error ? err.message : 'Unable to load application settings');
+    }
+  }, []);
+
+  // Refresh only the saved state (e.g. "key set" badges). Unlike refreshAppSettings this keeps
+  // the draft, so saving an API key never throws away unsaved edits or a provider just added.
+  const refreshSavedSettings = useCallback(async () => {
+    try {
+      setAppSettings(await getAppSettings());
+    } catch {
+      /* the badge simply stays as it was */
     }
   }, []);
 
@@ -435,6 +486,8 @@ export const Workspace: React.FC = () => {
       case 'notebook': return <NotebookEditor />;
       case 'ml': return <MLWorkbench />;
       case 'health': return <HealthMonitor />;
+      case 'copilot': return <CopilotTile />;
+      case 'activity': return <ActivityPanel />;
       case 'strategy':
         return (
           <React.Suspense fallback={<div className="p-4 text-xs text-text-muted">Loading strategy workspace…</div>}>
@@ -554,78 +607,40 @@ export const Workspace: React.FC = () => {
       {/* Settings Panel */}
       {showSettings && (
         <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-surface-1 border border-[var(--border-color)] rounded-lg p-4 w-[820px] max-h-[85vh] overflow-y-auto" data-testid="settings-panel">
-            <h3 className="text-sm font-medium mb-4">Settings</h3>
-            <div className="space-y-4">
-              {settingsDraft && (
-                <div data-testid="appearance-settings-section">
-                  <h4 className="text-xs font-medium text-text-secondary mb-2">Appearance</h4>
-                  <div className="grid grid-cols-2 gap-3">
-                    <label className="flex flex-col gap-1 text-sm">
-                      <span>Theme</span>
-                      <select
-                        value={settingsDraft.appearance.theme}
-                        onChange={(e) => {
-                          const theme = e.target.value;
-                          setSettingsDraft((current) => current ? {
-                            ...current,
-                            appearance: { ...current.appearance, theme },
-                          } : current);
-                          applyAppearance(theme, settingsDraft.appearance.density);
-                          setSettingsSuccess(null);
-                        }}
-                        className="px-2 py-1.5 text-sm bg-surface-0 border border-[var(--border-color)] rounded"
-                        data-testid="settings-theme"
-                      >
-                        <option value="terminal">Terminal (amber)</option>
-                        <option value="dark">Dark</option>
-                        <option value="light">Light</option>
-                      </select>
-                    </label>
-                    <label className="flex flex-col gap-1 text-sm">
-                      <span>Density</span>
-                      <select
-                        value={settingsDraft.appearance.density}
-                        onChange={(e) => {
-                          const density = e.target.value;
-                          setSettingsDraft((current) => current ? {
-                            ...current,
-                            appearance: { ...current.appearance, density },
-                          } : current);
-                          applyAppearance(settingsDraft.appearance.theme, density);
-                          setSettingsSuccess(null);
-                        }}
-                        className="px-2 py-1.5 text-sm bg-surface-0 border border-[var(--border-color)] rounded"
-                        data-testid="settings-density"
-                      >
-                        <option value="comfortable">Comfortable</option>
-                        <option value="compact">Compact</option>
-                      </select>
-                    </label>
-                  </div>
-                  <p className="mt-1 text-[11px] text-text-muted">Appearance applies immediately and is saved with the rest of your settings.</p>
-                </div>
-              )}
-
-              <div data-testid="trading-settings-section">
-                <h4 className="text-xs font-medium text-text-secondary mb-2">Trading Settings</h4>
-                <div className="space-y-2">
-                  <label className="flex items-center justify-between text-sm">
-                    <span>Default Order Size</span>
-                    <input type="number" className="w-24 px-2 py-1 text-sm bg-surface-0 border border-[var(--border-color)] rounded" defaultValue={1} />
-                  </label>
-                  <label className="flex items-center justify-between text-sm">
-                    <span>Enable Confirmations</span>
-                    <input type="checkbox" defaultChecked />
-                  </label>
-                </div>
-              </div>
-
-              <AdapterManager />
-
+          <div className="bg-surface-1 border border-[var(--border-color)] rounded-lg w-[920px] max-w-[96vw] h-[82vh] flex flex-col" data-testid="settings-panel">
+            <div className="flex items-center justify-between border-b border-[var(--border-color)] px-4 py-3">
+              <h3 className="text-sm font-medium">Settings</h3>
+              <button type="button" onClick={() => setShowSettings(false)} aria-label="Close settings" data-testid="settings-close-x"
+                className="px-2 text-text-muted hover:text-text-primary">✕</button>
+            </div>
+            <div className="flex min-h-0 flex-1">
+              <nav aria-label="Settings sections" role="tablist" aria-orientation="vertical" className="w-44 shrink-0 space-y-1 border-r border-[var(--border-color)] p-2">
+                {SETTINGS_TABS.map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={settingsTab === tab.id}
+                    onClick={() => setSettingsTab(tab.id)}
+                    data-testid={`settings-tab-${tab.id}`}
+                    className={`block w-full px-3 py-2 text-left text-xs ${settingsTab === tab.id ? 'bg-accent/15 text-accent shadow-[inset_2px_0_0_0_var(--color-accent)]' : 'text-text-secondary hover:bg-surface-2 hover:text-text-primary'}`}
+                  >
+                    {tab.label}
+                    <span className="block text-[10px] font-normal text-text-muted">{tab.hint}</span>
+                  </button>
+                ))}
+              </nav>
+              <div className="min-w-0 flex-1 space-y-4 overflow-y-auto p-4" role="tabpanel" data-testid={`settings-pane-${settingsTab}`}>
+                {settingsTab === 'accounts' && (
+                  <>
+                    <AdapterManager />
+                    <details className="border border-[var(--border-color)] bg-surface-0 p-3" data-testid="session-tokens-details">
+                      <summary className="cursor-pointer text-xs font-medium text-text-secondary">Session tokens (advanced)</summary>
+                      <p className="mt-1 text-[11px] text-text-muted">For brokers that give you a token to paste (Angel One, Groww, Robinhood), or to pick the account new orders use.</p>
+                      <div className="mt-3">
               <div data-testid="broker-settings-section">
                 <div className="mb-2 flex items-center justify-between">
-                  <h4 className="text-xs font-medium text-text-secondary">Broker Connections</h4>
+                  <h4 className="text-xs font-medium text-text-secondary">Session tokens</h4>
                   <button
                     type="button"
                     onClick={() => void refreshBrokerConnections()}
@@ -766,91 +781,20 @@ export const Workspace: React.FC = () => {
                   })}
                 </div>
               </div>
-
-              <div data-testid="runtime-settings-section">
-                <div className="mb-2 flex items-start justify-between gap-4">
-                  <div>
-                    <h4 className="text-xs font-medium text-text-secondary">Runtime & Storage</h4>
-                    <p className="mt-1 text-xs text-text-muted">
-                      These values are saved to <code>{appSettings?.config_path ?? 'config/apex.toml'}</code> and apply after restart.
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => void refreshAppSettings()}
-                    className="px-2 py-1 text-[11px] bg-surface-2 hover:bg-surface-3 border border-[var(--border-color)] rounded"
-                    data-testid="refresh-app-settings"
-                  >
-                    Refresh
-                  </button>
-                </div>
-
-                <div className="rounded border border-[var(--border-color)] bg-surface-0 p-3 space-y-2">
-                  <div className="flex flex-wrap items-center gap-3 text-xs text-text-muted">
-                    <span>
-                      Runtime storage: <span className="text-text-primary font-medium">{appSettings ? formatSettingsLabel(appSettings.runtime_storage_backend) : '--'}</span>
-                    </span>
-                    <span className="truncate">
-                      Target: <span className="text-text-primary font-mono">{appSettings?.runtime_storage_target ?? '--'}</span>
-                    </span>
-                  </div>
-
-                  {settingsError && (
-                    <p className="text-xs text-bear" data-testid="settings-error">
-                      {settingsError}
-                    </p>
-                  )}
-
-                  {settingsSuccess && (
-                    <p className="text-xs text-bull" data-testid="settings-success">
-                      {settingsSuccess}
-                    </p>
-                  )}
-
-                  {settingsDraft ? (
-                    <div className="space-y-3 pt-1">
-                      <div className="grid grid-cols-2 gap-3">
-                        <label className="flex flex-col gap-1 text-sm">
-                          <span>Data Directory</span>
-                          <input
-                            type="text"
-                            value={settingsDraft.general.data_dir}
-                            onChange={(e) => {
-                              setSettingsDraft((current) => current ? {
-                                ...current,
-                                general: { ...current.general, data_dir: e.target.value },
-                              } : current);
-                              setSettingsSuccess(null);
-                            }}
-                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
-                            data-testid="settings-data-dir"
-                          />
-                        </label>
-
-                        <label className="flex flex-col gap-1 text-sm">
-                          <span>Storage Backend</span>
-                          <select
-                            value={settingsDraft.storage.backend}
-                            onChange={(e) => {
-                              setSettingsDraft((current) => current ? {
-                                ...current,
-                                storage: { ...current.storage, backend: e.target.value },
-                              } : current);
-                              setSettingsSuccess(null);
-                            }}
-                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
-                            data-testid="settings-storage-backend"
-                          >
-                            {(appSettings?.storage.available_backends ?? ['sqlite', 'timescale']).map((backend) => (
-                              <option key={backend} value={backend}>
-                                {formatSettingsLabel(backend)}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
                       </div>
+                    </details>
+                  </>
+                )}
 
-                      <div className="grid grid-cols-2 gap-3">
+                {settingsTab === 'data' && (
+                  <>
+                    <div data-testid="market-data-settings-section" className="space-y-3">
+                      <div>
+                        <h4 className="text-xs font-medium text-text-secondary">Default data provider</h4>
+                        <p className="mt-1 text-[11px] text-text-muted">Used for tickers you haven&apos;t pinned. Pin a specific feed for any ticker from the SRC badge in the Watchlist.</p>
+                      </div>
+                      {settingsDraft ? (
+                        <div className="grid grid-cols-2 gap-3">
                         <label className="flex flex-col gap-1 text-sm">
                           <span>Preferred Market Data Adapter</span>
                           <select
@@ -872,165 +816,23 @@ export const Workspace: React.FC = () => {
                             ))}
                           </select>
                         </label>
-
-                        <label className="flex flex-col gap-1 text-sm">
-                          <span>Preferred Execution Adapter</span>
-                          <select
-                            value={settingsDraft.execution.adapter}
-                            onChange={(e) => {
-                              setSettingsDraft((current) => current ? {
-                                ...current,
-                                execution: { adapter: e.target.value },
-                              } : current);
-                              setSettingsSuccess(null);
-                            }}
-                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
-                            data-testid="settings-execution-adapter"
-                          >
-                            {(appSettings?.execution.available_adapters ?? []).map((adapter) => (
-                              <option key={adapter} value={adapter}>
-                                {formatSettingsLabel(adapter)}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-3">
-                        <label className="flex flex-col gap-1 text-sm">
-                          <span>SQLite Path</span>
-                          <input
-                            type="text"
-                            value={settingsDraft.storage.sqlite_path}
-                            onChange={(e) => {
-                              setSettingsDraft((current) => current ? {
-                                ...current,
-                                storage: { ...current.storage, sqlite_path: e.target.value },
-                              } : current);
-                              setSettingsSuccess(null);
-                            }}
-                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
-                            data-testid="settings-sqlite-path"
-                          />
-                        </label>
-
-                        <label className="flex flex-col gap-1 text-sm">
-                          <span>Postgres / Timescale URL</span>
-                          <input
-                            type="password"
-                            value={settingsDraft.storage.postgres_url}
-                            onChange={(e) => {
-                              setSettingsDraft((current) => current ? {
-                                ...current,
-                                storage: { ...current.storage, postgres_url: e.target.value },
-                              } : current);
-                              setSettingsSuccess(null);
-                            }}
-                            placeholder="postgresql://postgres:postgres@localhost:5432/apex_market"
-                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
-                            data-testid="settings-postgres-url"
-                          />
-                        </label>
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-3">
-                        <label className="flex flex-col gap-1 text-sm">
-                          <span>Max Daily Loss</span>
-                          <input
-                            type="number"
-                            min={1}
-                            value={settingsDraft.risk.max_daily_loss}
-                            onChange={(e) => {
-                              setSettingsDraft((current) => current ? {
-                                ...current,
-                                risk: { ...current.risk, max_daily_loss: Number(e.target.value) || 0 },
-                              } : current);
-                              setSettingsSuccess(null);
-                            }}
-                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
-                            data-testid="settings-max-daily-loss"
-                          />
-                        </label>
-
-                        <label className="flex flex-col gap-1 text-sm">
-                          <span>Max Order Value</span>
-                          <input
-                            type="number"
-                            min={1}
-                            value={settingsDraft.risk.max_order_value}
-                            onChange={(e) => {
-                              setSettingsDraft((current) => current ? {
-                                ...current,
-                                risk: { ...current.risk, max_order_value: Number(e.target.value) || 0 },
-                              } : current);
-                              setSettingsSuccess(null);
-                            }}
-                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
-                            data-testid="settings-max-order-value"
-                          />
-                        </label>
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-3 items-end">
-                        <label className="flex flex-col gap-1 text-sm">
-                          <span>Storage Pool Size</span>
-                          <input
-                            type="number"
-                            min={1}
-                            value={settingsDraft.storage.pool_size}
-                            onChange={(e) => {
-                              setSettingsDraft((current) => current ? {
-                                ...current,
-                                storage: { ...current.storage, pool_size: Math.max(1, Number(e.target.value) || 1) },
-                              } : current);
-                              setSettingsSuccess(null);
-                            }}
-                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
-                            data-testid="settings-storage-pool-size"
-                          />
-                        </label>
-
-                        <label className="flex items-center gap-2 text-sm pt-6">
-                          <input
-                            type="checkbox"
-                            checked={settingsDraft.storage.wal_mode}
-                            onChange={(e) => {
-                              setSettingsDraft((current) => current ? {
-                                ...current,
-                                storage: { ...current.storage, wal_mode: e.target.checked },
-                              } : current);
-                              setSettingsSuccess(null);
-                            }}
-                            data-testid="settings-storage-wal-mode"
-                          />
-                          <span>Enable SQLite WAL mode</span>
-                        </label>
-                      </div>
-
-                      <div className="rounded border border-[var(--border-color)] bg-surface-1 px-3 py-2 text-xs text-text-muted">
-                        <p>
-                          <strong className="text-text-primary">Heads-up:</strong> storage and adapter changes are saved immediately, but the desktop runtime keeps using the current backend until restart.
-                        </p>
-                        {settingsDraft.storage.backend === 'timescale' && (
-                          <p className="mt-1">
-                            The Postgres option expects a TimescaleDB-enabled database URL.
-                          </p>
-                        )}
-                      </div>
+                        </div>
+                      ) : <p className="text-sm text-text-muted">Loading…</p>}
                     </div>
-                  ) : (
-                    <p className="text-sm text-text-muted">Loading application settings…</p>
-                  )}
-                </div>
-              </div>
+                    <DataFeedsOverview />
+                  </>
+                )}
 
+                {settingsTab === 'ai' && (
+                  <>
+                    <ChatGptCard />
               {settingsDraft && (
                 <div data-testid="llm-settings-section">
                   <div className="mb-2 flex items-center justify-between">
                     <div>
                       <h4 className="text-xs font-medium text-text-secondary">AI Providers</h4>
                       <p className="mt-0.5 text-[11px] text-text-muted">
-                        OpenAI-compatible endpoints for the Copilot. API keys are read from env vars — store only the variable name.
+                        OpenAI-compatible endpoints for the Copilot. Each provider has its own API key field below; keys are stored encrypted in the credential vault.
                       </p>
                       <p className="mt-0.5 text-[11px] text-warning">
                         Copilot prompts and tool results (quotes, positions, orders) are sent to the active provider's endpoint. Only configure providers you trust with your trading data.
@@ -1123,14 +925,9 @@ export const Workspace: React.FC = () => {
                               className="px-2 py-1 text-xs bg-surface-1 border border-[var(--border-color)] rounded font-mono"
                               data-testid={`llm-model-${p.id}`}
                             />
-                            <input
-                              value={p.api_key_env}
-                              onChange={(e) => updateLlmProvider(p.id, { api_key_env: e.target.value })}
-                              placeholder="API key env var (e.g. OPEN_ROUTER)"
-                              className="px-2 py-1 text-xs bg-surface-1 border border-[var(--border-color)] rounded font-mono"
-                              data-testid={`llm-key-env-${p.id}`}
-                            />
-                            <input
+                            <ProviderKeyField providerId={p.id} stored={Boolean(persisted?.key_configured)} onChanged={refreshSavedSettings} />
+                            <label className="flex items-center gap-2 text-[11px] text-text-muted">Max tokens
+                              <input
                               type="number"
                               value={p.max_tokens}
                               min={1}
@@ -1139,13 +936,14 @@ export const Workspace: React.FC = () => {
                               className="px-2 py-1 text-xs bg-surface-1 border border-[var(--border-color)] rounded"
                               data-testid={`llm-max-tokens-${p.id}`}
                             />
+                            </label>
                           </div>
                         </div>
                       );
                     })}
                     {settingsDraft.llm.providers.length === 0 && (
                       <p className="text-xs text-text-muted" data-testid="llm-no-providers">
-                        No providers configured — the copilot falls back to the legacy [copilot] section + OPEN_ROUTER env var.
+                        No providers configured. The copilot uses the legacy [copilot] section with the key saved under Accounts &gt; Copilot (OpenRouter).
                       </p>
                     )}
                   </div>
@@ -1187,12 +985,292 @@ export const Workspace: React.FC = () => {
                   </div>
                 </div>
               )}
+                  </>
+                )}
+
+                {settingsTab === 'trading' && (
+                  <div data-testid="trading-settings-section" className="space-y-4">
+                    <div className="border border-[var(--border-color)] bg-surface-0 p-3" data-testid="live-summary">
+                      <h4 className="text-xs font-medium text-text-secondary">Live trading</h4>
+                      <p className="mt-1 text-xs text-text-primary">
+                        {liveStatus.armed ? 'ARMED: live orders can be sent.' : 'OFF: live orders are blocked.'}
+                        {' '}<span className="text-text-muted">{liveStatus.orders_today} of {liveStatus.max_orders_per_day || '--'} orders today, max {liveStatus.max_qty_per_order || '--'} per order.</span>
+                      </p>
+                      <p className="mt-1 text-[11px] text-text-muted">It starts OFF at every launch. Use <strong>Live armed / Live off</strong> and <strong>Kill</strong> in the status bar. Caps are set under <code>[live]</code> in <code>{appSettings?.config_path ?? 'config/apex.toml'}</code>; every live order also needs your confirmation.</p>
+                    </div>
+                    {settingsDraft ? (
+                      <>
+                        <div>
+                          <h4 className="mb-2 text-xs font-medium text-text-secondary">Risk limits</h4>
+                          <div className="grid grid-cols-2 gap-3">
+                        <label className="flex flex-col gap-1 text-sm">
+                          <span>Max Daily Loss</span>
+                          <input
+                            type="number"
+                            min={1}
+                            value={settingsDraft.risk.max_daily_loss}
+                            onChange={(e) => {
+                              setSettingsDraft((current) => current ? {
+                                ...current,
+                                risk: { ...current.risk, max_daily_loss: Number(e.target.value) || 0 },
+                              } : current);
+                              setSettingsSuccess(null);
+                            }}
+                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
+                            data-testid="settings-max-daily-loss"
+                          />
+                        </label>
+                        <label className="flex flex-col gap-1 text-sm">
+                          <span>Max Order Value</span>
+                          <input
+                            type="number"
+                            min={1}
+                            value={settingsDraft.risk.max_order_value}
+                            onChange={(e) => {
+                              setSettingsDraft((current) => current ? {
+                                ...current,
+                                risk: { ...current.risk, max_order_value: Number(e.target.value) || 0 },
+                              } : current);
+                              setSettingsSuccess(null);
+                            }}
+                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
+                            data-testid="settings-max-order-value"
+                          />
+                        </label>
+                          </div>
+                          <p className="mt-1 text-[11px] text-text-muted">Orders that would breach these are rejected. Trading halts for the day when the daily loss is reached.</p>
+                        </div>
+                        <div>
+                          <h4 className="mb-2 text-xs font-medium text-text-secondary">Default account</h4>
+                          <div className="grid grid-cols-2 gap-3">
+                        <label className="flex flex-col gap-1 text-sm">
+                          <span>Preferred Execution Adapter</span>
+                          <select
+                            value={settingsDraft.execution.adapter}
+                            onChange={(e) => {
+                              setSettingsDraft((current) => current ? {
+                                ...current,
+                                execution: { adapter: e.target.value },
+                              } : current);
+                              setSettingsSuccess(null);
+                            }}
+                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
+                            data-testid="settings-execution-adapter"
+                          >
+                            {(appSettings?.execution.available_adapters ?? []).map((adapter) => (
+                              <option key={adapter} value={adapter}>
+                                {formatSettingsLabel(adapter)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                          </div>
+                        </div>
+                      </>
+                    ) : <p className="text-sm text-text-muted">Loading…</p>}
+                  </div>
+                )}
+
+                {settingsTab === 'general' && (
+                  <>
+              {settingsDraft && (
+                <div data-testid="appearance-settings-section">
+                  <h4 className="text-xs font-medium text-text-secondary mb-2">Appearance</h4>
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="flex flex-col gap-1 text-sm">
+                      <span>Theme</span>
+                      <select
+                        value={settingsDraft.appearance.theme}
+                        onChange={(e) => {
+                          const theme = e.target.value;
+                          setSettingsDraft((current) => current ? {
+                            ...current,
+                            appearance: { ...current.appearance, theme },
+                          } : current);
+                          applyAppearance(theme, settingsDraft.appearance.density);
+                          setSettingsSuccess(null);
+                        }}
+                        className="px-2 py-1.5 text-sm bg-surface-0 border border-[var(--border-color)] rounded"
+                        data-testid="settings-theme"
+                      >
+                        <option value="terminal">Terminal (amber)</option>
+                        <option value="dark">Dark</option>
+                        <option value="light">Light</option>
+                      </select>
+                    </label>
+                    <label className="flex flex-col gap-1 text-sm">
+                      <span>Density</span>
+                      <select
+                        value={settingsDraft.appearance.density}
+                        onChange={(e) => {
+                          const density = e.target.value;
+                          setSettingsDraft((current) => current ? {
+                            ...current,
+                            appearance: { ...current.appearance, density },
+                          } : current);
+                          applyAppearance(settingsDraft.appearance.theme, density);
+                          setSettingsSuccess(null);
+                        }}
+                        className="px-2 py-1.5 text-sm bg-surface-0 border border-[var(--border-color)] rounded"
+                        data-testid="settings-density"
+                      >
+                        <option value="comfortable">Comfortable</option>
+                        <option value="compact">Compact</option>
+                      </select>
+                    </label>
+                  </div>
+                  <p className="mt-1 text-[11px] text-text-muted">Appearance applies immediately and is saved with the rest of your settings.</p>
+                </div>
+              )}
+                    {appSettings?.runtime_storage_notice && (
+                      <div role="alert" data-testid="storage-fallback-notice"
+                        className="mb-2 border border-[var(--color-warning,#d9a400)] bg-surface-1 p-2 text-xs text-text-primary">
+                        {appSettings.runtime_storage_notice}
+                      </div>
+                    )}
+                    <div className="flex flex-wrap items-center gap-2 border border-[var(--border-color)] bg-surface-0 px-3 py-2 text-xs text-text-muted" data-testid="settings-history-section">
+                      <span className="min-w-0 flex-1">Every settings save is kept as a version. Values of keys named like a secret (password, token, api_key) and the password in a URL are stored as &lt;redacted&gt;; every other value is kept as written, so do not put a credential in an ordinary field.</span>
+                      <VersionHistory kind="settings" id="config/apex.toml" buttonLabel="Settings history" testId="settings-history-open" />
+                    </div>
+                    <details className="border border-[var(--border-color)] bg-surface-0 p-3" data-testid="runtime-settings-section">
+                      <summary className="cursor-pointer text-xs font-medium text-text-secondary">Storage &amp; runtime (advanced)</summary>
+                      <div className="mt-2 flex items-start justify-between gap-4">
+                        <p className="text-xs text-text-muted">
+                          Saved to <code>{appSettings?.config_path ?? 'config/apex.toml'}</code>; applies after restart. Running on{' '}
+                          <span className="text-text-primary">{appSettings ? formatSettingsLabel(appSettings.runtime_storage_backend) : '--'}</span>
+                          {' '}(<span className="font-mono">{appSettings?.runtime_storage_target ?? '--'}</span>).
+                        </p>
+                        <button type="button" onClick={() => void refreshAppSettings()} data-testid="refresh-app-settings"
+                          className="shrink-0 px-2 py-1 text-[11px] bg-surface-2 hover:bg-surface-3 border border-[var(--border-color)] rounded">Refresh</button>
+                      </div>
+                      {settingsDraft ? (
+                        <div className="mt-3 space-y-3">
+                          <div className="grid grid-cols-2 gap-3">
+                        <label className="flex flex-col gap-1 text-sm">
+                          <span>Data Directory</span>
+                          <input
+                            type="text"
+                            value={settingsDraft.general.data_dir}
+                            onChange={(e) => {
+                              setSettingsDraft((current) => current ? {
+                                ...current,
+                                general: { ...current.general, data_dir: e.target.value },
+                              } : current);
+                              setSettingsSuccess(null);
+                            }}
+                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
+                            data-testid="settings-data-dir"
+                          />
+                        </label>
+                        <label className="flex flex-col gap-1 text-sm">
+                          <span>Storage Backend</span>
+                          <select
+                            value={settingsDraft.storage.backend}
+                            onChange={(e) => {
+                              setSettingsDraft((current) => current ? {
+                                ...current,
+                                storage: { ...current.storage, backend: e.target.value },
+                              } : current);
+                              setSettingsSuccess(null);
+                            }}
+                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
+                            data-testid="settings-storage-backend"
+                          >
+                            {(appSettings?.storage.available_backends ?? ['sqlite', 'timescale']).map((backend) => (
+                              <option key={backend} value={backend}>
+                                {formatSettingsLabel(backend)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                          </div>
+                          <div className="grid grid-cols-2 gap-3">
+                        <label className="flex flex-col gap-1 text-sm">
+                          <span>SQLite Path</span>
+                          <input
+                            type="text"
+                            value={settingsDraft.storage.sqlite_path}
+                            onChange={(e) => {
+                              setSettingsDraft((current) => current ? {
+                                ...current,
+                                storage: { ...current.storage, sqlite_path: e.target.value },
+                              } : current);
+                              setSettingsSuccess(null);
+                            }}
+                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
+                            data-testid="settings-sqlite-path"
+                          />
+                        </label>
+                        <label className="flex flex-col gap-1 text-sm">
+                          <span>Postgres / Timescale URL</span>
+                          <input
+                            type="password"
+                            value={settingsDraft.storage.postgres_url}
+                            onChange={(e) => {
+                              setSettingsDraft((current) => current ? {
+                                ...current,
+                                storage: { ...current.storage, postgres_url: e.target.value },
+                              } : current);
+                              setSettingsSuccess(null);
+                            }}
+                            placeholder="postgresql://postgres:postgres@localhost:5432/apex_market"
+                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
+                            data-testid="settings-postgres-url"
+                          />
+                        </label>
+                          </div>
+                          <div className="grid grid-cols-2 gap-3 items-end">
+                        <label className="flex flex-col gap-1 text-sm">
+                          <span>Storage Pool Size</span>
+                          <input
+                            type="number"
+                            min={1}
+                            value={settingsDraft.storage.pool_size}
+                            onChange={(e) => {
+                              setSettingsDraft((current) => current ? {
+                                ...current,
+                                storage: { ...current.storage, pool_size: Math.max(1, Number(e.target.value) || 1) },
+                              } : current);
+                              setSettingsSuccess(null);
+                            }}
+                            className="px-3 py-2 text-sm bg-surface-1 border border-[var(--border-color)] rounded"
+                            data-testid="settings-storage-pool-size"
+                          />
+                        </label>
+                        <label className="flex items-center gap-2 text-sm pt-6">
+                          <input
+                            type="checkbox"
+                            checked={settingsDraft.storage.wal_mode}
+                            onChange={(e) => {
+                              setSettingsDraft((current) => current ? {
+                                ...current,
+                                storage: { ...current.storage, wal_mode: e.target.checked },
+                              } : current);
+                              setSettingsSuccess(null);
+                            }}
+                            data-testid="settings-storage-wal-mode"
+                          />
+                          <span>Enable SQLite WAL mode</span>
+                        </label>
+                          </div>
+                        </div>
+                      ) : <p className="mt-2 text-sm text-text-muted">Loading application settings…</p>}
+                    </details>
+                  </>
+                )}
+              </div>
             </div>
-            <div className="flex items-center justify-between gap-3 mt-4">
-              <span className="text-xs text-text-muted">
-                Runtime continues using <strong className="text-text-primary">{appSettings ? formatSettingsLabel(appSettings.runtime_storage_backend) : 'current settings'}</strong> until restart.
-              </span>
-              <div className="flex gap-2">
+            <div className="flex items-center justify-between gap-3 border-t border-[var(--border-color)] px-4 py-3">
+              <div className="min-w-0 text-xs">
+                {settingsError && <p className="text-bear" data-testid="settings-error">{settingsError}</p>}
+                {settingsSuccess && <p className="text-bull" data-testid="settings-success">{settingsSuccess}</p>}
+                {!settingsError && !settingsSuccess && (
+                  <span className="text-text-muted">
+                    Storage and adapter changes apply after restart (running on <strong className="text-text-primary">{appSettings ? formatSettingsLabel(appSettings.runtime_storage_backend) : 'current settings'}</strong>). Accounts and API keys apply immediately.
+                  </span>
+                )}
+              </div>
+              <div className="flex shrink-0 gap-2">
                 <button
                   type="button"
                   onClick={() => void handleSaveSettings()}
@@ -1200,7 +1278,7 @@ export const Workspace: React.FC = () => {
                   className="px-3 py-1 text-xs bg-surface-2 hover:bg-surface-3 border border-[var(--border-color)] rounded disabled:opacity-50"
                   data-testid="save-app-settings"
                 >
-                  {settingsBusy ? 'Saving…' : 'Save & Apply on Restart'}
+                  {settingsBusy ? 'Saving…' : 'Save settings'}
                 </button>
                 <button
                   onClick={() => setShowSettings(false)}
@@ -1233,11 +1311,21 @@ export const Workspace: React.FC = () => {
         ))}
         <button
           type="button"
+          onClick={toggleCopilot}
+          aria-pressed={copilotShown}
+          title={copilotShown ? 'Hide the Copilot (Ctrl+Shift+A)' : 'Show the Copilot (Ctrl+Shift+A)'}
+          data-testid="copilot-launch"
+          className={`ml-auto shrink-0 border px-3 py-1.5 text-xs font-medium ${copilotShown ? 'border-accent bg-accent/25 text-accent' : 'border-accent/60 bg-accent/10 text-accent hover:bg-accent/20'}`}
+        >
+          ✦ Copilot{copilotShown ? ' ●' : ''}
+        </button>
+        <button
+          type="button"
           onClick={() => setViewMode(viewMode === 'tiles' ? 'focus' : 'tiles')}
           aria-pressed={viewMode === 'tiles'}
           title={viewMode === 'tiles' ? 'Switch to single-panel focus view' : 'Switch to tiled multi-panel view'}
           data-testid="view-mode-toggle"
-          className="ml-auto shrink-0 border border-[var(--border-color)] px-3 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-accent"
+          className="shrink-0 border border-[var(--border-color)] px-3 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-accent"
         >
           {viewMode === 'tiles' ? 'Tiles ▦' : 'Focus ▭'}
         </button>
@@ -1247,7 +1335,8 @@ export const Workspace: React.FC = () => {
 
       {/* Main Workspace Grid (focus mode) */}
       {viewMode === 'focus' && (
-      <div className="flex-1 min-h-0 grid grid-cols-12 gap-1 p-1 bg-surface-0" data-testid="workspace-panel">
+      <div className="flex min-h-0 flex-1" data-testid="focus-layout">
+      <div className="min-h-0 min-w-0 flex-1 grid grid-cols-12 gap-1 p-1 bg-surface-0" data-testid="workspace-panel">
         {/* Left: Watchlist */}
         <div className={`${researchView ? 'hidden' : centerTab === 'chart' ? 'col-span-2' : 'col-span-3'} bg-surface-1 rounded-lg overflow-hidden border border-[var(--border-color)]`}>
           <Watchlist onSelectSymbol={setSelectedSymbol} selectedSymbol={selectedSymbol} />
@@ -1313,6 +1402,10 @@ export const Workspace: React.FC = () => {
             <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
               <NotebookEditor />
             </div>
+          ) : centerTab === 'activity' ? (
+            <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
+              <ActivityPanel />
+            </div>
           ) : (
             <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
               <HealthMonitor />
@@ -1335,6 +1428,8 @@ export const Workspace: React.FC = () => {
             <AlertConsole />
           </div>
         </div>
+      </div>
+      {copilotSideOpen && <ErrorBoundary label="Copilot"><CopilotSidePanel /></ErrorBoundary>}
       </div>
       )}
     </div>
@@ -1366,6 +1461,19 @@ const AlertConsole: React.FC = () => {
   useEffect(() => {
     void refreshRules();
   }, [refreshRules]);
+
+  // Something else changed the rules (Copilot added, deleted or restored one): the activity counter moves,
+  // so reload quietly, without the loading state, and keep what is shown if the reload fails.
+  const activityVersion = useArtifactStore((s) => s.activityVersion);
+  const firstActivityVersion = useRef(activityVersion);
+  useEffect(() => {
+    if (activityVersion === firstActivityVersion.current) return;
+    let stale = false;
+    getAlertRules()
+      .then((next) => { if (!stale && Array.isArray(next)) setRules(next); })
+      .catch(() => { /* the list shown stays; the next change or a manual action reloads it */ });
+    return () => { stale = true; };
+  }, [activityVersion]);
 
   const handleCreateAlert = useCallback(async () => {
     const symbol = alertSymbol.trim().toUpperCase();
@@ -1409,6 +1517,8 @@ const AlertConsole: React.FC = () => {
     <div className="h-full flex flex-col">
       <div className="flex items-center justify-between mb-2">
         <span className="text-sm font-medium text-text-secondary">Alerts</span>
+        <div className="flex items-center gap-1">
+        <DeletedObjects kind="alert" onRestored={() => void refreshRules()} className="text-[11px]" />
         <button
           onClick={() => setShowCreateAlert(!showCreateAlert)}
           className="text-xs px-2 py-0.5 bg-primary-500 hover:bg-primary-600 text-white rounded"
@@ -1416,17 +1526,17 @@ const AlertConsole: React.FC = () => {
         >
           +
         </button>
+        </div>
       </div>
 
       {showCreateAlert && (
         <div className="mb-2 p-2 border border-[var(--border-color)] rounded space-y-1">
-          <input
-            type="text"
+          <SymbolField
             value={alertSymbol}
-            onChange={(e) => setAlertSymbol(e.target.value)}
+            onChange={setAlertSymbol}
             placeholder="Symbol"
             className="w-full px-2 py-1 text-xs bg-surface-0 border border-[var(--border-color)] rounded"
-            data-testid="alert-symbol-input"
+            testId="alert-symbol-input"
           />
           <select
             value={alertCondition}
@@ -1461,7 +1571,7 @@ const AlertConsole: React.FC = () => {
         ) : isLoading ? (
           <p>Loading alerts…</p>
         ) : rules.length === 0 ? (
-          <p>No active alerts.</p>
+          <p>No active alerts. A deleted alert keeps its history; use Show deleted to restore it.</p>
         ) : (
           rules.map((rule) => (
             <div key={rule.id} className="mb-2 flex items-start justify-between gap-2" data-testid="alert-item">
@@ -1469,14 +1579,18 @@ const AlertConsole: React.FC = () => {
                 <div className="truncate">{formatAlertRule(rule.rule)}</div>
                 <div className="text-[10px] text-text-muted/70">{rule.id}</div>
               </div>
-              <button
-                type="button"
-                onClick={() => void handleRemoveAlert(rule.id)}
-                className="text-[10px] text-bear hover:brightness-125"
-                data-testid={`alert-remove-${rule.id}`}
-              >
-                Remove
-              </button>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <VersionHistory kind="alert" id={rule.id} testId={`alert-history-${rule.id}`} onRestored={() => void refreshRules()} />
+                <button
+                  type="button"
+                  onClick={() => void handleRemoveAlert(rule.id)}
+                  className="text-[10px] text-bear hover:brightness-125"
+                  title="Deleting an alert stops it. Its history is kept and you can restore it from Show deleted."
+                  data-testid={`alert-remove-${rule.id}`}
+                >
+                  Delete
+                </button>
+              </div>
             </div>
           ))
         )}

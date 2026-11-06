@@ -305,6 +305,8 @@ pub struct AppSettingsDto {
     pub config_path: String,
     pub runtime_storage_backend: String,
     pub runtime_storage_target: String,
+    /// Set when the saved storage backend could not start and SQLite is in use instead.
+    pub runtime_storage_notice: Option<String>,
     pub general: GeneralSettingsDto,
     pub market_data: AdapterPreferenceDto,
     pub execution: AdapterPreferenceDto,
@@ -436,15 +438,75 @@ pub struct MLModelDto {
 }
 
 /// ML training request DTO from frontend.
+///
+/// Every field except `algorithm` has a default so older callers (and older saved JSON) keep
+/// working. When `dataset` is set it supplies `data_path`, the feature columns, the target and
+/// the return column.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MLTrainingRequestDto {
     pub algorithm: String,
+    #[serde(default)]
     pub data_path: String,
+    #[serde(default)]
     pub target_column: String,
+    #[serde(default)]
     pub feature_columns: Vec<String>,
+    #[serde(default)]
     pub hyperparams: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(default = "default_n_splits")]
     pub n_splits: usize,
+    #[serde(default)]
     pub lag_periods: Vec<i64>,
+    /// Name of a dataset built in the workbench; when set it supplies `data_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    /// Column holding each row's forward return, used to score trading performance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_column: Option<String>,
+    /// How the evaluation trades the predictions: "long_flat" (default) or "long_short".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_mode: Option<String>,
+    /// Share (0 to 40) of the final time steps kept out of cross-validation and scored once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_pct: Option<f64>,
+    /// Required when `algorithm` is "custom": a file saved with `save_estimator_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimator_file: Option<String>,
+    /// Required when `algorithm` is "recipe": the name of a saved recipe (see `ml_recipes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
+    /// Seed for estimators that take one. Omitted: a fixed default, so runs repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub random_state: Option<i64>,
+    /// With `dataset`: train on this version of it. Omitted: the latest version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_version: Option<u32>,
+}
+
+impl Default for MLTrainingRequestDto {
+    fn default() -> Self {
+        Self {
+            algorithm: String::new(),
+            data_path: String::new(),
+            target_column: String::new(),
+            feature_columns: Vec::new(),
+            hyperparams: Default::default(),
+            n_splits: default_n_splits(),
+            lag_periods: Vec::new(),
+            dataset: None,
+            return_column: None,
+            trade_mode: None,
+            holdout_pct: None,
+            estimator_file: None,
+            recipe: None,
+            random_state: None,
+            dataset_version: None,
+        }
+    }
+}
+
+fn default_n_splits() -> usize {
+    5
 }
 
 /// ML training result DTO for frontend.
@@ -454,6 +516,317 @@ pub struct MLTrainingResultDto {
     pub metrics: std::collections::HashMap<String, f64>,
     pub feature_names: Vec<String>,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f64>,
+}
+
+// ── ML workbench: features, datasets, model detail ───────────────────
+
+/// One entry of the shared feature catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureDefDto {
+    pub id: String,
+    pub label: String,
+    /// "Price" | "Trend" | "Momentum" | "Volatility" | "Volume"
+    pub group: String,
+    pub description: String,
+    /// Number of leading bars for which the value is not yet defined.
+    pub warmup_bars: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LabelSpecDto {
+    pub horizon_bars: usize,
+    /// "direction" | "return_threshold"
+    pub kind: String,
+    #[serde(default)]
+    pub threshold_pct: f64,
+    /// return_threshold only: separate up/down thresholds (percent); fall back to `threshold_pct`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_threshold_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub down_threshold_pct: Option<f64>,
+}
+
+/// A user-defined feature: a formula over bars (see `commands::ml_expr`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CustomFeatureDto {
+    /// `[a-z][a-z0-9_]{0,40}`, not a catalog feature id.
+    pub name: String,
+    pub expr: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildDatasetRequestDto {
+    pub name: String,
+    pub symbols: Vec<String>,
+    pub timeframe: String,
+    pub bars: usize,
+    pub features: Vec<String>,
+    pub label: LabelSpecDto,
+    /// Inclusive ISO dates (YYYY-MM-DD) bounding the bars; otherwise the latest `bars`.
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub custom_features: Vec<CustomFeatureDto>,
+    /// Extra symbols custom formulas may read with `other("SYMBOL", "field")`; not dataset rows.
+    #[serde(default)]
+    pub context_symbols: Vec<String>,
+    /// Round-trip cost in percent, subtracted from every forward return before labelling.
+    #[serde(default)]
+    pub fee_pct: f64,
+}
+
+/// One sample value of a formula check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpressionSampleDto {
+    pub time: String,
+    /// null = not yet defined at that bar.
+    pub value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpressionCheckDto {
+    pub ok: bool,
+    pub error: Option<String>,
+    /// 0-based character offset of the error in the formula.
+    pub error_pos: Option<usize>,
+    pub warmup_bars: usize,
+    /// The last few computed values for the chosen symbol.
+    pub sample: Vec<ExpressionSampleDto>,
+}
+
+/// How much stored data exists for a symbol and timeframe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolDataDto {
+    pub symbol: String,
+    pub timeframe: String,
+    pub bars: usize,
+    pub first_time: Option<String>,
+    pub last_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DatasetInfoDto {
+    pub name: String,
+    /// Path usable as `data_path` when training (relative to the work root).
+    pub path: String,
+    pub rows: usize,
+    pub symbols: Vec<String>,
+    pub timeframe: String,
+    pub features: Vec<String>,
+    pub label: LabelSpecDto,
+    pub class_counts: std::collections::BTreeMap<String, usize>,
+    pub created_at: String,
+    pub first_time: Option<String>,
+    pub last_time: Option<String>,
+    /// "user" | "copilot"
+    pub source: String,
+    #[serde(default)]
+    pub custom_features: Vec<CustomFeatureDto>,
+    #[serde(default)]
+    pub context_symbols: Vec<String>,
+    #[serde(default)]
+    pub fee_pct: f64,
+    /// Version of the dataset object in the audit ledger (1 for the first build under this name).
+    /// Every build is a new version under the same name; earlier versions are never overwritten.
+    #[serde(default)]
+    pub version: u32,
+    /// SHA-256 of this version's CSV file (the file is write-once).
+    #[serde(default)]
+    pub csv_sha256: String,
+    /// Size of that CSV file in bytes.
+    #[serde(default)]
+    pub csv_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetPreviewDto {
+    #[serde(flatten)]
+    pub info: DatasetInfoDto,
+    pub columns: Vec<String>,
+    pub sample: Vec<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CvFoldDto {
+    pub fold: usize,
+    pub train_rows: usize,
+    pub test_rows: usize,
+    pub accuracy: f64,
+    pub f1: f64,
+    pub precision: f64,
+    pub recall: f64,
+    #[serde(default)]
+    pub baseline_accuracy: Option<f64>,
+    #[serde(default)]
+    pub trade_return_pct: Option<f64>,
+    #[serde(default)]
+    pub hit_rate: Option<f64>,
+    #[serde(default)]
+    pub trades: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradingSummaryDto {
+    pub strategy_return_pct: f64,
+    pub buy_hold_return_pct: f64,
+    pub hit_rate: f64,
+    pub trades: usize,
+    pub max_drawdown_pct: f64,
+    pub sharpe: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureImportanceDto {
+    pub feature: String,
+    pub importance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUsageDto {
+    /// Always "automation".
+    pub kind: String,
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub symbol: String,
+}
+
+/// Result on the final period that cross-validation never saw.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HoldoutDto {
+    pub rows: usize,
+    pub accuracy: f64,
+    #[serde(default)]
+    pub baseline_accuracy: Option<f64>,
+    #[serde(default)]
+    pub trading: Option<TradingSummaryDto>,
+}
+
+fn default_trade_mode() -> String {
+    "long_flat".to_string()
+}
+
+/// Everything the workbench shows about one model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelDetailDto {
+    pub model_id: String,
+    pub algorithm: String,
+    pub status: String,
+    pub metrics: std::collections::HashMap<String, f64>,
+    pub feature_names: Vec<String>,
+    pub created_at: String,
+    pub data_path: String,
+    pub target_column: String,
+    pub display_name: String,
+    pub notes: String,
+    pub tags: Vec<String>,
+    /// "user" | "copilot" | "unknown"
+    pub source: String,
+    pub hyperparams: std::collections::HashMap<String, serde_json::Value>,
+    pub n_splits: usize,
+    pub lag_periods: Vec<i64>,
+    pub dataset: Option<String>,
+    pub symbols: Vec<String>,
+    pub timeframe: Option<String>,
+    pub label: Option<LabelSpecDto>,
+    pub rows: Option<usize>,
+    pub duration_secs: Option<f64>,
+    pub artifact_bytes: Option<u64>,
+    pub library_versions: std::collections::HashMap<String, String>,
+    pub cv_folds: Vec<CvFoldDto>,
+    pub feature_importance: Vec<FeatureImportanceDto>,
+    pub trading: Option<TradingSummaryDto>,
+    pub log_tail: String,
+    pub used_by: Vec<ModelUsageDto>,
+    /// "long_flat" | "long_short": how the evaluation traded the predictions.
+    #[serde(default = "default_trade_mode")]
+    pub trade_mode: String,
+    pub holdout: Option<HoldoutDto>,
+    #[serde(default)]
+    pub custom_features: Vec<CustomFeatureDto>,
+    #[serde(default)]
+    pub context_symbols: Vec<String>,
+    #[serde(default)]
+    pub fee_pct: f64,
+    /// Name of the custom estimator file when `algorithm` is "custom".
+    pub estimator_file: Option<String>,
+    /// The recipe this model was built from when `algorithm` is "recipe" (a copy).
+    #[serde(default)]
+    pub recipe: Option<RecipeDto>,
+    /// Provenance. Version of the dataset the model was trained on (see `ledger_history('dataset', name)`).
+    #[serde(default)]
+    pub dataset_version: Option<u32>,
+    /// SHA-256 of the dataset CSV the trainer read.
+    #[serde(default)]
+    pub dataset_csv_sha256: Option<String>,
+    /// Ledger version of the custom estimator file whose code produced this model.
+    #[serde(default)]
+    pub estimator_version: Option<u32>,
+    /// Ledger version of the recipe this model was built from.
+    #[serde(default)]
+    pub recipe_version: Option<u32>,
+    /// Current version of this model's own metadata in the audit ledger (display name, notes, tags).
+    #[serde(default)]
+    pub ledger_version: Option<u32>,
+}
+
+// ── Algorithm catalog and custom estimators ──────────────────────────
+
+/// One tunable constructor parameter of an algorithm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParamDefDto {
+    pub key: String,
+    pub label: String,
+    /// "int" | "float" | "bool" | "choice" | "text"
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub default: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices: Option<Vec<String>>,
+    #[serde(default)]
+    pub help: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlgorithmDto {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub params: Vec<ParamDefDto>,
+    pub accepts_extra_params: bool,
+}
+
+/// A custom estimator file under `<work root>/estimators/`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EstimatorFileDto {
+    pub name: String,
+    /// Relative to the work root, e.g. `estimators/my_model.py`.
+    pub path: String,
+    pub content: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSignalPointDto {
+    pub time: String,
+    pub close: f64,
+    pub signal: i64,
+    pub probability: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSignalHistoryDto {
+    pub model_id: String,
+    pub symbol: String,
+    pub points: Vec<ModelSignalPointDto>,
 }
 
 /// Adapter health DTO for frontend.
@@ -490,6 +863,10 @@ pub struct BrokerConnectionDto {
     pub market_data_available: bool,
     pub token_field_label: String,
     pub message: String,
+    /// Whether an automation may short through this broker: paper always; a live broker only
+    /// when `[automations] allow_live_shorting` is on and its adapter supports shorting.
+    #[serde(default)]
+    pub can_short: bool,
 }
 
 /// One point of an indicator/quant series, aligned to a bar time (RFC3339).
@@ -670,9 +1047,11 @@ mod tests {
             market_data_available: false,
             token_field_label: String::new(),
             message: "Paper trading is available".into(),
+            can_short: true,
         };
 
         let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains("\"can_short\":true"));
         assert!(json.contains("Paper Trading"));
         assert!(json.contains("ready"));
     }
@@ -813,4 +1192,141 @@ pub struct SymbolSearchResultDto {
     pub exchange: String,
     /// Where the match came from: "zerodha" or "yahoo".
     pub source: String,
+}
+
+/// One data feed that could serve a symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedOptionDto {
+    pub adapter_id: String,
+    pub name: String,
+    /// "delayed" | "live" | "exchange"
+    pub quality: String,
+    pub supports: bool,
+    pub ready: bool,
+    /// Why it can't be chosen right now, if so.
+    pub unavailable_reason: Option<String>,
+}
+
+/// Which feed is serving a symbol and which others could.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolFeedDto {
+    pub symbol: String,
+    /// The feed currently supplying quotes.
+    pub active: Option<String>,
+    /// The feed the user pinned, if any (None = automatic).
+    pub preferred: Option<String>,
+    pub options: Vec<FeedOptionDto>,
+}
+
+// ── Algorithm recipes ────────────────────────────────────────────────
+
+/// Parameters of a step or member: a JSON object, keys sorted when written.
+pub type RecipeParams = serde_json::Map<String, serde_json::Value>;
+
+/// `#[serde(default)]` only covers a missing key. The Python validator also accepts an explicit
+/// `null` (and language models often send one), so a `null` reads as the default too.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn null_as_none_calibration<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_else(default_calibrate))
+}
+
+/// One preprocessing step, e.g. `{"kind": "standard_scaler", "params": {}}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeStepDto {
+    pub kind: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub params: RecipeParams,
+}
+
+/// A member model of a voting or stacking recipe (or the final estimator of a stack).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeMemberDto {
+    pub algorithm: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub params: RecipeParams,
+    /// Voting only; the trainer treats a missing weight as 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipeModelDto {
+    Single {
+        algorithm: String,
+        #[serde(default, deserialize_with = "null_as_default")]
+        params: RecipeParams,
+    },
+    Voting {
+        /// "soft" | "hard"
+        voting: String,
+        members: Vec<RecipeMemberDto>,
+    },
+    /// Time-aware stacking: members are fitted on expanding windows and their out-of-fold
+    /// predictions train `final`.
+    Stacking {
+        members: Vec<RecipeMemberDto>,
+        #[serde(rename = "final")]
+        final_estimator: RecipeMemberDto,
+        blocks: usize,
+    },
+}
+
+fn default_calibrate() -> String {
+    "none".into()
+}
+
+/// An algorithm assembled from library parts, saved as `<work root>/algorithms/<name>.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeDto {
+    /// `[a-z][a-z0-9_]{0,40}`
+    pub name: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub label: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub description: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub steps: Vec<RecipeStepDto>,
+    pub model: RecipeModelDto,
+    /// "none" | "sigmoid" | "isotonic"
+    #[serde(default = "default_calibrate", deserialize_with = "null_as_none_calibration")]
+    pub calibrate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeIssueDto {
+    /// Where in the recipe, e.g. `steps[1].params.k` or `model.members[2]`.
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeCheckDto {
+    pub ok: bool,
+    #[serde(default)]
+    pub errors: Vec<RecipeIssueDto>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub steps: usize,
+    /// Number of fitted models (members plus the final estimator for stacking).
+    #[serde(default)]
+    pub models: usize,
+    /// Pessimistic size estimate for a typical dataset; null when unknown.
+    #[serde(default)]
+    pub est_model_mb: Option<f64>,
 }

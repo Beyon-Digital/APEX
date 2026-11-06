@@ -1,0 +1,610 @@
+/**
+ * Web-mode mock of the ML workbench and activity-log commands.
+ *
+ * The real implementations live in the Rust backend; this keeps the UI buildable and testable in
+ * a plain browser. It also owns the in-memory activity log and the helpers that announce changes
+ * (`apex:artifacts-changed`), so the panels refresh exactly as they do on the desktop.
+ *
+ * Test hook: `window.__apexMock` lets a spec act "as the Copilot" (create a strategy, train a
+ * model, add an automation) and see the open panels update.
+ */
+import type {
+  ActivityActor, ActivityDto, ArtifactEventDto, ArtifactKind, BuildDatasetRequestDto, CvFoldDto,
+  DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, MLModelDto, MLTrainingRequestDto, ModelDetailDto,
+  ModelSignalHistoryDto, AlgorithmDto, EstimatorFileDto, ExpressionCheckDto, ParamDefDto, SymbolDataDto,
+  BuildingBlocksDto, RecipeCheckDto, RecipeDto, RecipeIssueDto, StepKindDto,
+  VersionedKind,
+} from './types';
+import {
+  applyToWorkingCopy, ledgerAppendEvent, ledgerContent, ledgerHistoryOf, ledgerHooks, ledgerListOrderEvents, ledgerObjectList,
+  ledgerPut, ledgerRestoreVersion, ledgerStatusNow, ledgerTombstone, ledgerVerifyNow, registerLedgerApplier,
+} from './mockLedger';
+
+export const ARTIFACT_EVENT = 'apex:artifacts-changed';
+export const ACTIVITY_EVENT = 'apex:activity-added';
+
+const activity: ActivityDto[] = [];
+let seq = 0;
+
+export function mockActivity(): ActivityDto[] {
+  return [...activity];
+}
+
+/** Record an activity and announce it, like `activity::record` in the backend. */
+export function recordMockActivity(
+  actor: ActivityActor, action: string, kind: ActivityDto['kind'], targetId: string,
+  summary: string, ok = true, details: string | null = null,
+): ActivityDto {
+  const entry: ActivityDto = {
+    id: `act-${++seq}`, ts: new Date().toISOString(), actor, action, kind,
+    target_id: targetId, summary, ok, details,
+  };
+  activity.unshift(entry);
+  ledgerAppendEvent('activity', { ...entry });
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(ACTIVITY_EVENT, { detail: entry }));
+    if (ok && (kind === 'strategy' || kind === 'model' || kind === 'automation' || kind === 'dataset')) {
+      const event: ArtifactEventDto = { kind: kind as ArtifactKind, id: targetId, action, actor };
+      window.dispatchEvent(new CustomEvent(ARTIFACT_EVENT, { detail: event }));
+    }
+  }
+  return entry;
+}
+
+/* ----- immutable audit ledger: what each mock store records, and how a restore reaches it ----- */
+
+const withoutTimes = <T extends object>(o: T, keys: string[]): Record<string, unknown> =>
+  Object.fromEntries(Object.entries(o).filter(([k]) => !keys.includes(k)));
+/** Recipe text kept in the ledger. Timestamps are left out so saving an unchanged recipe is a no-op. */
+const recipeText = (r: RecipeDto) => JSON.stringify(withoutTimes(r, ['created_at', 'updated_at']), null, 2);
+const datasetText = (d: DatasetInfoDto) => JSON.stringify(withoutTimes(d, ['created_at']), null, 2);
+const modelText = (d: ModelDetailDto) => JSON.stringify(withoutTimes(d, ['used_by']), null, 2);
+const ledgerActivityKind = (kind: VersionedKind): ActivityDto['kind'] =>
+  (kind === 'strategy' || kind === 'model' || kind === 'automation' || kind === 'dataset') ? kind : 'system';
+
+export function recordModelVersion(d: ModelDetailDto, actor: ActivityActor, summary: string): void {
+  ledgerPut('model', d.model_id, modelText(d), actor, summary);
+}
+
+export const MOCK_FEATURES: FeatureDefDto[] = [
+  { id: 'ret_1', label: '1-bar return', group: 'Price', description: 'Close-to-close return over 1 bar.', warmup_bars: 1 },
+  { id: 'ret_5', label: '5-bar return', group: 'Price', description: 'Return over 5 bars.', warmup_bars: 5 },
+  { id: 'ret_10', label: '10-bar return', group: 'Price', description: 'Return over 10 bars.', warmup_bars: 10 },
+  { id: 'range_pct', label: 'Bar range %', group: 'Price', description: '(high - low) / close.', warmup_bars: 1 },
+  { id: 'sma_ratio_20', label: 'Close / SMA 20', group: 'Trend', description: 'Close divided by its 20-bar average.', warmup_bars: 20 },
+  { id: 'sma_ratio_50', label: 'Close / SMA 50', group: 'Trend', description: 'Close divided by its 50-bar average.', warmup_bars: 50 },
+  { id: 'ema_ratio_12', label: 'Close / EMA 12', group: 'Trend', description: 'Close divided by its 12-bar EMA.', warmup_bars: 12 },
+  { id: 'macd_hist', label: 'MACD histogram', group: 'Momentum', description: 'MACD line minus signal line, scaled by close.', warmup_bars: 35 },
+  { id: 'rsi_14', label: 'RSI 14', group: 'Momentum', description: 'Relative strength index, 0-100.', warmup_bars: 14 },
+  { id: 'roc_10', label: 'Rate of change 10', group: 'Momentum', description: 'Percent change over 10 bars.', warmup_bars: 10 },
+  { id: 'vol_10', label: 'Volatility 10', group: 'Volatility', description: 'Std-dev of 1-bar returns over 10 bars.', warmup_bars: 11 },
+  { id: 'vol_20', label: 'Volatility 20', group: 'Volatility', description: 'Std-dev of 1-bar returns over 20 bars.', warmup_bars: 21 },
+  { id: 'atr_pct_14', label: 'ATR 14 %', group: 'Volatility', description: 'Average true range as a share of close.', warmup_bars: 15 },
+  { id: 'bb_pos_20', label: 'Bollinger position', group: 'Volatility', description: 'Where close sits between the 20-bar bands (0-1).', warmup_bars: 20 },
+  { id: 'vol_ratio_20', label: 'Volume / avg 20', group: 'Volume', description: 'Volume divided by its 20-bar average.', warmup_bars: 20 },
+];
+
+/** Test hook: make the next call of `cmd` fail once (e.g. to exercise optimistic-update rollback). */
+let failNext: { cmd: string; message: string } | null = null;
+/** Test hook: delay the answer of the next call of `cmd` by `ms` (to exercise out-of-order replies). */
+let delayNext: { cmd: string; ms: number } | null = null;
+
+const datasets: DatasetInfoDto[] = [];
+const details = new Map<string, ModelDetailDto>();
+let trainCounter = 0;
+
+function folds(n: number, base: number): CvFoldDto[] {
+  return Array.from({ length: n }, (_, i) => {
+    const acc = Math.max(0.35, Math.min(0.8, base + Math.sin(i * 1.7) * 0.05));
+    return {
+      fold: i + 1, train_rows: 120 + i * 60, test_rows: 60, accuracy: acc, f1: acc - 0.03,
+      precision: acc + 0.01, recall: acc - 0.01, baseline_accuracy: 0.5,
+      trade_return_pct: Number((Math.sin(i * 2.1) * 3 + 1.2).toFixed(2)),
+      hit_rate: Number((acc - 0.02).toFixed(3)), trades: 14 + i,
+    };
+  });
+}
+
+function toSummary(d: ModelDetailDto): MLModelDto {
+  return {
+    model_id: d.model_id, algorithm: d.algorithm, status: d.status, metrics: d.metrics,
+    feature_names: d.feature_names, created_at: d.created_at, data_path: d.data_path, target_column: d.target_column,
+  };
+}
+
+/** Create a model in the mock registry, as the trainer would. */
+export function createMockModel(req: Partial<MLTrainingRequestDto>, actor: ActivityActor = 'user'): ModelDetailDto {
+  trainCounter += 1;
+  const id = `${req.algorithm ?? 'random_forest'}_20260101T0000${String(trainCounter).padStart(2, '0')}Z`;
+  const features = req.feature_columns?.length ? req.feature_columns : ['ret_1', 'rsi_14', 'vol_10'];
+  const ds = req.dataset ? datasets.find((d) => d.name === req.dataset) : undefined;
+  const acc = 0.5 + ((trainCounter * 7) % 13) / 100;
+  const cv = folds(req.n_splits ?? 5, acc);
+  const detail: ModelDetailDto = {
+    model_id: id, algorithm: req.algorithm ?? 'random_forest', status: 'completed',
+    metrics: { accuracy: acc, f1: acc - 0.03, precision: acc + 0.01, recall: acc - 0.01 },
+    feature_names: features, created_at: new Date().toISOString(),
+    data_path: ds?.path ?? req.data_path ?? 'data/sample.csv', target_column: req.target_column ?? 'target',
+    display_name: '', notes: '', tags: [], source: actor, hyperparams: { ...(req.hyperparams ?? {}) },
+    n_splits: req.n_splits ?? 5, lag_periods: req.lag_periods ?? [], dataset: ds?.name ?? req.dataset ?? null,
+    symbols: ds?.symbols ?? [], timeframe: ds?.timeframe ?? null, label: ds?.label ?? null, rows: ds?.rows ?? 480,
+    duration_secs: 1.8, artifact_bytes: 482_113, library_versions: { scikit_learn: '1.9.1', python: '3.13' },
+    cv_folds: cv,
+    feature_importance: features.map((feature, i) => ({ feature, importance: Number((1 / (i + 2)).toFixed(3)) })),
+    trading: { strategy_return_pct: 8.4, buy_hold_return_pct: 5.1, hit_rate: acc - 0.02, trades: 63, max_drawdown_pct: -4.2, sharpe: 1.1 },
+    log_tail: `INFO Starting training run: algorithm=${req.algorithm ?? 'random_forest'}\nINFO Fold 1 - accuracy=${acc.toFixed(4)}\nINFO Model saved`,
+    used_by: [],
+    trade_mode: req.trade_mode ?? 'long_flat',
+    holdout: req.holdout_pct ? { rows: Math.round(480 * (req.holdout_pct / 100)), accuracy: acc - 0.04, baseline_accuracy: 0.5, trading: { strategy_return_pct: 2.1, buy_hold_return_pct: 1.4, hit_rate: acc - 0.05, trades: 11, max_drawdown_pct: -2.2, sharpe: 0.6 } } : null,
+    custom_features: ds?.custom_features ?? [],
+    context_symbols: ds?.context_symbols ?? [],
+    fee_pct: ds?.fee_pct ?? 0,
+    estimator_file: req.estimator_file ?? null,
+    recipe: req.algorithm === 'recipe' && req.recipe ? (recipes.get(req.recipe) ?? null) : null,
+  };
+  details.set(id, detail);
+  recordModelVersion(detail, actor, `Trained ${detail.algorithm}`);
+  recordMockActivity(actor, 'model.train', 'model', id, `Trained ${detail.algorithm} on ${detail.dataset ?? detail.data_path}`);
+  return detail;
+}
+
+export function mockUsage(modelId: string, automations: { id: string; name: string; enabled: boolean; symbol: string; model_id: string }[]) {
+  return automations.filter((a) => a.model_id === modelId).map((a) => ({ kind: 'automation' as const, id: a.id, name: a.name, enabled: a.enabled, symbol: a.symbol }));
+}
+
+const fetched = new Map<string, number>();
+const recipes = new Map<string, RecipeDto>();
+const estimators = new Map<string, EstimatorFileDto>();
+
+/** Like the backend's canonical_timeframe: "d1" and "1d" are both stored and reported as "1d". */
+const CANONICAL_TIMEFRAMES: Record<string, string> = {
+  m1: '1m', m5: '5m', m15: '15m', h1: '1h', d1: '1d', '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h', '1d': '1d',
+};
+function canonicalTimeframe(tf: string): string {
+  return CANONICAL_TIMEFRAMES[tf.trim().toLowerCase()] ?? tf;
+}
+/** The backend never downloads more than this many bars in one fetch; larger requests are clamped. */
+const MOCK_MAX_FETCH_BARS = 5000;
+
+function symbolData(symbol: string, timeframe: string): SymbolDataDto {
+  const known = /^(RELIANCE|TCS|INFY|HDFCBANK)\.NS$|^(AAPL|MSFT|GOOGL|SPY|BTC-USD|ETH-USD|GC=F)$/.test(symbol);
+  const tf = canonicalTimeframe(timeframe);
+  const bars = fetched.get(`${symbol}|${tf}`) ?? (known ? 520 : 0);
+  return {
+    symbol, timeframe: tf, bars,
+    first_time: bars ? '2024-01-02T00:00:00Z' : null, last_time: bars ? '2026-01-02T00:00:00Z' : null,
+  };
+}
+
+const step = (kind: string, label: string, group: string, description: string, params: ParamDefDto[] = []): StepKindDto =>
+  ({ kind, label, group, description, params });
+
+export const MOCK_BLOCKS: BuildingBlocksDto = {
+  steps: [
+    step('standard_scaler', 'Standard scaler', 'scale', 'Centre each feature and divide by its spread.', [
+      { key: 'with_mean', label: 'Centre', type: 'bool', default: true, help: 'Subtract the mean.' },
+      { key: 'with_std', label: 'Scale', type: 'bool', default: true, help: 'Divide by the standard deviation.' },
+    ]),
+    step('robust_scaler', 'Robust scaler', 'scale', 'Scale by the middle of the data, ignoring extreme values.'),
+    step('minmax_scaler', 'Min-max scaler', 'scale', 'Squeeze each feature into 0..1.'),
+    step('quantile_transformer', 'Quantile transformer', 'scale', 'Turn each feature into its rank, spread evenly or like a bell curve.', [
+      { key: 'output_distribution', label: 'Output', type: 'choice', default: 'uniform', choices: ['uniform', 'normal'], help: 'Shape of the result.' },
+      { key: 'n_quantiles', label: 'Quantiles', type: 'int', default: 200, min: 10, max: 2000, help: 'Resolution of the rank table.' },
+    ]),
+    step('power_transformer', 'Power transformer', 'scale', 'Make skewed features more bell-shaped (Yeo-Johnson).'),
+    step('clip_outliers', 'Clip outliers', 'clean', 'Cap each feature at chosen percentiles learned from the training rows.', [
+      { key: 'lower_pct', label: 'Lower percentile', type: 'float', default: 1, min: 0, max: 20, help: 'Values below this percentile are raised to it.' },
+      { key: 'upper_pct', label: 'Upper percentile', type: 'float', default: 99, min: 80, max: 100, help: 'Values above this percentile are lowered to it.' },
+    ]),
+    step('variance_threshold', 'Drop flat features', 'select', 'Remove features that barely change.', [
+      { key: 'threshold', label: 'Min variance', type: 'float', default: 0, min: 0, max: 100, help: 'Features with less variance are dropped.' },
+    ]),
+    step('select_k_best', 'Keep the best k features', 'select', 'Keep the k features most related to the label.', [
+      { key: 'k', label: 'k', type: 'int', default: 10, min: 1, max: 500, help: 'How many to keep.' },
+      { key: 'score', label: 'Score', type: 'choice', default: 'f_classif', choices: ['f_classif', 'mutual_info_classif'], help: 'How features are ranked.' },
+    ]),
+    step('pca', 'PCA', 'reduce', 'Replace features with a few uncorrelated combinations.', [
+      { key: 'n_components', label: 'Components', type: 'float', default: 0.95, min: 0.1, max: 200, help: 'Under 1: share of variance to keep. 1 or more: number of components.' },
+      { key: 'whiten', label: 'Whiten', type: 'bool', default: false, help: 'Give every component equal spread.' },
+    ]),
+  ],
+  members: [
+    { id: 'random_forest', label: 'Random forest', description: 'Many decision trees voting.' },
+    { id: 'extra_trees', label: 'Extra trees', description: 'Random-split trees; fast and smooth.' },
+    { id: 'gradient_boosting', label: 'Gradient boosting', description: 'Trees that fix each other\'s errors.' },
+    { id: 'hist_gradient_boosting', label: 'Histogram gradient boosting', description: 'Fast boosting for larger data.' },
+    { id: 'logistic_regression', label: 'Logistic regression', description: 'A linear model.' },
+    { id: 'xgboost', label: 'XGBoost', description: 'Boosted trees (when installed).' },
+  ],
+  limits: { max_steps: 8, max_members: 6, min_members: 2, stacking_blocks: [3, 8] },
+};
+
+/** Mock validation: structure and limits only (the backend also checks every parameter). */
+function checkMockRecipe(r: RecipeDto): RecipeCheckDto {
+  const errors: RecipeIssueDto[] = [];
+  const warnings: string[] = [];
+  const bad = (path: string, message: string) => errors.push({ path, message });
+  if (!r || typeof r !== 'object') return { ok: false, errors: [{ path: '', message: 'recipe is required' }], warnings, steps: 0, models: 0, est_model_mb: null };
+  if (!/^[a-z][a-z0-9_]{0,40}$/.test(r.name ?? '')) bad('name', 'use lowercase letters, digits and underscores, starting with a letter (max 41 characters)');
+  if (!r.label?.trim()) bad('label', 'give the algorithm a name');
+  const kinds = new Set(MOCK_BLOCKS.steps.map((s) => s.kind));
+  if ((r.steps?.length ?? 0) > MOCK_BLOCKS.limits.max_steps) bad('steps', `at most ${MOCK_BLOCKS.limits.max_steps} steps`);
+  (r.steps ?? []).forEach((s, i) => { if (!kinds.has(s.kind)) bad(`steps[${i}].kind`, `unknown step ${s.kind}`); });
+  const members = new Set(MOCK_BLOCKS.members.map((m) => m.id));
+  const checkMember = (m: { algorithm: string }, path: string) => { if (!members.has(m?.algorithm)) bad(`${path}.algorithm`, `unknown algorithm ${m?.algorithm}`); };
+  let models = 0;
+  const model = r.model;
+  if (!model) bad('model', 'choose a model');
+  else if (model.kind === 'single') { checkMember(model, 'model'); models = 1; }
+  else if (model.kind === 'voting' || model.kind === 'stacking') {
+    const n = model.members?.length ?? 0;
+    if (n < MOCK_BLOCKS.limits.min_members || n > MOCK_BLOCKS.limits.max_members) bad('model.members', `use ${MOCK_BLOCKS.limits.min_members} to ${MOCK_BLOCKS.limits.max_members} models`);
+    (model.members ?? []).forEach((m, i) => checkMember(m, `model.members[${i}]`));
+    models = n;
+    if (model.kind === 'stacking') {
+      checkMember(model.final, 'model.final');
+      models += 1;
+      const [lo, hi] = MOCK_BLOCKS.limits.stacking_blocks;
+      if (!(model.blocks >= lo && model.blocks <= hi)) bad('model.blocks', `use ${lo} to ${hi} blocks`);
+    }
+    if (model.kind === 'voting' && model.voting === 'hard' && r.calibrate !== 'none') warnings.push('Hard voting has no probabilities to calibrate; the calibration is ignored.');
+  } else bad('model.kind', 'choose single, voting or stacking');
+  if (r.steps?.some((s) => s.kind === 'pca') && models > 0) warnings.push('PCA hides the original features, so feature importances are not available for this model.');
+  return { ok: errors.length === 0, errors, warnings, steps: r.steps?.length ?? 0, models, est_model_mb: models ? Math.round(models * 4) : null };
+}
+
+const num = (key: string, label: string, def: number, min: number, max: number, help: string, type = 'float'): ParamDefDto =>
+  ({ key, label, type, default: def, min, max, help });
+const choice = (key: string, label: string, def: string | null, choices: string[], help: string): ParamDefDto =>
+  ({ key, label, type: 'choice', default: def, choices, help });
+
+export const MOCK_ALGORITHMS: AlgorithmDto[] = [
+  { id: 'random_forest', label: 'Random forest', description: 'Many decision trees voting. Robust, hard to overfit badly.', accepts_extra_params: true, params: [
+    num('n_estimators', 'Trees', 100, 1, 2000, 'Number of trees.', 'int'), num('max_depth', 'Max depth', 0, 0, 100, '0 = unlimited.', 'int'),
+    num('min_samples_leaf', 'Min samples per leaf', 1, 1, 1000, 'Larger values smooth the model.', 'int'),
+    choice('class_weight', 'Class weight', null, ['balanced', 'balanced_subsample'], 'Balance rare classes.'),
+    { key: 'bootstrap', label: 'Bootstrap', type: 'bool', default: true, help: 'Sample rows with replacement.' },
+    { key: 'criterion', label: 'Criterion', type: 'choice', default: 'gini', choices: ['gini', 'entropy', 'log_loss'], help: 'Split quality measure.' },
+  ] },
+  { id: 'extra_trees', label: 'Extra trees', description: 'Like a random forest with random split points. Faster, often smoother.', accepts_extra_params: true, params: [
+    num('n_estimators', 'Trees', 100, 1, 2000, 'Number of trees.', 'int'), num('max_depth', 'Max depth', 0, 0, 100, '0 = unlimited.', 'int'),
+    num('min_samples_leaf', 'Min samples per leaf', 1, 1, 1000, 'Larger values smooth the model.', 'int'),
+  ] },
+  { id: 'gradient_boosting', label: 'Gradient boosting', description: 'Trees added one at a time to fix earlier errors.', accepts_extra_params: true, params: [
+    num('n_estimators', 'Rounds', 100, 1, 2000, 'Boosting rounds.', 'int'), num('learning_rate', 'Learning rate', 0.1, 0.001, 1, 'Step size.'),
+    num('max_depth', 'Max depth', 3, 1, 20, 'Depth of each tree.', 'int'), num('subsample', 'Subsample', 1, 0.1, 1, 'Row share per round.'),
+  ] },
+  { id: 'hist_gradient_boosting', label: 'Histogram gradient boosting', description: 'Fast boosting for larger datasets.', accepts_extra_params: true, params: [
+    num('max_iter', 'Rounds', 100, 1, 2000, 'Boosting rounds.', 'int'), num('learning_rate', 'Learning rate', 0.1, 0.001, 1, 'Step size.'),
+    num('max_depth', 'Max depth', 0, 0, 100, '0 = unlimited.', 'int'), num('l2_regularization', 'L2 regularization', 0, 0, 100, 'Penalty on leaf weights.'),
+  ] },
+  { id: 'logistic_regression', label: 'Logistic regression', description: 'A linear model. Simple, fast, good baseline.', accepts_extra_params: true, params: [
+    num('C', 'C (inverse regularization)', 1, 0.0001, 1000, 'Smaller = stronger regularization.'), num('max_iter', 'Max iterations', 200, 10, 10000, 'Solver iterations.', 'int'),
+    choice('class_weight', 'Class weight', null, ['balanced'], 'Balance rare classes.'),
+  ] },
+  { id: 'xgboost', label: 'XGBoost', description: 'Boosted trees with strong defaults (when installed).', accepts_extra_params: true, params: [
+    num('n_estimators', 'Rounds', 100, 1, 2000, 'Boosting rounds.', 'int'), num('max_depth', 'Max depth', 6, 1, 20, 'Depth of each tree.', 'int'),
+    num('learning_rate', 'Learning rate', 0.3, 0.001, 1, 'Step size.'), num('subsample', 'Subsample', 1, 0.1, 1, 'Row share per round.'),
+    num('colsample_bytree', 'Column share', 1, 0.1, 1, 'Feature share per tree.'),
+  ] },
+  { id: 'custom', label: 'Custom estimator (Python file)', description: 'Your own scikit-learn style classifier from estimators/<name>.py.', accepts_extra_params: true, params: [] },
+];
+
+/**
+ * A tiny evaluator for the mock only: it validates the shape of an expression (known functions,
+ * balanced parentheses) the way the backend would, and reports a plausible warmup.
+ */
+const FUNCS: Record<string, [number, number]> = {
+  sma: [2, 2], ema: [2, 2], std: [2, 2], rsi: [1, 2], ret: [1, 2], shift: [2, 2], max: [2, 2], min: [2, 2],
+  abs: [1, 1], log: [1, 1], zscore: [2, 2], atr: [0, 1], other: [2, 2], sum: [2, 2],
+};
+const SERIES = new Set(['open', 'high', 'low', 'close', 'volume']);
+
+function checkMockExpression(expr: string, symbol = '', timeframe = 'd1'): ExpressionCheckDto {
+  const fail = (error: string, pos: number): ExpressionCheckDto => ({ ok: false, error, error_pos: pos, warmup_bars: 0, sample: [] });
+  if (!expr.trim()) return fail('Enter a formula, for example sma(close, 20) / close - 1', 0);
+  let depth = 0;
+  let warmup = 1;
+  const re = /([A-Za-z_][A-Za-z0-9_]*)\s*(\()?|"[^"]*"|[()+\-*/,]|\d+(?:\.\d+)?|\S/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(expr))) {
+    const tok = m[0];
+    if (m[1]) {
+      if (m[2]) {
+        if (!(m[1] in FUNCS)) return fail(`Unknown function ${m[1]}(). Available: ${Object.keys(FUNCS).join(', ')}`, m.index);
+        depth += 1;
+        const win = /,\s*(\d+)/.exec(expr.slice(m.index));
+        if (win) warmup = Math.max(warmup, Number(win[1]));
+      } else if (!SERIES.has(m[1])) return fail(`Unknown name ${m[1]}. Use open, high, low, close or volume.`, m.index);
+    } else if (tok.startsWith('"')) continue; // string literal, e.g. other("SPY", "close")
+    else if (tok === '(') depth += 1;
+    else if (tok === ')') { depth -= 1; if (depth < 0) return fail('Unbalanced )', m.index); }
+    else if (!/^[()+\-*/,]$|^\d/.test(tok)) return fail(`Unexpected ${tok}`, m.index);
+  }
+  if (depth !== 0) return fail('Missing )', expr.length);
+  // As in the backend: once the main symbol has stored bars, every symbol read with other() needs them too.
+  if (symbol && symbolData(symbol.toUpperCase(), timeframe).bars > 0) {
+    for (const ref of expr.matchAll(/other\(\s*"([^"]+)"/g)) {
+      const sym = ref[1].toUpperCase();
+      if (symbolData(sym, timeframe).bars === 0) {
+        return fail(`no stored bars for ${sym}, which this formula reads with other("${sym}", ...); fetch its history first`, 0);
+      }
+    }
+  }
+  return {
+    ok: true, error: null, error_pos: null, warmup_bars: warmup,
+    sample: Array.from({ length: 5 }, (_, i) => ({ time: `2026-01-0${i + 1}T00:00:00Z`, value: Number((Math.sin(i) * 0.03).toFixed(4)) })),
+  };
+}
+
+export const MOCK_ESTIMATOR_TEMPLATE = `from sklearn.ensemble import ExtraTreesClassifier
+
+
+def make_estimator(params: dict):
+    return ExtraTreesClassifier(n_estimators=int(params.get("n_estimators", 200)), random_state=7, n_jobs=1)
+`;
+
+export type AutomationLookup = () => { id: string; name: string; enabled: boolean; symbol: string; model_id: string }[];
+
+/** Handle ML-workbench and activity commands. Returns `undefined` when `cmd` is not one of them. */
+export function handleMlMock(cmd: string, args: Record<string, unknown> | undefined, automations: AutomationLookup): unknown {
+  const result = handleMlMockNow(cmd, args, automations);
+  if (result !== undefined && delayNext && delayNext.cmd === cmd) {
+    const { ms } = delayNext;
+    delayNext = null;
+    return new Promise((resolve) => setTimeout(() => resolve(result), ms));
+  }
+  return result;
+}
+
+function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined, automations: AutomationLookup): unknown {
+  if (failNext && failNext.cmd === cmd) {
+    const message = failNext.message;
+    failNext = null;
+    throw new Error(message);
+  }
+  switch (cmd) {
+    case 'predict_model_signal': {
+      const id = String(args?.modelId);
+      if (!details.has(id)) throw new Error(`Unknown model ${id}`);
+      const symbol = String(args?.symbol ?? '');
+      if (!symbol.trim()) throw new Error('Symbol is required');
+      const p = 0.55 + (symbol.length % 4) * 0.08;
+      return { model_id: id, symbol, signal: symbol.length % 2 === 0 ? 1 : -1, probability: Number(p.toFixed(3)), features_used: details.get(id)?.feature_names ?? [] };
+    }
+    case 'list_activity': {
+      const kind = args?.kind as string | undefined;
+      const target = args?.targetId as string | undefined;
+      const limit = (args?.limit as number | undefined) ?? 200;
+      return activity.filter((a) => (!kind || a.kind === kind) && (!target || a.target_id === target)).slice(0, limit);
+    }
+    case 'list_feature_catalog': return MOCK_FEATURES;
+    case 'check_expression': return checkMockExpression(String(args?.expr ?? ''), String(args?.symbol ?? ''), String(args?.timeframe ?? 'd1'));
+    case 'list_symbol_data': return ((args?.symbols as string[]) ?? []).map((symbol) => symbolData(symbol, String(args?.timeframe ?? 'd1')));
+    case 'fetch_symbol_history': {
+      const symbol = String(args?.symbol);
+      if (/^(NOPE|BAD)/i.test(symbol)) throw new Error(`No history available for ${symbol}`);
+      fetched.set(`${symbol}|${canonicalTimeframe(String(args?.timeframe ?? 'd1'))}`, Math.min(MOCK_MAX_FETCH_BARS, Number(args?.bars ?? 500)));
+      return symbolData(symbol, String(args?.timeframe ?? 'd1'));
+    }
+    case 'list_algorithms': return MOCK_ALGORITHMS;
+    case 'estimator_template': return MOCK_ESTIMATOR_TEMPLATE;
+    case 'list_estimator_files': return [...estimators.values()];
+    case 'save_estimator_file': {
+      const name = String(args?.name);
+      if (!/^[a-z][a-z0-9_]{0,40}\.py$/.test(name)) throw new Error('Estimator names look like my_model.py (lowercase letters, digits, underscore)');
+      const content = String(args?.content ?? '');
+      if (!content.includes('def make_estimator')) throw new Error('The file must define make_estimator(params) returning a scikit-learn style classifier');
+      const file: EstimatorFileDto = { name, path: `estimators/${name}`, content, updated_at: new Date().toISOString() };
+      estimators.set(name, file);
+      ledgerPut('estimator', name, content, 'user', `Saved estimator ${name}`);
+      recordMockActivity('user', 'estimator.save', 'system', name, `Saved estimator ${name}`);
+      return file;
+    }
+    case 'delete_estimator_file': {
+      const had = estimators.delete(String(args?.name));
+      if (had) ledgerTombstone('estimator', String(args?.name), 'user', `Deleted estimator ${String(args?.name)}`);
+      return had;
+    }
+    case 'recipe_building_blocks': return MOCK_BLOCKS;
+    case 'list_recipes': return [...recipes.values()].sort((a, b) => a.name.localeCompare(b.name));
+    case 'validate_recipe': return checkMockRecipe(args?.recipe as RecipeDto);
+    case 'save_recipe': {
+      const r = args?.recipe as RecipeDto;
+      const check = checkMockRecipe(r);
+      if (!check.ok) throw new Error(check.errors.map((e) => `${e.path}: ${e.message}`).join('; '));
+      const now = new Date().toISOString();
+      const saved: RecipeDto = { ...r, created_at: recipes.get(r.name)?.created_at ?? now, updated_at: now };
+      recipes.set(r.name, saved);
+      ledgerPut('recipe', r.name, recipeText(saved), 'user', `Saved algorithm ${r.label || r.name}`);
+      recordMockActivity('user', 'recipe.save', 'system', r.name, `Saved algorithm ${r.label || r.name}`);
+      return saved;
+    }
+    case 'delete_recipe': {
+      const had = recipes.delete(String(args?.name));
+      if (had) ledgerTombstone('recipe', String(args?.name), 'user', `Deleted algorithm ${String(args?.name)}`);
+      if (had) recordMockActivity('user', 'recipe.delete', 'system', String(args?.name), `Deleted algorithm ${String(args?.name)}`);
+      return had;
+    }
+    case 'list_datasets': return [...datasets];
+    case 'build_dataset': {
+      const r = args?.request as BuildDatasetRequestDto;
+      if (!r.features.length && !(r.custom_features ?? []).length) throw new Error('Choose at least one feature');
+      if (!r.symbols.length) throw new Error('Choose at least one symbol');
+      const rows = Math.max(0, r.bars * r.symbols.length - 60 - r.label.horizon_bars);
+      const info: DatasetInfoDto = {
+        name: r.name, path: `datasets/${r.name}.csv`, rows, symbols: r.symbols, timeframe: canonicalTimeframe(r.timeframe),
+        features: r.features, label: r.label,
+        class_counts: r.label.kind === 'direction' ? { 0: Math.round(rows * 0.48), 1: Math.round(rows * 0.52) }
+          : { '-1': Math.round(rows * 0.2), 0: Math.round(rows * 0.6), 1: Math.round(rows * 0.2) },
+        created_at: new Date().toISOString(), first_time: r.from ? `${r.from}T00:00:00Z` : '2024-01-02T00:00:00Z',
+        last_time: r.to ? `${r.to}T00:00:00Z` : '2026-01-02T00:00:00Z', source: 'user',
+        custom_features: r.custom_features ?? [], context_symbols: r.context_symbols ?? [], fee_pct: r.fee_pct ?? 0,
+      };
+      mockBuildHook(r, info); // test hook, see the end of this file
+      const i = datasets.findIndex((d) => d.name === r.name);
+      if (i >= 0) datasets[i] = info; else datasets.push(info);
+      // Names containing "huge" stand for very large write-once files: the ledger keeps only the hash.
+      ledgerPut('dataset', r.name, datasetText(info), 'user', `Built dataset ${r.name} (${rows} rows)`, { reference: r.name.includes('huge') });
+      recordMockActivity('user', 'dataset.build', 'dataset', r.name, `Built dataset ${r.name} (${rows} rows)`);
+      return info;
+    }
+    case 'preview_dataset': {
+      const d = datasets.find((x) => x.name === args?.name);
+      if (!d) throw new Error(`Unknown dataset ${String(args?.name)}`);
+      const allFeatures = [...d.features, ...d.custom_features.map((c) => c.name)];
+      const columns = ['time', 'symbol', ...allFeatures, 'fwd_ret', 'target'];
+      const sample = Array.from({ length: 12 }, (_, i) => ['2025-01-0' + ((i % 9) + 1), d.symbols[0], ...allFeatures.map((_f, j) => Number((Math.sin(i + j) * 0.02).toFixed(4))), 0.004, i % 2]);
+      return { ...d, columns, sample } as DatasetPreviewDto;
+    }
+    case 'delete_dataset': {
+      const i = datasets.findIndex((d) => d.name === args?.name);
+      if (i >= 0) { datasets.splice(i, 1); ledgerTombstone('dataset', String(args?.name), 'user', `Deleted dataset ${String(args?.name)}`); recordMockActivity('user', 'dataset.delete', 'dataset', String(args?.name), `Deleted dataset ${String(args?.name)}`); }
+      return i >= 0;
+    }
+    case 'list_ml_models': return [...details.values()].map(toSummary).sort((a, b) => b.created_at.localeCompare(a.created_at));
+    case 'train_ml_model': {
+      const req = args?.request as MLTrainingRequestDto;
+      const run = () => {
+        const d = createMockModel(req, 'user');
+        return { model_id: d.model_id, metrics: d.metrics, feature_names: d.feature_names, status: 'completed', duration_secs: d.duration_secs };
+      };
+      const gate = mockTrainGate(req); // test hook, see the end of this file
+      return gate ? gate.then(run) : run();
+    }
+    case 'delete_ml_model': {
+      const id = String(args?.modelId);
+      const had = details.delete(id);
+      if (had) ledgerTombstone('model', id, 'user', `Deleted model ${id}`);
+      if (had) recordMockActivity('user', 'model.delete', 'model', id, `Deleted model ${id}`);
+      return had;
+    }
+    case 'get_ml_model': {
+      const d = details.get(String(args?.modelId));
+      if (!d) throw new Error(`Unknown model ${String(args?.modelId)}`);
+      return { ...d, used_by: mockUsage(d.model_id, automations()) };
+    }
+    case 'update_ml_model': {
+      const d = details.get(String(args?.modelId));
+      if (!d) throw new Error(`Unknown model ${String(args?.modelId)}`);
+      if (typeof args?.displayName === 'string') d.display_name = args.displayName.trim().slice(0, 80);
+      if (typeof args?.notes === 'string') d.notes = args.notes.slice(0, 4000);
+      if (Array.isArray(args?.tags)) d.tags = (args.tags as string[]).map((t) => t.trim()).filter(Boolean).slice(0, 12);
+      recordModelVersion(d, 'user', `Edited details of ${d.display_name || d.model_id}`);
+      recordMockActivity('user', 'model.update', 'model', d.model_id, `Edited details of ${d.display_name || d.model_id}`);
+      return { ...d, used_by: mockUsage(d.model_id, automations()) };
+    }
+    case 'model_signal_history': {
+      const id = String(args?.modelId);
+      if (!details.has(id)) throw new Error(`Unknown model ${id}`);
+      const n = Math.min(Number(args?.bars ?? 60), 300);
+      const points = Array.from({ length: n }, (_, i) => ({
+        time: new Date(Date.UTC(2025, 0, 1 + i)).toISOString(),
+        close: Number((100 + Math.sin(i / 6) * 5 + i * 0.05).toFixed(2)),
+        signal: Math.sin(i / 5) > 0.2 ? 1 : Math.sin(i / 5) < -0.2 ? -1 : 0,
+        probability: Number((0.5 + Math.abs(Math.sin(i / 5)) * 0.3).toFixed(3)),
+      }));
+      return { model_id: id, symbol: String(args?.symbol), points } as ModelSignalHistoryDto;
+    }
+    case 'ledger_history': return ledgerHistoryOf(args?.kind as VersionedKind, String(args?.id));
+    case 'ledger_version': return ledgerContent(args?.kind as VersionedKind, String(args?.id), Number(args?.version));
+    case 'ledger_objects': return ledgerObjectList(args?.kind as VersionedKind, args?.includeDeleted !== false);
+    case 'ledger_restore': {
+      const kind = args?.kind as VersionedKind;
+      const id = String(args?.id);
+      const version = Number(args?.version);
+      // The ledger holds settings with secrets redacted: writing an old version back would erase the real secrets.
+      if (kind === 'settings') throw new Error('settings history is view-only; redacted values cannot be restored');
+      const { record, text } = ledgerRestoreVersion(kind, id, version, 'user');
+      applyToWorkingCopy(kind, id, text);
+      recordMockActivity('user', `${kind}.restore`, ledgerActivityKind(kind), id, `Restored version ${version} of ${id} as version ${record.version}`);
+      return record;
+    }
+    // Takes a moment so the UI's progress state can be seen.
+    case 'ledger_verify': return new Promise((resolve) => { setTimeout(() => resolve(ledgerVerifyNow()), 250); });
+    case 'ledger_status': return ledgerStatusNow();
+    case 'list_order_events': {
+      return ledgerListOrderEvents({ orderId: args?.orderId as string | undefined, brokerId: args?.brokerId as string | undefined, limit: args?.limit as number | undefined });
+    }
+    default: return undefined;
+  }
+}
+
+registerLedgerApplier('estimator', (id, text) => {
+  estimators.set(id, { name: id, path: `estimators/${id}`, content: text, updated_at: new Date().toISOString() });
+});
+registerLedgerApplier('recipe', (id, text) => {
+  const parsed = JSON.parse(text) as RecipeDto;
+  const now = new Date().toISOString();
+  recipes.set(id, { ...parsed, created_at: recipes.get(id)?.created_at ?? now, updated_at: now });
+});
+registerLedgerApplier('dataset', (id, text) => {
+  const parsed = JSON.parse(text) as DatasetInfoDto;
+  const i = datasets.findIndex((d) => d.name === id);
+  const next: DatasetInfoDto = { ...parsed, created_at: datasets[i]?.created_at ?? new Date().toISOString() };
+  if (i >= 0) datasets[i] = next; else datasets.push(next);
+});
+registerLedgerApplier('model', (id, text) => {
+  const parsed = JSON.parse(text) as ModelDetailDto;
+  const current = details.get(id);
+  // The ledger keeps the model's editable details and its existence; a live model only takes the details back.
+  if (current) Object.assign(current, { display_name: parsed.display_name, notes: parsed.notes, tags: parsed.tags });
+  else details.set(id, { ...parsed, used_by: [] });
+});
+
+if (typeof window !== 'undefined') {
+  (window as unknown as { __apexMock?: unknown }).__apexMock = {
+    /** Act as the Copilot training a model. */
+    trainModelAsCopilot: (algorithm = 'random_forest') => createMockModel({ algorithm }, 'copilot').model_id,
+    /** Train a model, then overwrite fields of its stored detail (metrics, cv_folds, trading, rows ...). */
+    trainModelCustom: (patch: Partial<ModelDetailDto> = {}, actor: ActivityActor = 'user') => {
+      const d = createMockModel({ algorithm: patch.algorithm }, actor);
+      Object.assign(d, patch, { model_id: d.model_id });
+      return d.model_id;
+    },
+    failNext: (cmd: string, message = 'Simulated failure') => { failNext = { cmd, message }; },
+    delayNext: (cmd: string, ms = 500) => { delayNext = { cmd, ms }; },
+    /** Act as the Copilot editing a model's name, notes or tags. */
+    editModelAsCopilot: (modelId: string, patch: Partial<Pick<ModelDetailDto, 'display_name' | 'notes' | 'tags'>>) => {
+      const d = details.get(modelId);
+      if (!d) throw new Error(`Unknown model ${modelId}`);
+      Object.assign(d, patch);
+      recordModelVersion(d, 'copilot', `Edited details of ${d.display_name || modelId}`);
+      recordMockActivity('copilot', 'model.update', 'model', modelId, `Edited details of ${d.display_name || modelId}`);
+    },
+    recordActivity: recordMockActivity,
+    activity: mockActivity,
+    /** Immutable audit ledger test hooks: tamper, externalEdit, put, history, verify ... (see mockLedger.ts). */
+    ledger: ledgerHooks,
+    /** Put a recipe straight into the mock store, skipping validation (so specs can seed one the backend would reject). */
+    seedRecipe: (recipe: RecipeDto) => { recipes.set(recipe.name, recipe); },
+  };
+}
+
+// --- ML workbench test hook (agent U2): magic dataset names make training slow or fail --------------
+/**
+ * A dataset whose name contains "slow" takes about 1.2 s to train; one containing "failxgb" makes
+ * xgboost fail (as when the package is missing) while the other algorithms succeed. Returns a
+ * promise to wait for, or `undefined` to train immediately.
+ */
+export function mockTrainGate(req: Partial<MLTrainingRequestDto>): Promise<void> | undefined {
+  const name = req.dataset ?? '';
+  const failing = name.includes('failxgb') && req.algorithm === 'xgboost';
+  const slow = name.includes('slow');
+  if (!failing && !slow) return undefined;
+  return new Promise<void>((resolve, reject) => {
+    setTimeout(() => (failing ? reject(new Error('xgboost is not installed in the Python environment')) : resolve()), slow ? 1200 : 100);
+  });
+}
+
+/**
+ * Dataset names containing "boom" make the build fail (to show backend errors inline); names
+ * containing "skew" get a 5% / 90% / 5% class split (to show the class-balance warning).
+ */
+export function mockBuildHook(r: Pick<BuildDatasetRequestDto, 'name' | 'symbols'>, info: DatasetInfoDto): void {
+  if (r.name.includes('boom')) throw new Error(`No market data available for ${r.symbols.join(', ')}`);
+  if (r.name.includes('skew')) {
+    const n = info.rows;
+    info.class_counts = { '-1': Math.round(n * 0.05), '0': n - 2 * Math.round(n * 0.05), '1': Math.round(n * 0.05) };
+  }
+}

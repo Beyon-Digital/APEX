@@ -106,6 +106,23 @@ impl LiveTradingGuard {
         Ok(())
     }
 
+    /// Modifying a live order is gated like placing one: armed, and the new
+    /// quantity within the per-order cap.
+    pub fn check_modify(&self, new_quantity: Option<f64>) -> Result<(), String> {
+        if !self.is_armed() {
+            return Err("Live trading is not armed. Arm it before changing live orders.".to_string());
+        }
+        if let Some(quantity) = new_quantity {
+            if quantity > self.limits.max_qty_per_order {
+                return Err(format!(
+                    "Quantity {quantity} exceeds the live per-order limit of {}",
+                    self.limits.max_qty_per_order
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Take one unit of today's order budget.
     pub fn reserve(&self) -> Result<OrderSlot<'_>, String> {
         let mut counter = self.counter.lock().unwrap();
@@ -236,5 +253,15 @@ mod tests {
         let (id, _) = g.issue_confirmation("zerodha", &order(1.0));
         g.set_armed(false);
         assert!(g.consume_confirmation(&id, "zerodha", &order(1.0)).is_err());
+    }
+
+    #[test]
+    fn modifying_needs_arming_and_respects_the_quantity_cap() {
+        let g = guard(5, 10.0);
+        assert!(g.check_modify(Some(5.0)).is_err(), "disarmed");
+        g.set_armed(true);
+        assert!(g.check_modify(Some(10.0)).is_ok());
+        assert!(g.check_modify(None).is_ok());
+        assert!(g.check_modify(Some(1000.0)).is_err(), "cannot inflate a small order past the cap");
     }
 }

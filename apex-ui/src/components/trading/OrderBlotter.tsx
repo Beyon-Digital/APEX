@@ -3,6 +3,7 @@ import { cancelOrder, getOrders } from '../../lib/tauri';
 import type { OrderDto } from '../../lib/types';
 import { formatPrice, formatQuantity } from '../../lib/format';
 import { useBrokerStore } from '../../stores/brokerStore';
+import { OrderAuditDrawer } from '../audit/OrderTimeline';
 
 const POLL_MS = 3_000;
 
@@ -23,6 +24,7 @@ export const OrderBlotter: React.FC = () => {
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const activeBrokerId = useBrokerStore((s) => s.activeBrokerId);
+  const [auditOrder, setAuditOrder] = useState<OrderDto | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -120,7 +122,15 @@ export const OrderBlotter: React.FC = () => {
                     )}
                   </td>
                   <td className="px-2 py-1.5 font-mono text-xs text-text-muted">{order.broker_id}</td>
-                  <td className="px-2 py-1.5 text-right">
+                  <td className="px-2 py-1.5 text-right whitespace-nowrap">
+                    <button
+                      onClick={() => setAuditOrder(order)}
+                      className="mr-2 text-[10px] text-text-muted hover:text-accent"
+                      title="Every state this order went through, and what produced it"
+                      data-testid={`blotter-audit-${order.id}`}
+                    >
+                      Audit trail
+                    </button>
                     {cancellable(order) && (
                       <button
                         onClick={() => void handleCancel(order)}
@@ -138,6 +148,7 @@ export const OrderBlotter: React.FC = () => {
           </table>
         )}
       </div>
+      {auditOrder && <OrderAuditDrawer orderId={auditOrder.id} brokerId={auditOrder.broker_id || activeBrokerId} onClose={() => setAuditOrder(null)} />}
     </div>
   );
 };

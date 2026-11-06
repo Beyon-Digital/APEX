@@ -44,8 +44,8 @@ interface Suggestion {
 /** Delay in ms before deactivating command bar on blur, to allow click events */
 const BLUR_DELAY_MS = 200;
 
-/** Map from command keywords to tab identifiers ('copilot' opens the dock, not a tab) */
-const PANEL_MAP: Record<string, CenterTab | 'copilot'> = {
+/** Map from command keywords to tab identifiers (COPILOT / AI add and highlight the Copilot tile) */
+const PANEL_MAP: Record<string, CenterTab> = {
   CHART: 'chart',
   STRATEGY: 'strategy',
   ML: 'ml',
@@ -245,8 +245,9 @@ export const CommandBar: React.FC<CommandBarProps> = ({ onSelectSymbol, onSwitch
           side: cmd.side === 'BUY' ? 'Buy' : 'Sell',
           order_type: cmd.orderType === 'LIMIT' ? 'Limit' : cmd.orderType === 'STOP' ? 'Stop' : 'Market',
           quantity: cmd.quantity,
-          price: cmd.price ?? null,
-          stop_price: null,
+          // A STOP order's number is its trigger, not a limit price.
+          price: cmd.orderType === 'STOP' ? null : cmd.price ?? null,
+          stop_price: cmd.orderType === 'STOP' ? cmd.price ?? null : null,
           broker_id: activeBrokerId,
           tag: 'command-bar',
         };

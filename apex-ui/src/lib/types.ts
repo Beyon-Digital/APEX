@@ -136,6 +136,8 @@ export interface AppSettingsDto {
   config_path: string;
   runtime_storage_backend: string;
   runtime_storage_target: string;
+  /** Set when the saved storage backend could not start and SQLite is in use instead. */
+  runtime_storage_notice?: string | null;
   general: GeneralSettingsDto;
   market_data: AdapterPreferenceDto;
   execution: AdapterPreferenceDto;
@@ -327,6 +329,8 @@ export interface AutomationDto {
   last_run_at: string | null;
   last_result: string | null;
   orders_today: number;
+  /** When true a "down" signal opens a short instead of only exiting a long. */
+  allow_short: boolean;
 }
 
 export interface CreateAutomationDto {
@@ -338,6 +342,7 @@ export interface CreateAutomationDto {
   quantity?: number;
   threshold?: number;
   broker_id?: string;
+  allow_short?: boolean;
 }
 
 export interface MLTrainingRequestDto {
@@ -345,9 +350,22 @@ export interface MLTrainingRequestDto {
   data_path: string;
   target_column: string;
   feature_columns: string[];
-  hyperparams: Record<string, number | string>;
+  hyperparams: Record<string, number | string | boolean | null>;
   n_splits: number;
   lag_periods: number[];
+  /** Name of a dataset built in the workbench; when set it supplies `data_path`. */
+  dataset?: string;
+  /** Column holding each row's forward return, used to score trading performance. */
+  return_column?: string;
+  /** How the evaluation trades the predictions. Default long_flat. */
+  trade_mode?: TradeMode;
+  /** Share of the final rows (0-40) kept out of cross-validation and scored once at the end. */
+  holdout_pct?: number;
+  /** Required when algorithm is "custom": a file saved with saveEstimatorFile. */
+  estimator_file?: string;
+  /** Required when algorithm is "recipe": the name of a saved recipe. Hyperparameters live in the recipe. */
+  recipe?: string;
+  random_state?: number;
 }
 
 export interface MLTrainingResultDto {
@@ -355,6 +373,7 @@ export interface MLTrainingResultDto {
   metrics: Record<string, number>;
   feature_names: string[];
   status: string;
+  duration_secs?: number;
 }
 
 // Health Monitor types
@@ -386,6 +405,8 @@ export interface BrokerConnectionDto {
   market_data_available: boolean;
   token_field_label: string;
   message: string;
+  /** The broker can hold short positions (paper always; live brokers only when enabled and supported). */
+  can_short: boolean;
 }
 
 // News
@@ -485,6 +506,8 @@ export interface ToolCallTraceDto {
   name: string;
   detail: string;
   ok: boolean;
+  /** Set when the call created or changed something the user can open (a strategy file, model, dataset or automation). */
+  artifact?: { kind: 'strategy' | 'model' | 'dataset' | 'automation'; id: string } | null;
 }
 
 export interface PendingApprovalDto {
@@ -499,6 +522,8 @@ export interface CopilotReplyDto {
   provider: string;
   tool_calls: ToolCallTraceDto[];
   pending_approvals: PendingApprovalDto[];
+  /** Mode the backend actually used: ask | review | agent. */
+  mode?: string;
 }
 
 // Quant / indicators (OpenBB-style analytics)
@@ -643,4 +668,485 @@ export interface SymbolSearchResultDto {
   exchange: string;
   /** "zerodha" | "yahoo" | "local" */
   source: string;
+}
+
+// ── Strategy sessions ────────────────────────────────────────────────
+
+export interface StrategySessionInfoDto {
+  path: string;
+  symbol: string;
+  timeframe: string;
+  broker_id: string;
+  quantity: number;
+  started_at: string;
+  /** "starting" | "running" | "stopped" | "error" */
+  state: string;
+  held: boolean;
+  bars_processed: number;
+  orders_placed: number;
+  last_error: string | null;
+  recent_logs: string[];
+}
+
+// ── ChatGPT plan sign-in ─────────────────────────────────────────────
+
+export interface ChatGptStatusDto {
+  /** "locked" | "signed_out" | "waiting" | "connected" | "error" */
+  state: string;
+  email: string | null;
+  /** False when signed in but plan usage was not granted. */
+  plan_usage: boolean;
+  message: string | null;
+  /** The copilot is set to run on the ChatGPT plan. */
+  use_for_copilot: boolean;
+  model: string | null;
+}
+
+export interface ChatGptModelDto {
+  slug: string;
+  name: string;
+}
+
+// ── Data feeds per ticker ────────────────────────────────────────────
+
+export interface FeedOptionDto {
+  adapter_id: string;
+  name: string;
+  /** "delayed" | "live" | "exchange" */
+  quality: string;
+  supports: boolean;
+  ready: boolean;
+  unavailable_reason: string | null;
+}
+
+export interface SymbolFeedDto {
+  symbol: string;
+  /** The feed currently supplying quotes. */
+  active: string | null;
+  /** The feed the user pinned (null = automatic). */
+  preferred: string | null;
+  options: FeedOptionDto[];
+}
+
+// ── Activity / audit and live artifact updates ───────────────────────
+
+export type ArtifactKind = 'strategy' | 'model' | 'automation' | 'dataset';
+export type ActivityActor = 'user' | 'copilot' | 'automation' | 'system';
+
+/** Payload of the `artifacts-changed` event: something was created, changed or deleted. */
+export interface ArtifactEventDto {
+  kind: ArtifactKind;
+  id: string;
+  /** e.g. "strategy.save", "model.train", "automation.create" */
+  action: string;
+  actor: ActivityActor;
+}
+
+export interface ActivityDto {
+  id: string;
+  ts: string;
+  /** "external": the settings file was edited outside APEX and picked up as a new version. */
+  actor: ActivityActor | 'external';
+  action: string;
+  kind: ArtifactKind | 'order' | 'system';
+  target_id: string;
+  summary: string;
+  ok: boolean;
+  details: string | null;
+}
+
+// ── ML workbench: datasets, richer models, run audit ─────────────────
+
+export interface FeatureDefDto {
+  id: string;
+  label: string;
+  /** "Price" | "Trend" | "Momentum" | "Volatility" | "Volume" */
+  group: string;
+  description: string;
+  /** Bars needed before the first valid value. */
+  warmup_bars: number;
+}
+
+export interface LabelSpecDto {
+  /** Look this many bars ahead. */
+  horizon_bars: number;
+  /** "direction": 1 if the forward return is positive, else 0.
+   *  "return_threshold": 1 above +threshold, -1 below -threshold, else 0. */
+  kind: 'direction' | 'return_threshold';
+  threshold_pct: number;
+  /** return_threshold only: separate up/down thresholds (percent). When absent, threshold_pct is used for both. */
+  up_threshold_pct?: number | null;
+  down_threshold_pct?: number | null;
+}
+
+/** A user-defined feature: a formula over bars. See the expression language in the Data tab. */
+export interface CustomFeatureDto {
+  /** [a-z][a-z0-9_]{0,40}, must not clash with a catalog feature id. */
+  name: string;
+  /** e.g. "sma(close, 20) / close - 1". Trailing windows only, so it can never look ahead. */
+  expr: string;
+}
+
+export interface BuildDatasetRequestDto {
+  name: string;
+  symbols: string[];
+  timeframe: string;
+  bars: number;
+  features: string[];
+  label: LabelSpecDto;
+  /** Inclusive ISO dates (YYYY-MM-DD). When set they bound the bars used instead of the latest `bars`. */
+  from?: string | null;
+  to?: string | null;
+  custom_features?: CustomFeatureDto[];
+  /** Extra symbols whose bars custom formulas can read with other("SYMBOL","close"). Not rows of the dataset. */
+  context_symbols?: string[];
+  /** Round-trip trading cost in percent, subtracted from every forward return before labelling. */
+  fee_pct?: number;
+}
+
+export interface DatasetInfoDto {
+  name: string;
+  /** Path usable as `data_path` when training. */
+  path: string;
+  rows: number;
+  symbols: string[];
+  timeframe: string;
+  features: string[];
+  label: LabelSpecDto;
+  class_counts: Record<string, number>;
+  created_at: string;
+  first_time: string | null;
+  last_time: string | null;
+  source: ActivityActor;
+  custom_features: CustomFeatureDto[];
+  context_symbols: string[];
+  fee_pct: number;
+}
+
+export interface DatasetPreviewDto extends DatasetInfoDto {
+  columns: string[];
+  /** First rows as strings/numbers, in `columns` order. */
+  sample: (string | number)[][];
+}
+
+export interface CvFoldDto {
+  fold: number;
+  train_rows: number;
+  test_rows: number;
+  accuracy: number;
+  f1: number;
+  precision: number;
+  recall: number;
+  /** Accuracy of always predicting the most common class in this fold's test rows. */
+  baseline_accuracy: number | null;
+  /** Return from trading the fold's predicted signals on its test rows (null without returns). */
+  trade_return_pct: number | null;
+  hit_rate: number | null;
+  trades: number | null;
+}
+
+export interface TradingSummaryDto {
+  strategy_return_pct: number;
+  buy_hold_return_pct: number;
+  hit_rate: number;
+  trades: number;
+  max_drawdown_pct: number;
+  sharpe: number;
+}
+
+export interface ModelUsageDto {
+  kind: 'automation';
+  id: string;
+  name: string;
+  enabled: boolean;
+  symbol: string;
+}
+
+export interface ModelDetailDto extends MLModelDto {
+  display_name: string;
+  notes: string;
+  tags: string[];
+  source: ActivityActor | 'unknown';
+  hyperparams: Record<string, unknown>;
+  n_splits: number;
+  lag_periods: number[];
+  dataset: string | null;
+  symbols: string[];
+  timeframe: string | null;
+  label: LabelSpecDto | null;
+  rows: number | null;
+  duration_secs: number | null;
+  artifact_bytes: number | null;
+  library_versions: Record<string, string>;
+  /** Empty for models trained before per-fold results were recorded. */
+  cv_folds: CvFoldDto[];
+  /** Empty when the algorithm exposes no importances. */
+  feature_importance: { feature: string; importance: number }[];
+  trading: TradingSummaryDto | null;
+  /** Last lines of the training output. */
+  log_tail: string;
+  used_by: ModelUsageDto[];
+  /** How the evaluation traded the predictions: long/flat, or long and short. */
+  trade_mode: TradeMode;
+  /** Result on the final period that cross-validation never saw; null when no hold-out was set. */
+  holdout: HoldoutDto | null;
+  custom_features: CustomFeatureDto[];
+  context_symbols: string[];
+  fee_pct: number;
+  /** Name of the custom estimator file when algorithm is "custom". */
+  estimator_file: string | null;
+  /** The recipe this model was built from when algorithm is "recipe" (a copy: editing the saved recipe later does not change this model). */
+  recipe: RecipeDto | null;
+}
+
+export type TradeMode = 'long_flat' | 'long_short';
+
+export interface HoldoutDto {
+  rows: number;
+  accuracy: number;
+  baseline_accuracy: number | null;
+  trading: TradingSummaryDto | null;
+}
+
+// ── Custom data and training ─────────────────────────────────────────
+
+export interface ExpressionCheckDto {
+  ok: boolean;
+  error: string | null;
+  /** 0-based character offset of the error in the expression. */
+  error_pos: number | null;
+  /** Bars needed before the first valid value. */
+  warmup_bars: number;
+  /** The last few computed values for the chosen symbol (null = not yet valid). */
+  sample: { time: string; value: number | null }[];
+}
+
+export interface SymbolDataDto {
+  symbol: string;
+  timeframe: string;
+  bars: number;
+  first_time: string | null;
+  last_time: string | null;
+}
+
+export interface ParamDefDto {
+  key: string;
+  label: string;
+  /** "int" | "float" | "bool" | "choice" | "text" */
+  type: string;
+  default: string | number | boolean | null;
+  min?: number | null;
+  max?: number | null;
+  choices?: string[] | null;
+  help: string;
+}
+
+export interface AlgorithmDto {
+  /** e.g. "random_forest", "extra_trees", "custom" */
+  id: string;
+  label: string;
+  description: string;
+  /** Every tunable parameter the library reports for this algorithm, with its default. */
+  params: ParamDefDto[];
+  /** Extra keys outside `params` are still validated against the estimator's constructor. */
+  accepts_extra_params: boolean;
+}
+
+// ── Immutable audit ledger: every change is a new version ─────────────
+
+/** Things that keep a full version history. Nothing here is ever overwritten or erased. */
+export type VersionedKind =
+  | 'strategy' | 'estimator' | 'recipe' | 'dataset' | 'model' | 'automation' | 'notebook'
+  /** The settings file (risk limits, live-trading caps, storage, ...). Secrets are replaced by "<redacted>" in the history. */
+  | 'settings'
+  /** Price alert rules. */
+  | 'alert';
+
+export interface VersionDto {
+  /** Position in the global ledger (1, 2, 3...). */
+  seq: number;
+  kind: VersionedKind;
+  /** Strategy path, estimator/recipe/dataset name, model id, automation id, notebook path. */
+  object_id: string;
+  /** 1, 2, 3... within this object. */
+  version: number;
+  /** "external" = the file was changed outside APEX and was picked up as a new version. */
+  action: 'create' | 'update' | 'delete' | 'restore' | 'external';
+  actor: ActivityActor | 'external';
+  ts: string;
+  /** SHA-256 of the content; null for a delete marker. */
+  content_hash: string | null;
+  size: number;
+  /** True when the ledger holds the content itself. Very large files (datasets) keep only their hash, and the file on disk is write-once. */
+  retained: boolean;
+  parent_version: number | null;
+  /** Set for action "restore": the older version whose content was brought back as this new one. */
+  restored_from: number | null;
+  summary: string;
+  /** Hash of this record, which includes prev_hash: changing any earlier record breaks every later one. */
+  hash: string;
+  prev_hash: string;
+}
+
+export interface VersionContentDto {
+  record: VersionDto;
+  /** The content as text; null when it is binary or deleted. */
+  text: string | null;
+  /** True when the text was cut for display (the stored copy is complete). */
+  truncated: boolean;
+  binary: boolean;
+}
+
+export interface VersionedObjectDto {
+  kind: VersionedKind;
+  object_id: string;
+  head_version: number;
+  /** The current state is a delete marker. The history is still readable and the object can be restored. */
+  deleted: boolean;
+  versions: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LedgerProblemDto {
+  /** "record_hash" | "chain_link" | "blob_missing" | "blob_hash" | "stream_hash" | "stream_link" | "parse" */
+  kind: string;
+  where: string;
+  detail: string;
+}
+
+export interface LedgerVerifyDto {
+  ok: boolean;
+  checked_records: number;
+  checked_blobs: number;
+  checked_events: number;
+  problems: LedgerProblemDto[];
+  head_hash: string | null;
+  verified_at: string;
+}
+
+export interface LedgerStatusDto {
+  /** null = not verified since the app started. */
+  ok: boolean | null;
+  records: number;
+  objects: number;
+  head_hash: string | null;
+  last_verified_at: string | null;
+  /** Latest hash of each event stream ("activity", "orders"): copy these somewhere safe to detect later rewrites. */
+  stream_heads: Record<string, string | null>;
+}
+
+export interface OrderSourceDto {
+  /** "manual" | "copilot" | "automation" | "strategy" | "kill_switch" */
+  kind: string;
+  /** Automation id, strategy path, copilot turn id. */
+  id: string;
+  /** Exact version of the automation / strategy / model that produced the order. */
+  version: number | null;
+  /** Content hash of that version, so the exact code can be fetched from the ledger. */
+  hash: string | null;
+  /** Model version that produced the signal, when one did. */
+  model_id?: string | null;
+}
+
+export interface OrderEventDto {
+  seq: number;
+  ts: string;
+  order_id: string;
+  broker_id: string;
+  /** "submitted" | "risk_accepted" | "risk_rejected" | "broker_ack" | "status" | "fill" | "cancel_requested" | "cancelled" | "modified" | "rejected" | "kill_switch" | "live_armed" | "live_disarmed" */
+  event: string;
+  actor: string;
+  source: OrderSourceDto | null;
+  data: Record<string, unknown>;
+  hash: string;
+  prev_hash: string;
+}
+
+// ── Algorithm recipes: build an algorithm from parts, no code ─────────
+
+/** One preprocessing step, e.g. {kind: "standard_scaler", params: {}}. See recipeBuildingBlocks. */
+export interface RecipeStepDto {
+  kind: string;
+  params: Record<string, unknown>;
+}
+
+/** A member model. `algorithm` is a built-in id (never "custom" or "recipe"). */
+export interface RecipeMemberDto {
+  algorithm: string;
+  params: Record<string, unknown>;
+  /** Voting only; default 1. */
+  weight?: number;
+}
+
+export type RecipeModelDto =
+  | { kind: 'single'; algorithm: string; params: Record<string, unknown> }
+  | { kind: 'voting'; voting: 'soft' | 'hard'; members: RecipeMemberDto[] }
+  /** Time-aware stacking: members are fitted on expanding windows, their out-of-fold predictions train `final`. */
+  | { kind: 'stacking'; members: RecipeMemberDto[]; final: RecipeMemberDto; blocks: number };
+
+export interface RecipeDto {
+  /** [a-z][a-z0-9_]{0,40} */
+  name: string;
+  label: string;
+  description: string;
+  steps: RecipeStepDto[];
+  model: RecipeModelDto;
+  /** Rescale predicted probabilities so "70% sure" means about 70% of the time. */
+  calibrate: 'none' | 'sigmoid' | 'isotonic';
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface RecipeIssueDto {
+  /** Where in the recipe, e.g. "steps[1].params.k" or "model.members[2]". */
+  path: string;
+  message: string;
+}
+
+export interface RecipeCheckDto {
+  ok: boolean;
+  errors: RecipeIssueDto[];
+  warnings: string[];
+  steps: number;
+  /** Number of fitted models (members plus the final estimator for stacking). */
+  models: number;
+  /** Pessimistic size estimate for a typical dataset; null when unknown. */
+  est_model_mb: number | null;
+}
+
+export interface StepKindDto {
+  kind: string;
+  label: string;
+  description: string;
+  /** "scale" | "clean" | "select" | "reduce" */
+  group: string;
+  params: ParamDefDto[];
+}
+
+export interface BuildingBlocksDto {
+  steps: StepKindDto[];
+  /** Algorithms that may be members or the final estimator. */
+  members: { id: string; label: string; description: string }[];
+  limits: { max_steps: number; max_members: number; min_members: number; stacking_blocks: [number, number] };
+}
+
+export interface EstimatorFileDto {
+  name: string;
+  path: string;
+  content: string;
+  updated_at: string;
+}
+
+export interface ModelSignalPointDto {
+  time: string;
+  close: number;
+  signal: number;
+  probability: number | null;
+}
+
+export interface ModelSignalHistoryDto {
+  model_id: string;
+  symbol: string;
+  points: ModelSignalPointDto[];
 }

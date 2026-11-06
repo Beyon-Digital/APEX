@@ -70,3 +70,44 @@ class Actual(Strategy):
 ''')
     with pytest.raises(ValueError, match="long and flat"):
         bar(worker, 10)
+
+
+def test_prefix_sum_indicators_match_the_direct_formulas(tmp_path):
+    """The O(1) prefix-sum SMA/RSI must equal the straightforward slice maths."""
+    import random
+
+    worker = init_worker(tmp_path, '''from apex_sdk import Strategy
+class Actual(Strategy):
+    def on_bar(self, symbol, bar): pass
+''')
+    random.seed(7)
+    price, closes = 100.0, []
+    for index in range(130):
+        price = max(1.0, price + random.uniform(-2, 2))
+        closes.append(price)
+        bar(worker, price, index)
+        for period in (2, 5, 14, 50):
+            got_sma = worker.strategy.indicator("sma", "AAPL", period)
+            if len(closes) >= period:
+                assert got_sma == pytest.approx(sum(closes[-period:]) / period, rel=1e-9)
+            else:
+                assert math.isnan(got_sma)
+            if len(closes) > period:
+                changes = [b - a for a, b in zip(closes[-period - 1:-1], closes[-period:])]
+                gain = sum(max(x, 0) for x in changes) / period
+                loss = sum(max(-x, 0) for x in changes) / period
+                expected = 100 - 100 / (1 + gain / loss) if loss else (100.0 if gain else 50.0)
+                assert worker.strategy.indicator("rsi", "AAPL", period) == pytest.approx(expected, rel=1e-9)
+
+
+def test_many_bars_stay_fast(tmp_path):
+    import time
+
+    worker = init_worker(tmp_path, '''from apex_sdk import Strategy
+class Actual(Strategy):
+    def on_bar(self, symbol, bar): pass
+''')
+    started = time.perf_counter()
+    for index in range(1500):
+        bar(worker, 100 + (index % 7), index)
+    assert time.perf_counter() - started < 5.0

@@ -280,6 +280,9 @@ impl MarketDataPort for YahooFinanceAdapter {
     fn priority(&self) -> u8 {
         0
     }
+    fn releases_on_unsubscribe(&self) -> bool {
+        true
+    }
     async fn subscribe(&self, symbols: &[Symbol]) -> Result<TickStream> {
         let (tx, rx) = mpsc::channel(1024);
         let client = self.client.clone();

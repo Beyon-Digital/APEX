@@ -118,7 +118,18 @@ fn llm_schema(provider_id: &str, name: &str) -> AdapterSchemaDto {
     }
 }
 
+/// Every LLM provider takes exactly one API key. This does not depend on the provider being in
+/// the list loaded at startup, or a provider added in Settings could not get a key until a restart.
+fn llm_provider_fields(adapter_id: &str) -> Option<Vec<AdapterFieldDto>> {
+    adapter_id
+        .strip_prefix("llm:")
+        .map(|provider_id| llm_schema(provider_id, provider_id).fields)
+}
+
 fn allowed_fields(state: &AppState, adapter_id: &str) -> Vec<AdapterFieldDto> {
+    if let Some(fields) = llm_provider_fields(adapter_id) {
+        return fields;
+    }
     adapter_schemas(state)
         .into_iter()
         .find(|s| s.adapter_id == adapter_id)
@@ -148,6 +159,7 @@ fn config_dto(state: &AppState, adapter_id: &str) -> Result<AdapterConfigDto, St
                 serde_json::from_str::<HashMap<String, serde_json::Value>>(&record.settings_json)
                     .unwrap_or_default()
                     .into_iter()
+                    .filter(|(k, _)| !k.ends_with("_expires_at"))
                     .map(|(k, v)| {
                         let text = match v {
                             serde_json::Value::String(s) => s,
@@ -194,13 +206,74 @@ pub async fn save_adapter_config(
     request: SaveAdapterConfigRequest,
     state: State<'_, AppState>,
 ) -> Result<AdapterConfigDto, String> {
+    save_adapter_config_as(&state, request, "user").await
+}
+
+/// Sorted field names, comma separated; `-` when empty.
+fn names(mut fields: Vec<String>) -> String {
+    fields.sort();
+    fields.dedup();
+    if fields.is_empty() { "-".into() } else { fields.join(",") }
+}
+
+/// [`save_adapter_config`] plus the `adapter.save` activity entry: the adapter id and the NAMES of the
+/// fields set or cleared. Values are never logged, and error texts have the secrets of this request
+/// (and URL credentials) removed.
+pub(crate) async fn save_adapter_config_as(
+    state: &AppState,
+    request: SaveAdapterConfigRequest,
+    actor: &str,
+) -> Result<AdapterConfigDto, String> {
+    let adapter_id = request.adapter_id.clone();
+    let enabled = request.enabled;
+    let set_settings = names(request.settings.keys().filter(|k| !k.ends_with("_expires_at")).cloned().collect());
+    let set_secrets = names(request.secrets.iter().filter(|(_, v)| !v.trim().is_empty()).map(|(k, _)| k.clone()).collect());
+    let cleared = names(request.clear_secrets.clone());
+    let secret_values: Vec<String> = request.secrets.values().map(|v| v.trim().to_string()).collect();
+    let result = save_adapter_config_inner(state, request).await;
+    match &result {
+        Ok(_) => crate::activity::record(
+            state,
+            actor,
+            "adapter.save",
+            "system",
+            &adapter_id,
+            &format!("Saved adapter {adapter_id}"),
+            true,
+            Some(format!("enabled={enabled} settings_set={set_settings} secrets_set={set_secrets} secrets_cleared={cleared}")),
+        ),
+        Err(error) => {
+            let secrets: Vec<&str> = secret_values.iter().map(String::as_str).collect();
+            crate::activity::record(
+                state,
+                actor,
+                "adapter.save",
+                "system",
+                &adapter_id,
+                &format!("Could not save adapter {adapter_id}"),
+                false,
+                Some(crate::commands::settings::scrub_error(error, &secrets)),
+            );
+        }
+    }
+    result
+}
+
+async fn save_adapter_config_inner(
+    state: &AppState,
+    request: SaveAdapterConfigRequest,
+) -> Result<AdapterConfigDto, String> {
+    let mut request = request;
+    // Keys the app manages itself (such as a login token's expiry) can come back from
+    // the form; they are not editable fields, so drop them instead of rejecting the save.
+    request.settings.retain(|key, _| !key.ends_with("_expires_at"));
     let adapter_id = request.adapter_id.as_str();
     validation::validate_adapter_id(adapter_id)?;
     if !state.vault.is_unlocked() {
         return Err("Vault is locked. Unlock it to change adapter credentials.".into());
     }
 
-    let fields = allowed_fields(&state, adapter_id);
+    let fields = allowed_fields(state, adapter_id);
     let kind_of = |key: &str| fields.iter().find(|f| f.key == key).map(|f| f.kind.as_str());
 
     for (key, value) in request.settings.iter().chain(request.secrets.iter()) {
@@ -249,7 +322,7 @@ pub async fn save_adapter_config(
     if !adapter_id.starts_with("llm:") {
         state.apply_broker(adapter_id).await.map_err(|e| e.to_string())?;
     }
-    config_dto(&state, adapter_id)
+    config_dto(state, adapter_id)
 }
 
 #[tauri::command]
@@ -258,20 +331,49 @@ pub async fn set_adapter_enabled(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<AdapterConfigDto, String> {
-    validation::validate_adapter_id(&adapter_id)?;
+    set_adapter_enabled_as(&state, adapter_id, enabled, "user").await
+}
+
+/// [`set_adapter_enabled`] plus the `adapter.enable` activity entry (id and the new state only).
+pub(crate) async fn set_adapter_enabled_as(
+    state: &AppState,
+    adapter_id: String,
+    enabled: bool,
+    actor: &str,
+) -> Result<AdapterConfigDto, String> {
+    let result = set_adapter_enabled_inner(state, &adapter_id, enabled).await;
+    let word = if enabled { "enabled" } else { "disabled" };
+    match &result {
+        Ok(_) => crate::activity::record(state, actor, "adapter.enable", "system", &adapter_id, &format!("Adapter {adapter_id} {word}"), true, Some(format!("enabled={enabled}"))),
+        Err(error) => crate::activity::record(
+            state,
+            actor,
+            "adapter.enable",
+            "system",
+            &adapter_id,
+            &format!("Could not set adapter {adapter_id} to {word}"),
+            false,
+            Some(crate::commands::settings::scrub_error(error, &[])),
+        ),
+    }
+    result
+}
+
+async fn set_adapter_enabled_inner(state: &AppState, adapter_id: &str, enabled: bool) -> Result<AdapterConfigDto, String> {
+    validation::validate_adapter_id(adapter_id)?;
     if !state.vault.is_unlocked() {
         return Err("Vault is locked".into());
     }
     let settings = state
         .vault
-        .get_config(&adapter_id)?
+        .get_config(adapter_id)?
         .map(|c| c.settings_json)
         .unwrap_or_else(|| "{}".into());
-    state.vault.set_config(&adapter_id, enabled, &settings)?;
+    state.vault.set_config(adapter_id, enabled, &settings)?;
     if !adapter_id.starts_with("llm:") {
-        state.apply_broker(&adapter_id).await.map_err(|e| e.to_string())?;
+        state.apply_broker(adapter_id).await.map_err(|e| e.to_string())?;
     }
-    config_dto(&state, &adapter_id)
+    config_dto(state, adapter_id)
 }
 
 /// Remove an adapter's configuration and every stored secret.
@@ -280,10 +382,47 @@ pub async fn delete_adapter_config(
     adapter_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    validation::validate_adapter_id(&adapter_id)?;
-    state.vault.delete_adapter(&adapter_id)?;
+    delete_adapter_config_as(&state, adapter_id, "user").await
+}
+
+/// [`delete_adapter_config`] plus the `adapter.delete` activity entry: the adapter id and the names of
+/// the secret fields that were stored (never their values).
+pub(crate) async fn delete_adapter_config_as(state: &AppState, adapter_id: String, actor: &str) -> Result<(), String> {
+    let stored = state.vault.secret_fields(&adapter_id).unwrap_or_default();
+    let result = delete_adapter_config_inner(state, &adapter_id).await;
+    match &result {
+        Ok(()) => crate::activity::record(
+            state,
+            actor,
+            "adapter.delete",
+            "system",
+            &adapter_id,
+            &format!("Removed adapter {adapter_id} and its stored credentials"),
+            true,
+            Some(format!("secrets_removed={}", names(stored))),
+        ),
+        Err(error) => crate::activity::record(
+            state,
+            actor,
+            "adapter.delete",
+            "system",
+            &adapter_id,
+            &format!("Could not remove adapter {adapter_id}"),
+            false,
+            Some(crate::commands::settings::scrub_error(error, &[])),
+        ),
+    }
+    result
+}
+
+async fn delete_adapter_config_inner(state: &AppState, adapter_id: &str) -> Result<(), String> {
+    validation::validate_adapter_id(adapter_id)?;
+    if !state.vault.is_unlocked() {
+        return Err("Vault is locked. Unlock it to remove credentials.".into());
+    }
+    state.vault.delete_adapter(adapter_id)?;
     if !adapter_id.starts_with("llm:") {
-        state.reset_broker(&adapter_id).await.map_err(|e| e.to_string())?;
+        state.reset_broker(adapter_id).await.map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -333,4 +472,18 @@ pub async fn test_adapter_connection(
         connection.authenticated,
         connection.message,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn any_llm_provider_id_accepts_an_api_key_but_brokers_do_not_match() {
+        let fields = llm_provider_fields("llm:brand-new-provider").expect("llm ids take a key");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].key, "api_key");
+        assert_eq!(fields[0].kind, "secret");
+        assert!(llm_provider_fields("zerodha").is_none());
+    }
 }

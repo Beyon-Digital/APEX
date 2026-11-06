@@ -1,3 +1,4 @@
+import { SymbolField } from '../common/SymbolField';
 import { formatProfitFactor } from '../../lib/format';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createChart } from 'lightweight-charts';
@@ -5,6 +6,7 @@ import type { IChartApi, UTCTimestamp } from 'lightweight-charts';
 import { listStrategyFiles, runStrategyBacktest } from '../../lib/tauri';
 import type { StrategyBacktestResultDto, StrategyFileDto } from '../../lib/types';
 import { useMarketStore } from '../../stores/marketStore';
+import { useArtifactStore } from '../../stores/artifactStore';
 import { chartTheme, useThemeTick, withAlpha } from '../../lib/chartTheme';
 
 const TF_OPTIONS = ['d1', '1h', '15m', '5m', '1m', 'w1'];
@@ -119,16 +121,19 @@ export const BacktestPanel: React.FC<{ defaultSymbol?: string }> = ({ defaultSym
             : !Number.isFinite(capital) || capital <= 0 ? 'Initial capital must be greater than zero.'
               : null);
 
+  // Refetches when any strategy file is created, saved or deleted (by the Copilot, the IDE...).
+  const strategyVersion = useArtifactStore((s) => s.versions.strategy);
   useEffect(() => {
     listStrategyFiles()
       .then((files) => {
         setStrategies(files);
+        setLoadError(null);
         if (!path && files.length > 0) setPath(files[0].path);
       })
       .catch((err) => { setStrategies([]); setLoadError(err instanceof Error ? err.message : 'Could not load strategy files.'); })
       .finally(() => setLoadingStrategies(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [strategyVersion]);
 
   const run = useCallback(async () => {
     if (validation || busy) return;
@@ -191,7 +196,7 @@ export const BacktestPanel: React.FC<{ defaultSymbol?: string }> = ({ defaultSym
             </select>
           </label>
           <label className="text-xs text-text-secondary">Symbol
-            <input value={symbol} onChange={(e) => setSymbol(e.target.value)} placeholder="e.g. BTC-USD" className={`${inputCls} mt-1 w-full font-mono`} data-testid="backtest-symbol" />
+            <SymbolField value={symbol} onChange={setSymbol} placeholder="e.g. BTC-USD" className={`${inputCls} mt-1 w-full font-mono`} testId="backtest-symbol" />
           </label>
           <label className="text-xs text-text-secondary">Timeframe
             <select value={timeframe} onChange={(e) => setTimeframe(e.target.value)} className={`${inputCls} mt-1 w-full`} data-testid="backtest-timeframe">

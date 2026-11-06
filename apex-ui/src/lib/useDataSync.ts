@@ -4,9 +4,12 @@ import { useOrderStore } from '../stores/orderStore';
 import { useRiskStore } from '../stores/riskStore';
 import { useBrokerStore } from '../stores/brokerStore';
 import { useLiveStore } from '../stores/liveStore';
-import { getQuote, subscribeSymbols, unsubscribeSymbols, getPositions, getOpenOrders, getRiskStatus, getAccountBalance, listBrokerConnections, getLiveStatus } from './tauri';
+import { getQuote, subscribeSymbols, unsubscribeSymbols, setSymbolProvider, getPositions, getOpenOrders, getRiskStatus, getAccountBalance, listBrokerConnections, getLiveStatus } from './tauri';
 
 const POLL_INTERVAL_MS = 3000;
+
+/** Index and macro symbols other panels (ticker tape, Market tab) keep streaming. */
+const SHARED_SYMBOLS = new Set(['^GSPC', '^IXIC', '^DJI', '^NSEI', 'BTC-USD', 'ETH-USD', 'GC=F', 'CL=F', 'EURUSD=X', 'USDINR=X']);
 
 /**
  * Hook that initializes data subscriptions and polling on mount.
@@ -25,6 +28,8 @@ export function useDataSync() {
   const activeBrokerId = useBrokerStore((s) => s.activeBrokerId);
   const setLiveStatus = useLiveStore((s) => s.setStatus);
   const subscribedRef = useRef<Set<string>>(new Set());
+  const appliedPrefsRef = useRef<Record<string, string>>({});
+  const providerPrefs = useMarketStore((s) => s.providerPrefs);
 
   // Keep backend subscriptions in step with the watchlist: new symbols are
   // subscribed as they are added, removed ones are released.
@@ -43,7 +48,11 @@ export function useDataSync() {
     }
     if (removed.length > 0) {
       removed.forEach((symbol) => subscribed.delete(symbol));
-      unsubscribeSymbols(removed).catch((err) => console.warn('[DataSync] unsubscribe failed:', err));
+      // The ticker tape and Market tab share these quotes; dropping one would blank them.
+      const releasable = removed.filter((symbol) => !SHARED_SYMBOLS.has(symbol));
+      if (releasable.length > 0) {
+        unsubscribeSymbols(releasable).catch((err) => console.warn('[DataSync] unsubscribe failed:', err));
+      }
     }
   }, [watchlist]);
 
@@ -66,6 +75,24 @@ export function useDataSync() {
     const id = setInterval(poll, POLL_INTERVAL_MS);
     return () => clearInterval(id);
   }, [watchlist, updateQuote]);
+
+  // Re-apply pinned data feeds (the backend forgets them on restart).
+  useEffect(() => {
+    const applied = appliedPrefsRef.current;
+    const onWatchlist = new Set(useMarketStore.getState().watchlist);
+    for (const [symbol, adapter] of Object.entries(providerPrefs)) {
+      if (!onWatchlist.has(symbol)) continue; // a stale pin must not re-subscribe a removed symbol
+      if (applied[symbol] === adapter) continue;
+      applied[symbol] = adapter;
+      setSymbolProvider(symbol, adapter).catch((err) => {
+        delete applied[symbol];
+        console.warn('[DataSync] could not pin data feed:', err);
+      });
+    }
+    for (const symbol of Object.keys(applied)) {
+      if (!(symbol in providerPrefs)) delete applied[symbol];
+    }
+  }, [providerPrefs]);
 
   // Poll live-trading safeguards (armed state, daily order budget, halt).
   useEffect(() => {

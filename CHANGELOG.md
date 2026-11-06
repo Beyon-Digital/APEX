@@ -6,6 +6,14 @@ The format is based on "Keep a Changelog" and this project adheres to [Semantic 
 
 ## [Unreleased]
 
+### Added (algo trading, copilot, ChatGPT sign-in, UX)
+- **Sign in with ChatGPT**: the Copilot can run on a ChatGPT Plus/Pro/Go plan allowance using OpenAI's documented open-source flow (OAuth + PKCE with dynamic client registration, loopback callback, verified ID token, rotating refresh tokens kept encrypted in the vault). Plan-backed requests use the Responses endpoint with the documented constraints and map OpenAI's usage-limit errors to plain messages.
+- **Strategies can trade live**: sessions take a broker, size and duration; live runs need the config opt-in, a connected account and armed live trading, and every order passes the live guard. Indicators are warmed up on history, logs stream as they happen, and session state (position, bars, orders, errors) is visible. Positions are tracked per broker.
+- **Safer automations**: fresh daily data with a staleness check, long/flat position awareness (no pyramiding, no shorting), quote subscription for paper orders, connected-broker precheck, startup grace, and the kill switch pauses them.
+- **Copilot**: new tools (status, brokers, balances, holdings, symbol search, watchlist, strategy sessions start/stop, modify order, kill switch), a richer system prompt, approval cards that show side/quantity/price/broker, single-use per-turn approvals, and no silent file overwrite.
+- **Per-ticker data feed**: a SRC badge in the Watchlist shows which feed serves each ticker and lets you pin another; unavailable feeds say why.
+- **Settings** is now five short tabs (Accounts, Market data, AI Copilot, Trading, General) with collapsible adapter rows; dead controls removed. Ticker fields in the order ticket, alerts, backtests and automations suggest symbols as you type.
+
 ### Added
 - **Encrypted credential vault**: broker and AI API keys are entered in the app (Settings > Adapters & API keys) and stored in `vault.db`, encrypted with a passphrase-derived key (Argon2id + XChaCha20-Poly1305). Adapters are built from the vault and hot-added, replaced or removed at runtime with no restart; locking the vault drops every in-memory credential. A one-time "Import .env" command migrates old env files. Env-var credentials are no longer read.
 - **Live Zerodha Kite**: form-encoded orders with correct SL/SL-M mapping, product/exchange/variety, order history and status mapping, positions, holdings, margins and P&L; instruments master; KiteTicker WebSocket (binary packets, order postbacks) with batched REST fallback; token-based historical candles; rate limiting, retries and `TokenException` handling; daily login flow with token persisted until 06:00 IST.

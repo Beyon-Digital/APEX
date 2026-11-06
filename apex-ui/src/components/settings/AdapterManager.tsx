@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   clearBrokerSession, deleteAdapterConfig, getAdapterConfigs, importEnvCredentials, listAdapterSchemas,
   listBrokerConnections, saveAdapterConfig, setAdapterEnabled, testAdapterConnection, vaultLock, vaultStatus,
-  zerodhaLogin, zerodhaLoginUrl,
+  openExternalUrl, zerodhaLogin, zerodhaLoginUrl,
 } from '../../lib/tauri';
 import type { AdapterConfigDto, AdapterSchemaDto, AdapterTestResultDto, BrokerConnectionDto } from '../../lib/types';
 import { useBrokerStore } from '../../stores/brokerStore';
@@ -33,8 +33,19 @@ const AdapterCard: React.FC<CardProps> = ({ schema, config, connection, vaultUnl
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
   const [testResult, setTestResult] = useState<AdapterTestResultDto | null>(null);
+  // Rows start collapsed so the Accounts tab is a short list, not a wall of fields.
+  const [expanded, setExpanded] = useState(false);
 
-  useEffect(() => setSettings(config.settings), [config.settings]);
+  // Reset only when the saved values really change, not whenever another card triggers a reload.
+  const savedSettingsKey = JSON.stringify(config.settings);
+  useEffect(() => setSettings(config.settings), [savedSettingsKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Typed-but-unsaved secrets must not outlive the vault being locked.
+  useEffect(() => {
+    if (!vaultUnlocked) {
+      setSecrets({});
+      setCleared([]);
+    }
+  }, [vaultUnlocked]);
 
   const dirty = Object.values(secrets).some((v) => v.trim() !== '')
     || cleared.length > 0
@@ -82,7 +93,18 @@ const AdapterCard: React.FC<CardProps> = ({ schema, config, connection, vaultUnl
   return (
     <div className="border border-[var(--border-color)] bg-surface-0 p-3" data-testid={`adapter-card-${id}`}>
       <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
+        <button
+          type="button"
+          onClick={() => setExpanded((open) => !open)}
+          aria-expanded={expanded}
+          aria-controls={`adapter-body-${id}`}
+          data-testid={`adapter-expand-${id}`}
+          className="mt-0.5 w-4 shrink-0 text-left text-xs text-text-muted hover:text-accent"
+          title={expanded ? 'Collapse' : 'Set up'}
+        >
+          {expanded ? '▾' : '▸'}
+        </button>
+        <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <h5 className="text-xs font-semibold text-text-primary">{schema.display_name}</h5>
             <span className="border border-[var(--border-color)] px-1 text-[9px] uppercase tracking-wider text-text-muted">{schema.category}</span>
@@ -92,7 +114,10 @@ const AdapterCard: React.FC<CardProps> = ({ schema, config, connection, vaultUnl
               </span>
             )}
           </div>
-          <p className="mt-1 text-[11px] text-text-muted">{schema.description}</p>
+          <p className="mt-1 text-[11px] text-text-muted">
+            {expanded ? schema.description : (hasAnySecret ? 'Keys saved.' : 'Not set up.')}{' '}
+            {!expanded && <button type="button" onClick={() => setExpanded(true)} className="underline hover:text-text-primary">{hasAnySecret ? 'Edit' : 'Set up'}</button>}
+          </p>
         </div>
         <label className="flex shrink-0 items-center gap-1.5 text-[11px] text-text-secondary">
           <input type="checkbox" checked={config.enabled} disabled={busy || !vaultUnlocked} onChange={() => void toggleEnabled()} data-testid={`adapter-enabled-${id}`} />
@@ -100,6 +125,14 @@ const AdapterCard: React.FC<CardProps> = ({ schema, config, connection, vaultUnl
         </label>
       </div>
 
+      {expanded && (<div id={`adapter-body-${id}`}>
+      {!vaultUnlocked && (
+        <div className="mt-3 flex items-center justify-between gap-3 border border-warning/50 bg-surface-1 px-2 py-1.5 text-[11px] text-warning" data-testid={`adapter-locked-${id}`}>
+          <span>The credential vault is locked, so these fields are read-only.</span>
+          <button type="button" onClick={() => useVaultStore.setState({ dismissed: false })} data-testid={`adapter-unlock-${id}`}
+            className="shrink-0 border border-accent px-2 py-0.5 text-accent hover:bg-accent/10">Unlock vault…</button>
+        </div>
+      )}
       <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2">
         {schema.fields.map((field) => {
           const testId = `adapter-field-${id}-${field.key}`;
@@ -124,11 +157,17 @@ const AdapterCard: React.FC<CardProps> = ({ schema, config, connection, vaultUnl
                 value={isSecret ? secrets[field.key] ?? '' : settings[field.key] ?? ''}
                 placeholder={stored ? '•••••••• saved' : field.help || field.label}
                 data-testid={testId}
-                disabled={!vaultUnlocked}
-                onChange={(e) => (isSecret
-                  ? setSecrets({ ...secrets, [field.key]: e.target.value })
-                  : setSettings({ ...settings, [field.key]: e.target.value }))}
-                className="mt-1 w-full min-w-0 border border-[var(--border-color)] bg-surface-1 px-2 py-1 font-mono text-xs text-text-primary focus:border-accent focus:outline-none disabled:opacity-50"
+                // readOnly, not disabled: a disabled input cannot be focused, so a locked vault
+                // looked like a broken form. Read-only fields still take focus and show why.
+                readOnly={!vaultUnlocked}
+                aria-readonly={!vaultUnlocked}
+                title={vaultUnlocked ? undefined : 'Unlock the vault to edit credentials'}
+                onChange={(e) => {
+                  if (!vaultUnlocked) return;
+                  if (isSecret) setSecrets({ ...secrets, [field.key]: e.target.value });
+                  else setSettings({ ...settings, [field.key]: e.target.value });
+                }}
+                className="mt-1 w-full min-w-0 border border-[var(--border-color)] bg-surface-1 px-2 py-1 font-mono text-xs text-text-primary focus:border-accent focus:outline-none read-only:opacity-60"
               />
               {stored && (
                 <button type="button" className="mt-0.5 text-[10px] text-text-muted underline hover:text-bear"
@@ -159,6 +198,7 @@ const AdapterCard: React.FC<CardProps> = ({ schema, config, connection, vaultUnl
         {notice && <span className={`text-[11px] ${notice.ok ? 'text-bull' : 'text-bear'}`} role="status" data-testid={`adapter-notice-${id}`}>{notice.text}</span>}
         {testResult && <span className={`text-[11px] ${testResult.ok ? 'text-bull' : 'text-warning'}`} data-testid={`adapter-test-result-${id}`}>{testResult.message}</span>}
       </div>
+      </div>)}
     </div>
   );
 };
@@ -173,7 +213,7 @@ const ZerodhaLogin: React.FC<{ ready: boolean; connection?: BrokerConnectionDto;
     try {
       const loginUrl = await zerodhaLoginUrl();
       setUrl(loginUrl);
-      window.open(loginUrl, '_blank', 'noopener');
+      await openExternalUrl(loginUrl);
     } catch (err) {
       setNotice({ ok: false, text: errorText(err) });
     }

@@ -10,9 +10,16 @@ import {
   runStrategyFile,
   stopStrategyFile,
   listStrategySessions,
+  listStrategySessionDetails,
   saveStrategyFile,
 } from '../../lib/tauri';
-import type { StrategyBacktestRequestDto, StrategyBacktestResultDto, StrategyExecutionResultDto } from '../../lib/types';
+import type { StrategyBacktestRequestDto, StrategyBacktestResultDto, StrategyExecutionResultDto, StrategySessionInfoDto } from '../../lib/types';
+import { useBrokerStore } from '../../stores/brokerStore';
+import { touchedKey, useArtifactStore } from '../../stores/artifactStore';
+import { useNavStore } from '../../stores/navStore';
+import { SymbolField } from '../common/SymbolField';
+import { VersionHistory } from '../audit/VersionHistory';
+import { DeletedObjects } from '../audit/DeletedObjects';
 
 type EditorInstance = editor.IStandaloneCodeEditor;
 
@@ -125,13 +132,56 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
   onSave,
   metrics,
 }) => {
-  const [files, setFiles] = useState<StrategyFile[]>(initialFiles ?? DEFAULT_FILES);
-  const [activeFileIndex, setActiveFileIndex] = useState(0);
+  const [files, rawSetFiles] = useState<StrategyFile[]>(initialFiles ?? DEFAULT_FILES);
+  const [activeFileIndex, rawSetActiveFileIndex] = useState(0);
+  // The latest files / selection, updated in the same tick as the state. Background refreshes read these
+  // (React may not have re-rendered yet when a refetch lands) so they never merge into a stale list.
+  const filesRef = useRef(files);
+  const activeIndexRef = useRef(activeFileIndex);
+  const setFiles = useCallback((update: StrategyFile[] | ((prev: StrategyFile[]) => StrategyFile[])) => {
+    const next = typeof update === 'function' ? update(filesRef.current) : update;
+    filesRef.current = next;
+    rawSetFiles(next);
+  }, []);
+  const setActiveFileIndex = useCallback((update: number | ((prev: number) => number)) => {
+    const next = typeof update === 'function' ? update(activeIndexRef.current) : update;
+    activeIndexRef.current = next;
+    rawSetActiveFileIndex(next);
+  }, []);
   const [activeSessions, setActiveSessions] = useState<string[]>([]);
   const runningPathRef = useRef<string | null>(null);
   const [runState, setRunState] = useState<RunState>('idle');
   const [paperQuantity, setPaperQuantity] = useState(1);
+  const [runBroker, setRunBroker] = useState('paper');
+  const [runMinutes, setRunMinutes] = useState(30);
+  // A live run needs a second click; it disarms itself so a stray click cannot start it later.
+  const [liveRunPending, setLiveRunPending] = useState(false);
+  const [sessionDetails, setSessionDetails] = useState<StrategySessionInfoDto[]>([]);
+  const brokerConnections = useBrokerStore((s) => s.connections);
+  const runnableBrokers = React.useMemo(
+    () => brokerConnections.filter((b) => b.mode === 'paper' || (b.execution_available && b.authenticated)),
+    [brokerConnections],
+  );
+  const runBrokerInfo = runnableBrokers.find((b) => b.broker_id === runBroker);
+  const runIsLive = runBroker !== 'paper';
+  useEffect(() => {
+    if (runBroker !== 'paper' && !runnableBrokers.some((b) => b.broker_id === runBroker)) setRunBroker('paper');
+  }, [runBroker, runnableBrokers]);
+  useEffect(() => {
+    if (!liveRunPending) return;
+    const timer = setTimeout(() => setLiveRunPending(false), 6000);
+    return () => clearTimeout(timer);
+  }, [liveRunPending]);
   const [output, setOutput] = useState<string[]>([]);
+  /** Last content known to be on disk, per path. A file whose text differs from it has unsaved edits. */
+  const diskRef = useRef<Record<string, string>>({});
+  /** Paths whose on-disk text changed while the user had unsaved edits, mapped to the new disk text. */
+  const [changedOnDisk, setChangedOnDisk] = useState<Record<string, string>>({});
+  const strategyVersion = useArtifactStore((s) => s.versions.strategy);
+  const touched = useArtifactStore((s) => s.copilotTouched);
+  const dismissTouched = useArtifactStore((s) => s.dismissTouched);
+  const navRequest = useNavStore((s) => s.request);
+  const clearNav = useNavStore((s) => s.clear);
   const [saveConfirm, setSaveConfirm] = useState(false);
   const [isLoadingFiles, setIsLoadingFiles] = useState(!initialFiles);
   const [strategyError, setStrategyError] = useState<string | null>(null);
@@ -147,6 +197,11 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
   const saveCurrentFileRef = useRef<() => void>(() => {});
 
   const activeFile = files[activeFileIndex];
+  // The second click confirms what the first click showed: change the file, account,
+  // size or duration in between and the confirmation starts over.
+  useEffect(() => {
+    setLiveRunPending(false);
+  }, [activeFile?.path, runBroker, paperQuantity, runMinutes]);
   const backtestKey = JSON.stringify([activeFile?.path, activeFile?.content, backtestConfig]);
   const backtestValidation = !backtestConfig.symbol.trim() ? 'Enter a symbol.'
     : !backtestConfig.from || !backtestConfig.to ? 'Choose both dates.'
@@ -159,6 +214,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     let disposed = false;
     const refresh = async () => {
       try { const paths = await listStrategySessions(); if (!disposed && Array.isArray(paths)) setActiveSessions(paths); } catch { /* Browser fixtures do not run native sessions. */ }
+      try { const details = await listStrategySessionDetails(); if (!disposed && Array.isArray(details)) setSessionDetails(details); } catch { /* same */ }
     };
     void refresh();
     const timer = setInterval(() => void refresh(), 2000);
@@ -176,7 +232,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
       next[index] = file;
       return next;
     });
-  }, []);
+  }, [setFiles]);
 
   const currentEditorFile = useCallback(() => {
     if (!activeFile) return null;
@@ -189,6 +245,13 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
 
   const persistFile = useCallback(async (file: StrategyFile, showConfirmation = false) => {
     const saved = await saveStrategyFile(file.path, file.content);
+    diskRef.current[saved.path] = saved.content;
+    setChangedOnDisk((prev) => {
+      if (!(saved.path in prev)) return prev;
+      const next = { ...prev };
+      delete next[saved.path];
+      return next;
+    });
     replaceFileInState(saved);
     onSave?.(saved);
     if (showConfirmation) {
@@ -232,6 +295,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
 
   useEffect(() => {
     if (initialFiles) {
+      diskRef.current = Object.fromEntries(initialFiles.map((f) => [f.path, f.content]));
       setFiles(initialFiles);
       setActiveFileIndex(0);
       setIsLoadingFiles(false);
@@ -247,6 +311,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         if (cancelled) return;
 
         if (loadedFiles.length > 0) {
+          diskRef.current = Object.fromEntries(loadedFiles.map((f) => [f.path, f.content]));
           setFiles(loadedFiles);
           setActiveFileIndex((current) => Math.min(current, loadedFiles.length - 1));
         } else {
@@ -269,7 +334,127 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [initialFiles]);
+  }, [initialFiles, setFiles, setActiveFileIndex]);
+
+  /**
+   * Merge the files now on disk into the open list without disturbing the user:
+   * new files are added, clean files pick up outside changes silently, and a file with unsaved
+   * edits is never overwritten (the banner offers Reload / Keep mine instead). The selected file
+   * is followed by path, so inserting or removing other files never moves the selection.
+   */
+  const reconcileFiles = useCallback(async (): Promise<StrategyFile[] | null> => {
+    let fetched: StrategyFile[];
+    try {
+      fetched = await listStrategyFiles();
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(fetched)) return null;
+    const current = filesRef.current;
+    const activePath = current[activeIndexRef.current]?.path;
+    const disk = diskRef.current;
+    const remote = new Map(fetched.map((f) => [f.path, f]));
+    const merged: StrategyFile[] = [];
+    const conflicts: Record<string, string> = {};
+    let changed = false;
+
+    for (const file of current) {
+      const onDisk = remote.get(file.path);
+      const known = file.path in disk;
+      const base = known ? disk[file.path] : file.content;
+      if (!onDisk) {
+        // Gone from disk. Keep it if it was never saved or has unsaved edits; otherwise drop it.
+        if (!known || file.content !== base) merged.push(file);
+        else { changed = true; delete disk[file.path]; }
+        continue;
+      }
+      remote.delete(file.path);
+      if (onDisk.content === base) { merged.push(file); continue; }
+      disk[file.path] = onDisk.content;
+      if (file.content === base) {
+        merged.push({ ...file, content: onDisk.content });
+        changed = true;
+      } else {
+        merged.push(file);
+        if (file.content !== onDisk.content) conflicts[file.path] = onDisk.content;
+      }
+    }
+    for (const file of remote.values()) {
+      disk[file.path] = file.content;
+      merged.push(file);
+      changed = true;
+    }
+
+    if (changed) {
+      setFiles(merged);
+      const nextIndex = activePath ? merged.findIndex((f) => f.path === activePath) : -1;
+      setActiveFileIndex(nextIndex >= 0 ? nextIndex : Math.min(activeIndexRef.current, Math.max(merged.length - 1, 0)));
+    }
+    setChangedOnDisk((prev) => {
+      // Keep conflicts the user has not resolved yet; add or refresh the new ones.
+      const next: Record<string, string> = {};
+      for (const [path, text] of Object.entries(prev)) {
+        const f = merged.find((x) => x.path === path);
+        if (f && f.content !== text) next[path] = text;
+      }
+      Object.assign(next, conflicts);
+      const same = Object.keys(next).length === Object.keys(prev).length
+        && Object.entries(next).every(([k, v]) => prev[k] === v);
+      return same ? prev : next;
+    });
+    return merged;
+  }, [setFiles, setActiveFileIndex]);
+
+  // Strategy files changed elsewhere (the Copilot, another panel): refetch. No polling.
+  const seenVersionRef = useRef(strategyVersion);
+  useEffect(() => {
+    if (strategyVersion === seenVersionRef.current) return;
+    seenVersionRef.current = strategyVersion;
+    if (initialFiles) return;
+    void reconcileFiles();
+  }, [strategyVersion, initialFiles, reconcileFiles]);
+
+  const openFileAt = useCallback((index: number) => {
+    setActiveFileIndex(index);
+    const path = filesRef.current[index]?.path;
+    if (path) dismissTouched('strategy', path);
+  }, [dismissTouched, setActiveFileIndex]);
+
+  // "Open" from the Copilot or the Activity panel: select that file (adding it if it just appeared).
+  const handledNavRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!navRequest || navRequest.kind !== 'strategy' || isLoadingFiles) return;
+    if (handledNavRef.current === navRequest.nonce) return;
+    handledNavRef.current = navRequest.nonce;
+    const { id, nonce } = navRequest;
+    if (!id) { clearNav(nonce); return; }
+    const select = (list: StrategyFile[]) => {
+      const index = list.findIndex((f) => f.path === id);
+      if (index >= 0) openFileAt(index);
+    };
+    if (files.some((f) => f.path === id)) {
+      select(files);
+      clearNav(nonce);
+    } else {
+      void reconcileFiles().then((list) => {
+        if (list) select(list);
+        clearNav(nonce);
+      });
+    }
+  }, [navRequest, isLoadingFiles, files, clearNav, openFileAt, reconcileFiles]);
+
+  const resolveChange = useCallback((path: string, reload: boolean) => {
+    const text = changedOnDisk[path];
+    if (reload && text !== undefined) {
+      setFiles((prev) => prev.map((f) => (f.path === path ? { ...f, content: text } : f)));
+      diskRef.current[path] = text;
+    }
+    setChangedOnDisk((prev) => {
+      const next = { ...prev };
+      delete next[path];
+      return next;
+    });
+  }, [changedOnDisk, setFiles]);
 
   const handleEditorMount: OnMount = useCallback((editor) => {
     editorRef.current = editor;
@@ -287,7 +472,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         return next;
       });
     },
-    [activeFileIndex],
+    [activeFileIndex, setFiles],
   );
 
   const appendOutput = useCallback((line: string) => {
@@ -317,11 +502,11 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     runningPathRef.current = fileToRun.path;
     setRunState('running');
     setStrategyError(null);
-    appendOutput(`[${new Date().toLocaleTimeString()}] ▶ Running ${fileToRun.name}...`);
+    appendOutput(`[${new Date().toLocaleTimeString()}] ▶ Running ${fileToRun.name} on ${runBroker}...`);
 
     try {
       const savedFile = await persistFile(fileToRun);
-      const result = await runStrategyFile(savedFile.path, { quantity: paperQuantity });
+      const result = await runStrategyFile(savedFile.path, { quantity: paperQuantity, broker_id: runBroker, duration_minutes: runMinutes });
       appendResult(result);
       onRun?.(savedFile);
       runningPathRef.current = null;
@@ -336,7 +521,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
       runningPathRef.current = null;
       setRunState('error');
     }
-  }, [appendOutput, appendResult, currentEditorFile, onRun, persistFile, paperQuantity]);
+  }, [appendOutput, appendResult, currentEditorFile, onRun, persistFile, paperQuantity, runBroker, runMinutes]);
 
   const handleStop = useCallback(async () => {
     const path = currentEditorFile()?.path;
@@ -387,7 +572,8 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
       const finalName = name.endsWith('.py') ? name : `${name}.py`;
       try {
         const newFile = await createStrategyFile(`strategies/${finalName}`, DEFAULT_TEMPLATE);
-        setFiles((prev) => [...prev, newFile]);
+        diskRef.current[newFile.path] = newFile.content;
+        setFiles((prev) => [...prev.filter((f) => f.path !== newFile.path), newFile]);
         setActiveFileIndex(files.length);
         setNewFileName('');
         setShowNewFileInput(false);
@@ -398,7 +584,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     } else {
       setShowNewFileInput(true);
     }
-  }, [files.length, showNewFileInput, newFileName]);
+  }, [files.length, showNewFileInput, newFileName, setFiles, setActiveFileIndex]);
 
   // Auto-scroll output
   useEffect(() => {
@@ -412,11 +598,29 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
 
   return (
     <div className="flex flex-1 flex-col h-full min-h-0 min-w-0 bg-surface-0" data-testid="strategy-ide">
-      {activeSessions.length > 0 && <div className="px-4 py-2 text-xs border-b border-[var(--border-color)]" data-testid="paper-strategy-sessions">
-        {activeSessions.map((path) => <div key={path} className="flex items-center justify-between gap-2">
-          <span>Paper running: {path}</span>
-          <button type="button" onClick={() => void stopStrategyFile(path).catch((err) => setStrategyError(String(err)))}>Stop paper session</button>
-        </div>)}
+      {activeSessions.length > 0 && <div className="space-y-1 px-4 py-2 text-xs border-b border-[var(--border-color)]" data-testid="paper-strategy-sessions">
+        {activeSessions.map((path) => {
+          const info = sessionDetails.find((s) => s.path === path);
+          const live = info ? info.broker_id !== 'paper' : false;
+          return (
+            <div key={path} className="flex items-start justify-between gap-3" data-testid={`strategy-session-${path}`}>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`border px-1 text-[9px] font-semibold uppercase tracking-wider ${live ? 'border-bear text-bear' : 'border-[var(--border-color)] text-text-muted'}`}>
+                    {live ? `LIVE ${info?.broker_id}` : 'Paper'}
+                  </span>
+                  <span className="font-mono text-text-primary">{path}</span>
+                  {info && <span className="text-text-muted">
+                    {info.symbol} {info.timeframe} · {info.state} · {info.held ? 'in position' : 'flat'} · {info.bars_processed} bars · {info.orders_placed} orders
+                  </span>}
+                </div>
+                {info?.recent_logs.length ? <div className="mt-0.5 truncate text-[11px] text-text-muted" title={info.recent_logs[info.recent_logs.length - 1]}>{info.recent_logs[info.recent_logs.length - 1]}</div> : null}
+                {info?.last_error && <div className="mt-0.5 text-[11px] text-bear">{info.last_error}</div>}
+              </div>
+              <button type="button" className="shrink-0 border border-[var(--border-color)] px-2 py-0.5 text-text-secondary hover:text-bear" onClick={() => void stopStrategyFile(path).catch((err) => setStrategyError(String(err)))}>Stop</button>
+            </div>
+          );
+        })}
       </div>}
       {/* Toolbar */}
       <div className="px-4 py-3 border-b border-[var(--border-color)] flex flex-wrap items-center justify-between gap-3 bg-surface-1">
@@ -429,17 +633,34 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <label className="flex items-center gap-2 text-xs text-text-secondary">
-            Paper size
+            Account
+            <select value={runBroker} onChange={(event) => { setRunBroker(event.target.value); setLiveRunPending(false); }}
+              className="rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1 text-text-primary" data-testid="strategy-run-broker">
+              {runnableBrokers.map((b) => <option key={b.broker_id} value={b.broker_id}>{b.mode === 'paper' ? 'Paper (simulated)' : `LIVE ${b.display_name}`}</option>)}
+              {runnableBrokers.length === 0 && <option value="paper">Paper (simulated)</option>}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-text-secondary">
+            Size
             <input type="number" min="0" step="any" value={paperQuantity} onChange={(event) => setPaperQuantity(Number(event.target.value))} className="w-16 rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1 text-text-primary" data-testid="paper-strategy-quantity" />
+          </label>
+          <label className="flex items-center gap-2 text-xs text-text-secondary" title="The session stops itself after this long (1-1440)">
+            Minutes
+            <input type="number" min="1" max="1440" step="1" value={runMinutes} onChange={(event) => setRunMinutes(Math.max(1, Math.min(1440, Math.round(Number(event.target.value) || 30))))} className="w-16 rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1 text-text-primary" data-testid="strategy-run-minutes" />
           </label>
           <button
             type="button"
-            onClick={() => void handleRun()}
+            onClick={() => {
+              if (runIsLive && !liveRunPending) { setLiveRunPending(true); return; }
+              setLiveRunPending(false);
+              void handleRun();
+            }}
             disabled={isLoadingFiles || !activeFile || !Number.isFinite(paperQuantity) || paperQuantity <= 0 || activeSessions.includes(activeFile.path) || runningPathRef.current === activeFile.path}
             data-testid="execute-strategy"
-            className="px-4 py-2 text-xs font-medium rounded bg-bull text-on-bull hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className={`px-4 py-2 text-xs font-medium rounded hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${runIsLive ? 'bg-bear text-on-bear' : 'bg-bull text-on-bull'}`}
+            title={runIsLive ? `Places REAL orders on ${runBrokerInfo?.display_name ?? runBroker}. Needs live trading armed; the order and daily caps apply.` : undefined}
           >
-            Run paper
+            {!runIsLive ? 'Run paper' : liveRunPending ? `Confirm: trade LIVE on ${runBrokerInfo?.display_name ?? runBroker}` : `Run LIVE on ${runBrokerInfo?.display_name ?? runBroker}`}
           </button>
           <button
             type="button"
@@ -474,6 +695,35 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
 
       {saveConfirm && (
         <div className="px-3 py-1 text-xs text-bull bg-bull/10" data-testid="save-confirmation">File saved</div>
+      )}
+
+      {activeFile && changedOnDisk[activeFile.path] !== undefined && (
+        <div
+          className="flex items-center gap-3 border-b border-warning/40 bg-warning/10 px-3 py-1 text-xs text-warning"
+          data-testid="copilot-changed-banner"
+        >
+          <span className="min-w-0 flex-1 truncate">
+            Changed by Copilot: {activeFile.name} was updated on disk, and you have unsaved edits.
+          </span>
+          <button
+            type="button"
+            onClick={() => resolveChange(activeFile.path, true)}
+            className="shrink-0 border border-warning/60 px-2 py-px font-mono text-[10px] hover:bg-warning/20"
+            title="Discard your edits and load the new version"
+            data-testid="copilot-changed-reload"
+          >
+            Reload
+          </button>
+          <button
+            type="button"
+            onClick={() => resolveChange(activeFile.path, false)}
+            className="shrink-0 border border-[var(--border-color)] px-2 py-px font-mono text-[10px] text-text-secondary hover:bg-surface-3"
+            title="Keep your edits; saving will overwrite the new version"
+            data-testid="copilot-changed-keep"
+          >
+            Keep mine
+          </button>
+        </div>
       )}
 
 
@@ -523,7 +773,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
               <button
                 key={file.path}
                 type="button"
-                onClick={() => setActiveFileIndex(idx)}
+                onClick={() => openFileAt(idx)}
                 data-testid={`file-${file.name}`}
                 aria-current={idx === activeFileIndex ? 'true' : undefined}
                 className={`w-full text-left px-3 py-2 text-xs font-mono rounded truncate transition-colors strategy-file-item ${
@@ -532,9 +782,24 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
                     : 'text-text-secondary hover:bg-surface-2'
                 }`}
               >
-                {file.name}{activeSessions.includes(file.path) ? ' · running' : ''}
+                <span className="flex items-center gap-1.5">
+                  <span className="min-w-0 truncate">{file.name}{activeSessions.includes(file.path) ? ' · running' : ''}</span>
+                  {touched[touchedKey('strategy', file.path)] !== undefined && (
+                    <span
+                      className="shrink-0 border border-accent/60 bg-accent/10 px-1 text-[9px] font-semibold uppercase tracking-wider text-accent"
+                      title="Created or changed by the Copilot"
+                      data-testid={`copilot-badge-${file.name}`}
+                    >
+                      Copilot
+                    </span>
+                  )}
+                </span>
               </button>
             ))}
+          </div>
+
+          <div className="shrink-0 border-t border-[var(--border-color)] px-2 py-1.5">
+            <DeletedObjects kind="strategy" />
           </div>
 
           {/* Live metrics */}
@@ -572,7 +837,10 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
               <div className="truncate text-xs font-medium text-text-primary">{activeFile?.name ?? 'Choose a strategy'}</div>
               <div className="truncate text-[11px] text-text-muted">{activeFile?.path ?? 'Create or select a file to begin'}</div>
             </div>
-            <span className="shrink-0 text-xs text-text-muted">Python</span>
+            <div className="flex shrink-0 items-center gap-2">
+              {activeFile && <VersionHistory kind="strategy" id={activeFile.path} buttonLabel="History" className="rounded border border-[var(--border-color)] px-2 py-0.5 text-xs text-text-secondary hover:bg-surface-2" />}
+              <span className="text-xs text-text-muted">Python</span>
+            </div>
           </div>
 
           <details className="shrink-0 border-b border-[var(--border-color)] bg-surface-1/70" data-testid="strategy-backtest-panel">
@@ -599,12 +867,11 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
           <label className="text-xs text-text-secondary">
             <span className="mb-1 block">Symbol</span>
-            <input
-              type="text"
+            <SymbolField
               value={backtestConfig.symbol}
-              onChange={(e) => setBacktestConfig((prev) => ({ ...prev, symbol: e.target.value.toUpperCase() }))}
+              onChange={(v) => setBacktestConfig((prev) => ({ ...prev, symbol: v.toUpperCase() }))}
               className="w-full rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1 font-mono text-xs text-text-primary"
-              data-testid="backtest-symbol-input"
+              testId="backtest-symbol-input"
             />
           </label>
           <label className="text-xs text-text-secondary">

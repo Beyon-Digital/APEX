@@ -109,6 +109,11 @@ impl MarketDataPort for ZerodhaKiteAdapter {
         self.is_authenticated()
     }
 
+    /// Stop the KiteTicker task and forget the access token.
+    fn shutdown(&self) {
+        self.hub.shutdown();
+    }
+
     fn supports_symbol(&self, symbol: &Symbol) -> bool {
         if is_explicit_indian_symbol(&symbol.0) {
             return true;

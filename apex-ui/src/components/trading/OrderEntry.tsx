@@ -1,9 +1,11 @@
 import React, { useState, useCallback, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { formatPrice } from '../../lib/format';
 import { placeOrder, previewOrder, setLiveArmed } from '../../lib/tauri';
 import type { NewOrderRequestDto, OrderPreviewDto } from '../../lib/types';
 import { useBrokerStore } from '../../stores/brokerStore';
 import { useLiveStore } from '../../stores/liveStore';
+import { SymbolField } from '../common/SymbolField';
 
 interface OrderEntryProps {
   defaultSymbol?: string;
@@ -157,8 +159,7 @@ export const OrderEntry: React.FC<OrderEntryProps> = ({ defaultSymbol }) => {
 
       <div className="mt-3 grid grid-cols-2 gap-x-2 gap-y-2">
         <label className="min-w-0 text-xs text-text-secondary">Symbol
-          <input type="text" value={symbol} onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-            aria-label="Symbol" placeholder="Symbol" data-testid="order-symbol-input"
+          <SymbolField value={symbol} onChange={(v) => setSymbol(v.toUpperCase())} ariaLabel="Symbol" placeholder="Symbol" testId="order-symbol-input"
             className="mt-1 w-full min-w-0 rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1.5 font-mono text-sm text-text-primary focus:border-accent focus:outline-none" />
         </label>
         <label className="min-w-0 text-xs text-text-secondary">Quantity
@@ -207,8 +208,8 @@ export const OrderEntry: React.FC<OrderEntryProps> = ({ defaultSymbol }) => {
         className={`mt-3 shrink-0 rounded py-2 text-sm font-semibold ${side === 'BUY' ? 'bg-bull text-on-bull hover:brightness-110' : 'bg-bear text-on-bear hover:brightness-110'} transition-colors disabled:cursor-not-allowed disabled:opacity-50`}>
         {status.type === 'submitting' ? 'Submitting…' : `${side === 'BUY' ? 'Buy' : 'Sell'} ${symbol.trim() || '…'}`}
       </button>
-      {confirming && (
-        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70" role="dialog" aria-modal="true" aria-label="Confirm live order" data-testid="order-confirm-dialog">
+      {confirming && createPortal(
+        <div className="fixed inset-0 z-[90] flex items-center justify-center overflow-auto bg-black/70 p-4" role="dialog" aria-modal="true" aria-label="Confirm live order" data-testid="order-confirm-dialog">
           <div className="w-[380px] max-w-[92vw] border border-bear bg-surface-1 p-4">
             <h3 className="text-sm font-semibold uppercase tracking-wider text-bear">Confirm live order</h3>
             <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 font-mono text-xs">
@@ -231,7 +232,7 @@ export const OrderEntry: React.FC<OrderEntryProps> = ({ defaultSymbol }) => {
             </div>
           </div>
         </div>
-      )}
+      , document.body)}
     </form>
   );
 };

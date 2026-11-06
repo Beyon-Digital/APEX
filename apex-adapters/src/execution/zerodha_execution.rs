@@ -11,7 +11,7 @@ use tracing::{debug, info};
 
 use crate::kite::instruments::InstrumentMaster;
 use crate::kite::orders::{kite_order_type, order_from_json};
-use crate::kite::{parse_symbol, to_apex_symbol, Bucket, KiteSession};
+use crate::kite::{parse_symbol, to_apex_symbol, AmbiguousOutcome, Bucket, KiteSession};
 
 /// Zerodha Kite execution adapter
 ///
@@ -73,14 +73,19 @@ impl ZerodhaExecutionAdapter {
         }
     }
 
-    /// Kite tags are alphanumeric and at most 20 characters.
-    fn sanitize_tag(tag: &str) -> Option<String> {
-        let clean: String = tag
+    /// Kite tags are alphanumeric and at most 20 characters. Every order gets a
+    /// unique one (a short readable prefix from the caller's tag plus random hex) so
+    /// that, if the reply to a placement is lost, the order can be found afterwards
+    /// instead of being sent a second time.
+    fn unique_tag(tag: Option<&str>) -> String {
+        let prefix: String = tag
+            .unwrap_or("")
             .chars()
             .filter(|c| c.is_ascii_alphanumeric())
-            .take(20)
+            .take(6)
             .collect();
-        (!clean.is_empty()).then_some(clean)
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        format!("{prefix}{}", &suffix[..14])
     }
 
     /// Build the form body for `POST /orders/{variety}`.
@@ -131,9 +136,7 @@ impl ZerodhaExecutionAdapter {
                 .ok_or_else(|| anyhow!("A stop trigger price is required"))?;
             form.push(("trigger_price", trigger.to_string()));
         }
-        if let Some(tag) = order.tag.as_deref().and_then(Self::sanitize_tag) {
-            form.push(("tag", tag));
-        }
+        form.push(("tag", Self::unique_tag(order.tag.as_deref())));
         Ok((variety, form))
     }
 
@@ -160,15 +163,82 @@ impl ZerodhaExecutionAdapter {
     }
 }
 
+/// One position per symbol. Kite reports a separate `net` row for each product (CNC, MIS,
+/// NRML), but APEX tracks a single position per broker and symbol, so rows that share a symbol
+/// would overwrite each other. Their signed quantities are added, so a long in one product and
+/// a short in another net out to the exposure the account really has. A symbol that nets to
+/// zero is dropped.
+fn merge_products(rows: Vec<Position>) -> Vec<Position> {
+    let mut order: Vec<Symbol> = Vec::new();
+    let mut merged: std::collections::HashMap<String, (f64, f64, f64, Position)> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let signed = if row.side == OrderSide::Buy { row.quantity } else { -row.quantity };
+        match merged.get_mut(&row.symbol.0) {
+            Some((net, cost, pnl, _)) => {
+                *net += signed;
+                *cost += row.avg_price * row.quantity;
+                *pnl += row.pnl;
+            }
+            None => {
+                order.push(row.symbol.clone());
+                merged.insert(row.symbol.0.clone(), (signed, row.avg_price * row.quantity, row.pnl, row));
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|symbol| {
+            let (net, cost, pnl, mut position) = merged.remove(&symbol.0)?;
+            if net.abs() < 1e-9 {
+                return None;
+            }
+            let gross: f64 = if position.avg_price > 0.0 { cost / position.avg_price } else { 0.0 };
+            let _ = gross;
+            position.quantity = net.abs();
+            position.side = if net > 0.0 { OrderSide::Buy } else { OrderSide::Sell };
+            position.pnl = pnl;
+            position.pnl_pct = if position.avg_price > 0.0 {
+                pnl / (position.avg_price * position.quantity) * 100.0
+            } else {
+                0.0
+            };
+            Some(position)
+        })
+        .collect()
+}
+
 #[async_trait]
 impl ExecutionPort for ZerodhaExecutionAdapter {
     async fn place_order(&self, order: &NewOrderRequest) -> Result<OrderId> {
         self.require_auth()?;
         let (variety, form) = Self::order_form(order)?;
-        let data = self
+        let tag = form
+            .iter()
+            .find(|(k, _)| *k == "tag")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let data = match self
             .session
             .send_form(Method::POST, &format!("/orders/{variety}"), &form, Bucket::Orders)
-            .await?;
+            .await
+        {
+            Ok(data) => data,
+            Err(error) if error.downcast_ref::<AmbiguousOutcome>().is_some() => {
+                // The order may have been accepted. Look it up by its unique tag.
+                return match self.find_order_by_tag(&tag).await {
+                    Ok(Some(id)) => {
+                        info!("Order {id} was placed; recovered it after an unclear reply");
+                        Ok(OrderId(id))
+                    }
+                    Ok(None) => Err(anyhow!("Zerodha did not place the order ({error})")),
+                    Err(_) => Err(anyhow!(
+                        "Order outcome unknown: {error}. Check Zerodha before sending it again."
+                    )),
+                };
+            }
+            Err(error) => return Err(error),
+        };
         let id = data
             .get("order_id")
             .and_then(|v| v.as_str())
@@ -245,8 +315,45 @@ impl ExecutionPort for ZerodhaExecutionAdapter {
             .and_then(|n| n.as_array())
             .map(|net| net.iter().filter_map(|p| Self::position_from_json(p, "zerodha")).collect())
             .unwrap_or_default();
+        let positions = merge_products(positions);
         debug!("Fetched {} positions from Zerodha", positions.len());
         Ok(positions)
+    }
+
+    async fn list_open_orders(&self) -> Result<Vec<Order>> {
+        self.require_auth()?;
+        let data = self.session.get("/orders", &[], Bucket::General).await?;
+        Ok(data
+            .as_array()
+            .map(|orders| {
+                orders
+                    .iter()
+                    .filter_map(order_from_json)
+                    .filter(|o| {
+                        matches!(
+                            o.status,
+                            OrderStatus::Pending | OrderStatus::Open | OrderStatus::PartiallyFilled
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn reports_realized_pnl(&self) -> bool {
+        true
+    }
+
+    async fn realized_pnl(&self) -> Result<Option<f64>> {
+        self.require_auth()?;
+        // An error here propagates: an unreadable P&L must never count as zero.
+        let positions = self.session.get("/portfolio/positions", &[], Bucket::General).await?;
+        let total = positions
+            .get("net")
+            .and_then(|n| n.as_array())
+            .map(|net| net.iter().map(|p| p.get("realised").and_then(|x| x.as_f64()).unwrap_or(0.0)).sum())
+            .unwrap_or(0.0);
+        Ok(Some(total))
     }
 
     async fn get_holdings(&self) -> Result<Vec<Position>> {
@@ -345,6 +452,20 @@ impl ExecutionPort for ZerodhaExecutionAdapter {
 }
 
 impl ZerodhaExecutionAdapter {
+    /// The id of the order placed with `tag`, if Zerodha has it.
+    async fn find_order_by_tag(&self, tag: &str) -> Result<Option<String>> {
+        if tag.is_empty() {
+            return Ok(None);
+        }
+        let data = self.session.get("/orders", &[], Bucket::General).await?;
+        Ok(data.as_array().and_then(|orders| {
+            orders
+                .iter()
+                .find(|o| o.get("tag").and_then(|t| t.as_str()) == Some(tag))
+                .and_then(|o| o.get("order_id").and_then(|i| i.as_str()).map(String::from))
+        }))
+    }
+
     /// Variety of an existing order (regular, amo, co, iceberg), needed in the
     /// cancel/modify URL. Reads it from the order's history.
     async fn order_variety(&self, order_id: &OrderId) -> Result<String> {
@@ -401,7 +522,8 @@ mod tests {
         assert_eq!(get("product"), Some("CNC"));
         assert_eq!(get("order_type"), Some("LIMIT"));
         assert_eq!(get("price"), Some("1200.5"));
-        assert_eq!(get("tag"), Some("apexmanual"));
+        let tag = get("tag").unwrap();
+        assert!(tag.starts_with("apexma") && tag.len() <= 20 && tag.chars().all(|c| c.is_ascii_alphanumeric()), "{tag}");
         assert_eq!(get("trigger_price"), None);
     }
 
@@ -583,5 +705,121 @@ mod tests {
         let adapter = ZerodhaExecutionAdapter::new("key".into(), None).unwrap();
         assert!(adapter.place_order(&limit_buy()).await.is_err());
         assert!(adapter.get_positions().await.is_err());
+    }
+
+    /// Stand up a Kite whose order POST answers `post_status` after "accepting" the
+    /// order, remembering the tag it carried, and whose order book then lists (or omits) it.
+    async fn kite_that_accepts_then_fails(post_status: u16, list_the_order: bool) -> (MockServer, std::sync::Arc<std::sync::Mutex<String>>) {
+        let server = MockServer::start().await;
+        let seen_tag = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let capture = seen_tag.clone();
+        Mock::given(method("POST"))
+            .and(path("/orders/regular"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body).to_string();
+                let tag = body
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("tag="))
+                    .unwrap_or("")
+                    .to_string();
+                *capture.lock().unwrap() = tag;
+                ResponseTemplate::new(post_status)
+            })
+            .expect(1) // an ambiguous placement is never retried
+            .mount(&server)
+            .await;
+        let read = seen_tag.clone();
+        Mock::given(method("GET"))
+            .and(path("/orders"))
+            .respond_with(move |_: &wiremock::Request| {
+                let data = if list_the_order {
+                    json!([{"order_id": "RECOVERED-1", "tag": read.lock().unwrap().clone(), "status": "OPEN"}])
+                } else {
+                    json!([{"order_id": "OTHER", "tag": "someoneelse", "status": "OPEN"}])
+                };
+                ResponseTemplate::new(200).set_body_json(json!({"status": "success", "data": data}))
+            })
+            .mount(&server)
+            .await;
+        (server, seen_tag)
+    }
+
+    #[tokio::test]
+    async fn a_5xx_on_placement_recovers_the_order_by_its_tag() {
+        let (server, tag) = kite_that_accepts_then_fails(502, true).await;
+        let id = adapter(&server).place_order(&limit_buy()).await.unwrap();
+        assert_eq!(id.0, "RECOVERED-1", "the order was accepted, so it must not be reported as failed");
+        let tag = tag.lock().unwrap().clone();
+        assert!(tag.starts_with("apexma") && tag.len() <= 20, "unique tag, got {tag:?}");
+    }
+
+    #[tokio::test]
+    async fn a_5xx_with_no_matching_order_is_reported_as_not_placed() {
+        let (server, _) = kite_that_accepts_then_fails(504, false).await;
+        let err = adapter(&server).place_order(&limit_buy()).await.unwrap_err();
+        assert!(err.to_string().contains("did not place"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn every_placement_carries_a_different_tag() {
+        let a = ZerodhaExecutionAdapter::order_form(&limit_buy()).unwrap().1;
+        let b = ZerodhaExecutionAdapter::order_form(&limit_buy()).unwrap().1;
+        let tag = |f: &Vec<(&'static str, String)>| f.iter().find(|(k, _)| *k == "tag").unwrap().1.clone();
+        assert_ne!(tag(&a), tag(&b));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_order_book_after_an_unclear_reply_says_the_outcome_is_unknown() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/orders/regular"))
+            .respond_with(ResponseTemplate::new(504))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/orders"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let err = adapter(&server).place_order(&limit_buy()).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("outcome unknown") && text.contains("before sending it again"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn open_orders_and_realized_pnl_come_from_the_broker() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status":"success","data":[
+                {"order_id":"1","status":"OPEN","exchange":"NSE","tradingsymbol":"TCS","transaction_type":"BUY",
+                 "order_type":"LIMIT","quantity":1,"filled_quantity":0,"price":3000.0},
+                {"order_id":"2","status":"COMPLETE","exchange":"NSE","tradingsymbol":"TCS","transaction_type":"BUY",
+                 "order_type":"LIMIT","quantity":1,"filled_quantity":1,"price":3000.0}]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/portfolio/positions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status":"success","data":{"net":[
+                {"tradingsymbol":"A","quantity":0,"realised":12.5},{"tradingsymbol":"B","quantity":1,"realised":-2.5}]}})))
+            .mount(&server)
+            .await;
+        let adapter = adapter(&server);
+        let open = adapter.list_open_orders().await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id.0, "1");
+        assert!(adapter.reports_realized_pnl());
+        assert_eq!(adapter.realized_pnl().await.unwrap(), Some(10.0));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_pnl_is_an_error_not_zero() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/portfolio/positions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        assert!(adapter(&server).realized_pnl().await.is_err());
     }
 }

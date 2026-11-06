@@ -10,7 +10,7 @@ const DEBOUNCE_MS = 150;
  * debounced backend results (broker instruments + Yahoo search).
  */
 export function useSymbolOptions(query: string, localSymbols: string[], limit = 12): SymbolSearchResultDto[] {
-  const [remote, setRemote] = useState<SymbolSearchResultDto[]>([]);
+  const [remote, setRemote] = useState<{ query: string; results: SymbolSearchResultDto[] }>({ query: '', results: [] });
   const requestId = useRef(0);
   const q = query.trim();
 
@@ -22,17 +22,17 @@ export function useSymbolOptions(query: string, localSymbols: string[], limit = 
   useEffect(() => {
     if (!q) {
       requestId.current += 1;
-      setRemote([]);
+      setRemote({ query: '', results: [] });
       return;
     }
     const id = ++requestId.current;
     const timer = setTimeout(() => {
       searchSymbols(q)
         .then((results) => {
-          if (id === requestId.current && Array.isArray(results)) setRemote(results);
+          if (id === requestId.current && Array.isArray(results)) setRemote({ query: q, results });
         })
         .catch(() => {
-          if (id === requestId.current) setRemote([]);
+          if (id === requestId.current) setRemote({ query: q, results: [] });
         });
     }, DEBOUNCE_MS);
     return () => clearTimeout(timer);
@@ -49,7 +49,8 @@ export function useSymbolOptions(query: string, localSymbols: string[], limit = 
         merged.push(item);
       }
     };
-    remote.forEach(push);
+    // Results for an older query are dropped: they would be suggestions for something the user is no longer typing.
+    if (remote.query === q) remote.results.forEach(push);
     localFuse.search(q, { limit: 5 }).forEach(({ item }) =>
       push({ symbol: item.symbol, name: 'In watchlist', exchange: '', source: 'local' }),
     );
