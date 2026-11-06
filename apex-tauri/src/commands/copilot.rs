@@ -3,7 +3,7 @@ use crate::commands::python_runtime;
 use crate::commands::scanner::ScanCriterionDto;
 use crate::commands::strategy::StrategyBacktestRequestDto;
 use crate::commands::copilot_mode::{self, ChatMode};
-use crate::commands::{automation, copilot_tools, data, ml, quant, scanner, strategy};
+use crate::commands::{automation, copilot_more, copilot_tools, data, ml, quant, scanner, strategy};
 use crate::dto::MLTrainingRequestDto;
 use crate::state::AppState;
 use crate::validation;
@@ -28,6 +28,17 @@ pub struct ToolCallTrace {
     pub name: String,
     pub detail: String,
     pub ok: bool,
+    /// What this call created or changed that the user can open (strategy file, automation,
+    /// model, dataset). Left out of the JSON when there is none, so older readers are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ToolArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ToolArtifact {
+    /// "strategy" | "model" | "dataset" | "automation"
+    pub kind: String,
+    pub id: String,
 }
 
 /// A write-class tool call paused for user approval ([copilot]
@@ -109,13 +120,15 @@ async fn dispatch_tool(
     pending: &mut Vec<PendingApprovalDto>,
 ) -> Option<Value> {
     let detail = trace_detail(name, args);
+    let refused = mode == ChatMode::Ask && copilot_mode::refused_in_ask(name, args, state, runtime_paths);
     // Ask mode is read-only. The model is not offered write tools, but a call that arrives
     // anyway (a stale tool list, a hallucinated name) is refused here, not executed.
-    if mode == ChatMode::Ask && copilot_mode::refused_in_ask(name, args, state, runtime_paths) {
+    if refused {
         trace.push(ToolCallTrace {
             name: name.to_string(),
             detail: format!("{detail} — blocked in Ask mode"),
             ok: false,
+            artifact: None,
         });
         return Some(json!({
             "error": "Ask mode is read-only, so this was not done. Tell the user what you would do and that they can switch to Review or Agent mode."
@@ -123,14 +136,27 @@ async fn dispatch_tool(
     }
     let gated = copilot_mode::requires_approval(mode, name, args, state, runtime_paths);
 
-    let result = if gated {
-        let key = tool_approval_key(name, args);
-        let cached = state.copilot_tool_cache.lock().unwrap().get(&key).cloned();
-        if let Some(cached) = cached {
+    let key = tool_approval_key(name, args);
+    let cached = if gated { state.copilot_tool_cache.lock().unwrap().get(&key).cloned() } else { None };
+    let approved = gated && state.copilot_approvals.lock().unwrap().contains(&key);
+    let gate = copilot_tools::audit::gate(false, gated, cached.is_some(), approved);
+
+    // Looked up now: a delete removes the rule, and its name belongs in the log.
+    let automation_name = if matches!(name, "set_automation_enabled" | "delete_automation") {
+        let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        state.automations.list().iter().find(|r| r.id == id).map(|r| r.name.clone())
+    } else {
+        None
+    };
+
+    let result = match gate {
+        copilot_tools::audit::Gate::Replay => {
             // Approved + executed on the first pass — replay returns the
             // recorded result instead of double-firing (e.g. duplicate order).
+            let cached = cached.unwrap_or_default();
             Ok(serde_json::from_str(&cached).unwrap_or_else(|_| json!(cached)))
-        } else if !state.copilot_approvals.lock().unwrap().contains(&key) {
+        }
+        copilot_tools::audit::Gate::Pending => {
             pending.push(PendingApprovalDto {
                 key,
                 name: name.to_string(),
@@ -140,26 +166,40 @@ async fn dispatch_tool(
                 name: name.to_string(),
                 detail: format!("{detail} — awaiting approval"),
                 ok: false,
+                artifact: None,
             });
             return None;
-        } else {
+        }
+        // `RefusedInAsk` returned above, so this is `Execute`.
+        _ => {
             let r = exec_tool(name, args, state, models, runtime_paths).await;
-            // An approval is good for one execution. The result is cached only so the
-            // replay of this same turn does not fire the call a second time.
-            state.copilot_approvals.lock().unwrap().remove(&key);
-            if let Ok(v) = &r {
-                state
-                    .copilot_tool_cache
-                    .lock()
-                    .unwrap()
-                    .insert(key, v.to_string());
+            if gated {
+                // An approval is good for one execution. The result is cached only so the
+                // replay of this same turn does not fire the call a second time.
+                state.copilot_approvals.lock().unwrap().remove(&key);
+                if let Ok(v) = &r {
+                    state
+                        .copilot_tool_cache
+                        .lock()
+                        .unwrap()
+                        .insert(key, v.to_string());
+                }
             }
             r
         }
-    } else {
-        exec_tool(name, args, state, models, runtime_paths).await
     };
 
+    // One activity entry per execution. A refused, paused or replayed call never gets here.
+    if let Some(entry) = copilot_tools::audit::entry_for(gate, name, args, &result, automation_name.as_deref()) {
+        let record = if entry.informational { crate::activity::record_info } else { crate::activity::record };
+        record(state, "copilot", entry.action, entry.kind, &entry.target_id, &entry.summary, entry.ok, entry.details);
+    }
+
+    let artifact = result
+        .as_ref()
+        .ok()
+        .and_then(|v| copilot_tools::audit::artifact(name, args, v))
+        .map(|(kind, id)| ToolArtifact { kind: kind.to_string(), id });
     let (payload, ok) = match result {
         Ok(v) => (v, true),
         Err(e) => (json!({ "error": e }), false),
@@ -168,6 +208,7 @@ async fn dispatch_tool(
         name: name.to_string(),
         detail,
         ok,
+        artifact,
     });
     Some(payload)
 }
@@ -354,7 +395,7 @@ fn tool_schemas() -> Value {
                 "quantity": {"type": "number", "default": 10},
                 "initial_capital": {"type": "number", "default": 100000} },
             "required": ["path", "symbol"] })),
-        ("export_bars_csv", "Export historical bars for a symbol to a CSV under data/exports — returns the path usable as data_path for train_ml_model", json!({
+        ("export_bars_csv", "Export historical bars (time, open, high, low, close, volume only) to a CSV under data/exports and return its path relative to the app folder. The file has no label or feature columns, so it cannot be trained on directly: use build_dataset for training", json!({
             "type": "object", "properties": {
                 "symbol": {"type": "string"},
                 "timeframe": {"type": "string", "default": "d1"},
@@ -362,16 +403,19 @@ fn tool_schemas() -> Value {
             "required": ["symbol"] })),
         ("list_ml_models", "List trained ML models with metrics", json!({
             "type": "object", "properties": {} })),
-        ("train_ml_model", "Train an ML model on a CSV dataset (use export_bars_csv first); returns model_id and metrics", json!({
+        ("train_ml_model", "Train an ML model with time-series cross-validation. Best path: build_dataset, then train_ml_model {algorithm, dataset}. Returns model_id, metrics, trading result against buy and hold, and flags for weak spots; read get_model for per-fold detail. Alternatively give data_path, target_column and feature_columns for a CSV you already have with a label column.", json!({
             "type": "object", "properties": {
-                "algorithm": {"type": "string", "description": "random_forest, logistic_regression, linear_regression, gradient_boosting, svm"},
-                "data_path": {"type": "string"},
-                "target_column": {"type": "string"},
-                "feature_columns": {"type": "array", "items": {"type": "string"}},
-                "n_splits": {"type": "integer", "default": 5},
-                "lag_periods": {"type": "array", "items": {"type": "integer"}, "default": [1]} },
-            "required": ["algorithm", "data_path", "target_column", "feature_columns"] })),
-        ("get_model_signal", "Score a trained ML model on a symbol's latest bar — returns {signal: 1=buy 0=sell -1=hold, probability}", json!({
+                "algorithm": {"type": "string", "enum": ["random_forest", "gradient_boosting", "logistic_regression", "xgboost"]},
+                "dataset": {"type": "string", "description": "name of a dataset from build_dataset; supplies data_path, target and features"},
+                "feature_columns": {"type": "array", "items": {"type": "string"}, "description": "optional subset of the dataset's features; required with data_path"},
+                "hyperparams": {"type": "object", "description": "allowed keys per algorithm. random_forest: n_estimators 1-2000, max_depth 1-100 or null, min_samples_leaf 1-1000, max_features sqrt|log2|int|0-1 float, class_weight balanced|balanced_subsample, random_state. gradient_boosting: n_estimators, learning_rate (0,1], max_depth 1-20, subsample (0,1], random_state. xgboost: gradient_boosting keys plus colsample_bytree (0,1]. logistic_regression: C, max_iter, class_weight balanced"},
+                "n_splits": {"type": "integer", "default": 5, "description": "time-series CV folds, 2-20"},
+                "lag_periods": {"type": "array", "items": {"type": "integer"}, "description": "add lagged copies of each feature (1-250). Default none with a dataset, [1] with data_path"},
+                "return_column": {"type": "string", "description": "column holding each row's forward return, used for the trading result; set automatically for datasets"},
+                "data_path": {"type": "string", "description": "CSV path (not needed with dataset)"},
+                "target_column": {"type": "string", "description": "label column (not needed with dataset)"} },
+            "required": ["algorithm"] })),
+        ("get_model_signal", "Score a trained ML model on a symbol's latest bar — returns {signal, probability}. signal is the model's predicted class: 1 = up, 0 = no clear move or down (2-class models), -1 = down (3-class return_threshold models)", json!({
             "type": "object", "properties": {
                 "model_id": {"type": "string"},
                 "symbol": {"type": "string"} },
@@ -484,6 +528,9 @@ async fn exec_tool(
     runtime_paths: &python_runtime::RuntimePaths,
 ) -> Result<Value, String> {
     if let Some(result) = copilot_tools::exec_extra(name, args, state, runtime_paths).await {
+        return result;
+    }
+    if let Some(result) = copilot_more::exec_ml(name, args, state, &models.models_dir, runtime_paths).await {
         return result;
     }
     match name {
@@ -717,12 +764,8 @@ async fn exec_tool(
                 ));
             }
             std::fs::write(&path, &out).map_err(|e| e.to_string())?;
-            // Return a user-relative path usable by train_ml_model / strategy files.
-            let rel = path
-                .strip_prefix(runtime_paths.data_dir())
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
+            // Relative to the work root, the base the trainer and strategy files resolve against.
+            let rel = runtime_paths.to_user_relative_path(&path);
             Ok(json!({"path": rel, "bars": bars.len()}))
         }
         "list_ml_models" => {
@@ -735,35 +778,49 @@ async fn exec_tool(
             )
         }
         "train_ml_model" => {
+            let dataset = args.get("dataset").and_then(|v| v.as_str()).map(String::from);
+            let hyperparams = match args.get("hyperparams") {
+                None | Some(Value::Null) => Default::default(),
+                Some(v @ Value::Object(_)) => serde_json::from_value(v.clone()).map_err(|e| format!("invalid hyperparams: {e}"))?,
+                Some(_) => return Err("`hyperparams` must be an object".into()),
+            };
+            let strings = |key: &str| -> Vec<String> {
+                args.get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default()
+            };
+            let text = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let req = MLTrainingRequestDto {
                 algorithm: arg_str(args, "algorithm")?.to_string(),
-                data_path: arg_str(args, "data_path")?.to_string(),
-                target_column: arg_str(args, "target_column")?.to_string(),
-                feature_columns: args
-                    .get("feature_columns")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                hyperparams: args
-                    .get("hyperparams")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default(),
+                data_path: text("data_path"),
+                target_column: text("target_column"),
+                feature_columns: strings("feature_columns"),
+                hyperparams,
                 n_splits: clamp_limit(args.get("n_splits"), 5, 20),
+                // A dataset already holds its features; a raw CSV keeps the old one-lag default.
                 lag_periods: args
                     .get("lag_periods")
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
-                    .unwrap_or_else(|| vec![1]),
+                    .unwrap_or_else(|| if dataset.is_some() { Vec::new() } else { vec![1] }),
+                dataset,
+                return_column: args.get("return_column").and_then(|v| v.as_str()).map(String::from),
             };
-            let r = ml::train_ml_model_inner(req, &models.models_dir, runtime_paths).await?;
-            Ok(json!({"model_id": r.model_id, "metrics": r.metrics,
-                      "features": r.feature_names}))
+            let r =
+                ml::train_ml_model_inner(req, &models.models_dir, runtime_paths, state, "copilot")
+                    .await?;
+            let detail = ml::build_detail(&models.models_dir, &r.model_id, Vec::new()).ok();
+            Ok(copilot_more::train_summary(&r, detail.as_ref()))
         }
         "get_model_signal" => {
+            ml::ensure_fresh_model_bars(
+                state,
+                &models.models_dir,
+                arg_str(args, "model_id")?,
+                arg_str(args, "symbol")?,
+            )
+            .await?;
             let s = ml::model_signal_inner(
                 arg_str(args, "model_id")?,
                 arg_str(args, "symbol")?,
@@ -1448,5 +1505,114 @@ mod approval_key_tests {
             canon_args(&json!({"a":1,"b":{"y":2,"x":1}})),
             canon_args(&json!({"b":{"x":1,"y":2},"a":1}))
         );
+    }
+}
+
+#[cfg(test)]
+mod ml_tool_tests {
+    use super::*;
+
+    const ML_READ: &[&str] = &["list_feature_catalog", "list_datasets", "preview_dataset", "get_model", "list_ml_models"];
+    const ML_WRITE: &[&str] = &["build_dataset", "delete_dataset", "update_model", "train_ml_model"];
+
+    fn function<'a>(all: &'a Value, name: &str) -> &'a Value {
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == name)
+            .unwrap_or_else(|| panic!("{name} has no schema"))
+    }
+
+    fn names(all: &Value) -> Vec<String> {
+        all.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str().map(String::from)).collect()
+    }
+
+    #[test]
+    fn every_ml_tool_has_a_schema_description_and_the_right_required_fields() {
+        let all = tool_schemas();
+        let required = |name: &str| -> Vec<String> {
+            function(&all, name)["function"]["parameters"]["required"]
+                .as_array()
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        };
+        for name in ML_READ.iter().chain(ML_WRITE) {
+            let f = &function(&all, name)["function"];
+            assert!(!f["description"].as_str().unwrap_or("").is_empty(), "{name} needs a description");
+            assert_eq!(f["parameters"]["type"], "object", "{name}");
+            // Every required field must be declared as a property.
+            for field in required(name) {
+                assert!(f["parameters"]["properties"].get(&field).is_some(), "{name}: required `{field}` is not a property");
+            }
+        }
+        assert_eq!(required("build_dataset"), ["name", "symbols", "features", "label"]);
+        assert_eq!(required("get_model"), ["model_id"]);
+        assert_eq!(required("update_model"), ["model_id"]);
+        assert_eq!(required("preview_dataset"), ["name"]);
+        assert_eq!(required("delete_dataset"), ["name"]);
+        // A dataset supplies the path, target and features, so only the algorithm is required.
+        assert_eq!(required("train_ml_model"), ["algorithm"]);
+        let train = &function(&all, "train_ml_model")["function"]["parameters"]["properties"];
+        for field in ["dataset", "hyperparams", "return_column", "feature_columns", "n_splits", "lag_periods"] {
+            assert!(train.get(field).is_some(), "train_ml_model should accept `{field}`");
+        }
+        // The algorithm list is the one the backend accepts (the old text offered svm and linear_regression).
+        let algos: Vec<&str> = train["algorithm"]["enum"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        for algo in &algos {
+            assert!(crate::validation::validate_algorithm(algo).is_ok(), "{algo} is not a valid algorithm");
+        }
+        assert_eq!(algos.len(), 4);
+    }
+
+    #[test]
+    fn tool_names_are_unique() {
+        let mut all = names(&tool_schemas());
+        let count = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), count, "duplicate tool names");
+    }
+
+    #[test]
+    fn ask_mode_hides_the_ml_write_tools_and_keeps_the_reads() {
+        let ask = names(&copilot_mode::tools_for_mode(tool_schemas(), ChatMode::Ask));
+        for read in ML_READ {
+            assert!(ask.contains(&read.to_string()), "{read} must stay available in Ask");
+            assert!(!copilot_mode::is_write_tool(read), "{read} is read-only");
+        }
+        for write in ML_WRITE {
+            assert!(copilot_mode::is_write_tool(write), "{write} is a write tool");
+            assert!(!ask.contains(&write.to_string()), "{write} must be hidden in Ask");
+        }
+        // Review and Agent are offered all of them.
+        for mode in [ChatMode::Review, ChatMode::Agent] {
+            let all = names(&copilot_mode::tools_for_mode(tool_schemas(), mode));
+            for name in ML_READ.iter().chain(ML_WRITE) {
+                assert!(all.contains(&name.to_string()), "{name} missing in {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_new_write_tools_need_approval_in_review() {
+        // Review pauses for every tool in these lists (see `copilot_mode::requires_approval`).
+        for write in ["build_dataset", "delete_dataset", "update_model"] {
+            assert!(copilot_more::WRITE_TOOLS.contains(&write), "{write}");
+        }
+        assert!(WRITE_TOOLS.contains(&"train_ml_model"));
+    }
+
+    #[test]
+    fn a_tool_trace_card_names_the_dataset_and_hyperparameters() {
+        let text = copilot_tools::describe_call(
+            "train_ml_model",
+            &json!({"algorithm": "random_forest", "dataset": "spy_5d", "hyperparams": {"max_depth": 4, "n_estimators": 200}}),
+        );
+        assert_eq!(text, "Train random_forest on dataset spy_5d, max_depth=4 n_estimators=200");
+        let csv = copilot_tools::describe_call(
+            "train_ml_model",
+            &json!({"algorithm": "xgboost", "data_path": "exports/a.csv", "target_column": "signal"}),
+        );
+        assert!(csv.contains("exports/a.csv") && csv.contains("signal"), "{csv}");
     }
 }

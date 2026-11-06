@@ -131,6 +131,16 @@ impl RuntimePaths {
             self.work_root.join(path)
         }
     }
+
+    /// Inverse of [`resolve_user_relative_path`]: the path as the trainer and strategy files
+    /// should name it (relative to `work_root`, e.g. `data/exports/X.csv`).
+    pub fn to_user_relative_path<P: AsRef<Path>>(&self, path: P) -> String {
+        let path = path.as_ref();
+        path.strip_prefix(&self.work_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    }
 }
 
 pub fn repo_root() -> Result<PathBuf, String> {
@@ -394,6 +404,17 @@ mod tests {
         assert!(error.contains("APEX_TEST_PYTHON_PATH"));
         assert!(error.contains("apex-python/.venv/bin/python"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exported_paths_resolve_back_to_the_same_file() {
+        let root = test_root("user-relative");
+        let paths = RuntimePaths::for_test(&root);
+        let file = paths.data_dir().join("exports").join("AAPL_1d.csv");
+        let rel = paths.to_user_relative_path(&file);
+        assert_eq!(rel, "data/exports/AAPL_1d.csv");
+        assert_eq!(paths.resolve_user_relative_path(&rel), file);
         let _ = fs::remove_dir_all(root);
     }
 

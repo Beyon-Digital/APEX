@@ -1,3 +1,4 @@
+mod activity;
 mod broker_runtime;
 mod chatgpt_auth;
 mod commands;
@@ -127,6 +128,14 @@ fn main() {
             ml::train_ml_model,
             ml::delete_ml_model,
             ml::predict_model_signal,
+            ml::get_ml_model,
+            ml::update_ml_model,
+            ml::model_signal_history,
+            commands::ml_features::list_feature_catalog,
+            commands::ml_datasets::build_dataset,
+            commands::ml_datasets::list_datasets,
+            commands::ml_datasets::preview_dataset,
+            commands::ml_datasets::delete_dataset,
             automation::create_automation,
             automation::list_automations,
             automation::delete_automation,
@@ -156,6 +165,7 @@ fn main() {
             adapters::delete_adapter_config,
             adapters::test_adapter_connection,
             health::get_system_health,
+            activity::list_activity,
             settings::get_app_settings,
             settings::save_app_settings,
             notebook::list_notebooks,

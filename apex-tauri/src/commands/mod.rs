@@ -15,6 +15,8 @@ pub mod health;
 pub mod live;
 pub mod market;
 pub mod ml;
+pub mod ml_datasets;
+pub mod ml_features;
 pub mod news;
 pub mod notebook;
 pub mod orderbook;

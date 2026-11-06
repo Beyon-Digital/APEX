@@ -265,6 +265,7 @@ pub fn start_background(
     app: &tauri::AppHandle,
     path: String,
     params: Value,
+    actor: &'static str,
 ) -> Result<(), String> {
     parse_session_params(&params)?;
     if sessions().lock().map_err(|e| e.to_string())?.contains_key(&path) {
@@ -274,19 +275,56 @@ pub fn start_background(
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         let paths = app.state::<python_runtime::RuntimePaths>();
-        if let Err(error) = run(&app, path.clone(), params, state.inner(), paths.inner()).await {
+        if let Err(error) = run(&app, path.clone(), params, state.inner(), paths.inner(), actor).await {
             note(&app, &path, format!("Session ended with an error: {error}"));
         }
     });
     Ok(())
 }
 
+/// Run a session to the end and write its start and end to the activity log.
+///
+/// `actor` is who started it ("user" or "copilot"). A session that could not start records one
+/// failed `strategy.start`; one that ran records `strategy.start` when it goes live and
+/// `strategy.stop` when it ends. These are informational entries: the strategy file did not
+/// change, so open panels are not told to reload.
 pub async fn run(
     app: &tauri::AppHandle,
     path: String,
     params: Value,
     state: &AppState,
     paths: &python_runtime::RuntimePaths,
+    actor: &str,
+) -> Result<Vec<String>, String> {
+    let mut reached_running = false;
+    let result = run_session(app, path.clone(), params.clone(), state, paths, actor, &mut reached_running).await;
+    if reached_running {
+        let info = info_map().lock().ok().and_then(|m| m.get(&path).cloned());
+        let (symbol, broker, orders) = info
+            .map(|i| (i.symbol, i.broker_id, i.orders_placed))
+            .unwrap_or_else(|| ("?".into(), "paper".into(), 0));
+        let (summary, details) = match &result {
+            Ok(_) => (format!("Stopped {path} ({symbol} on {broker}, {orders} orders)"), None),
+            Err(error) => (format!("Session of {path} ended with an error ({symbol} on {broker})"), Some(error.clone())),
+        };
+        crate::activity::record_info(state, actor, "strategy.stop", "strategy", &path, &summary, result.is_ok(), details);
+    } else if let Err(error) = &result {
+        let broker = params.get("broker_id").and_then(Value::as_str).unwrap_or("paper");
+        let summary = format!("Could not start {path} on {broker}");
+        crate::activity::record_info(state, actor, "strategy.start", "strategy", &path, &summary, false, Some(error.clone()));
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session(
+    app: &tauri::AppHandle,
+    path: String,
+    params: Value,
+    state: &AppState,
+    paths: &python_runtime::RuntimePaths,
+    actor: &str,
+    reached_running: &mut bool,
 ) -> Result<Vec<String>, String> {
     let session = parse_session_params(&params)?;
     if session.broker_id != "paper" {
@@ -313,7 +351,7 @@ pub async fn run(
         }
         map.insert(path.clone(), tx);
     }
-    let result = run_inner(app, &path, full_path, params, &session, state, paths, &mut stop).await;
+    let result = run_inner(app, &path, full_path, params, &session, state, paths, &mut stop, actor, reached_running).await;
     sessions().lock().map_err(|e| e.to_string())?.remove(&path);
     update_info(&path, |info| {
         info.state = if result.is_ok() { "stopped" } else { "error" }.into();
@@ -392,6 +430,8 @@ async fn run_inner(
     state: &AppState,
     paths: &python_runtime::RuntimePaths,
     stop: &mut watch::Receiver<bool>,
+    actor: &str,
+    reached_running: &mut bool,
 ) -> Result<Vec<String>, String> {
     let broker_id = session.broker_id.as_str();
     let is_paper = broker_id == "paper";
@@ -499,6 +539,17 @@ async fn run_inner(
         Err(error) => log!("Warm-up skipped: {error}"),
     }
     update_info(path, |info| info.state = "running".into());
+    *reached_running = true;
+    crate::activity::record_info(
+        state,
+        actor,
+        "strategy.start",
+        "strategy",
+        path,
+        &format!("Started {path}: {symbol} {tf} on {broker_id} ({label}), quantity {quantity}"),
+        true,
+        None,
+    );
 
     let mut held = false;
     // An order that has not reached a final state; no new signals until it does.

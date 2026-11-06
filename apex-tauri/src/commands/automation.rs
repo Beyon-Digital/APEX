@@ -139,7 +139,45 @@ pub async fn create_automation(
     request: CreateAutomationDto,
     state: State<'_, AppState>,
 ) -> Result<AutomationDto, String> {
-    create_automation_inner(request, &state)
+    let name = request.name.clone();
+    let result = create_automation_inner(request, &state);
+    match &result {
+        Ok(created) => crate::activity::record(
+            &state,
+            "user",
+            "automation.create",
+            "automation",
+            &created.id,
+            &format!(
+                "Created automation {name}: model {} on {} ({})",
+                created.model_id, created.symbol, created.broker_id
+            ),
+            true,
+            None,
+        ),
+        Err(error) => crate::activity::record(
+            &state,
+            "user",
+            "automation.create",
+            "automation",
+            "",
+            &format!("Could not create automation {name}"),
+            false,
+            Some(error.clone()),
+        ),
+    }
+    result
+}
+
+/// Display name of an automation, looked up before a change that may remove it.
+fn automation_label(state: &AppState, id: &str) -> String {
+    state
+        .automations
+        .list()
+        .iter()
+        .find(|r| r.id == id)
+        .map(|r| format!("{} ({id})", r.name))
+        .unwrap_or_else(|| id.to_string())
 }
 
 #[tauri::command]
@@ -155,7 +193,13 @@ pub async fn list_automations(state: State<'_, AppState>) -> Result<Vec<Automati
 #[tauri::command]
 pub async fn delete_automation(id: String, state: State<'_, AppState>) -> Result<bool, String> {
     validation::validate_string_length(&id, "automation id")?;
-    Ok(state.automations.remove_rule(&id))
+    let label = automation_label(&state, &id);
+    let removed = state.automations.remove_rule(&id);
+    // Deleting a rule that was already gone changed nothing, so it is not logged.
+    if removed {
+        crate::activity::record(&state, "user", "automation.delete", "automation", &id, &format!("Deleted automation {label}"), true, None);
+    }
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -165,20 +209,56 @@ pub async fn set_automation_enabled(
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     validation::validate_string_length(&id, "automation id")?;
-    Ok(state.automations.set_enabled(&id, enabled))
+    let label = automation_label(&state, &id);
+    let changed = state.automations.set_enabled(&id, enabled);
+    if changed {
+        let verb = if enabled { "Enabled" } else { "Disabled" };
+        crate::activity::record(&state, "user", "automation.toggle", "automation", &id, &format!("{verb} automation {label}"), true, None);
+    }
+    Ok(changed)
 }
 
 /// Rules do not fire for this long after launch.
 const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(45);
-/// Daily bars older than this (weekends and holidays included) are too stale to trade on.
-const MAX_BAR_AGE_DAYS: i64 = 6;
 
-/// Execute one due rule: model signal → order via OTM (risk-gated).
+/// Order side for a model class. Automations are long/flat and never short: class 1 ("up")
+/// buys, class 0 ("no clear move"/flat) and class -1 ("down") exit a held long. The trainer's
+/// trading simulation also *shorts* on -1, so a 3-class model's live result is long/flat only.
+fn side_for_signal(signal: i64) -> Option<OrderSide> {
+    match signal {
+        1 => Some(OrderSide::Buy),
+        0 | -1 => Some(OrderSide::Sell),
+        _ => None,
+    }
+}
+
+/// An order an automation tried to place, for the activity log.
+struct OrderAttempt {
+    ok: bool,
+    summary: String,
+    details: Option<String>,
+}
+
+/// Execute one due rule and report what it did. An order the rule tried to place also comes back
+/// as an [`OrderAttempt`] so the caller can log it once the rule's own counters are saved.
 async fn run_rule(
     rule: &AutomationRule,
     state: &AppState,
     models: &ModelRegistry,
     runtime_paths: &RuntimePaths,
+) -> (String, Option<OrderAttempt>) {
+    let mut attempt = None;
+    let text = run_rule_inner(rule, state, models, runtime_paths, &mut attempt).await;
+    (text, attempt)
+}
+
+/// Execute one due rule: model signal → order via OTM (risk-gated).
+async fn run_rule_inner(
+    rule: &AutomationRule,
+    state: &AppState,
+    models: &ModelRegistry,
+    runtime_paths: &RuntimePaths,
+    attempt: &mut Option<OrderAttempt>,
 ) -> String {
     // Recheck the live-trading gate on every run — the stored rule predates
     // any config change, so a rule created while allow_live_trading was true
@@ -201,20 +281,16 @@ async fn run_rule(
         }
     }
 
-    // Score on fresh daily bars, not whatever happens to be cached.
-    match crate::commands::data::load_bars(state, &rule.symbol, Some("d1"), 300).await {
-        Ok(bars) => match bars.last() {
-            Some(last) if (chrono::Utc::now() - last.time).num_days() <= MAX_BAR_AGE_DAYS => {}
-            Some(last) => {
-                return format!(
-                    "blocked: newest daily bar for {} is from {} (stale); refusing to trade on old data",
-                    rule.symbol,
-                    last.time.format("%Y-%m-%d")
-                )
-            }
-            None => return format!("blocked: no daily bars for {}", rule.symbol),
-        },
-        Err(e) => return format!("data error: {e}"),
+    // Score on fresh bars of the model's own timeframe, not whatever happens to be cached.
+    if let Err(e) = crate::commands::ml::ensure_fresh_model_bars(
+        state,
+        &models.models_dir,
+        &rule.model_id,
+        &rule.symbol,
+    )
+    .await
+    {
+        return format!("blocked: {e}");
     }
 
     let signal = match crate::commands::ml::model_signal_inner(
@@ -238,10 +314,9 @@ async fn run_rule(
         );
     }
 
-    let side = match signal.signal {
-        1 => OrderSide::Buy,
-        0 => OrderSide::Sell,
-        other => return format!("no-op: unrecognized signal {other}"),
+    let side = match side_for_signal(signal.signal) {
+        Some(side) => side,
+        None => return format!("no-op: unrecognized signal {}", signal.signal),
     };
 
     // An order from an earlier run may still be working (market closed, partial fill).
@@ -312,6 +387,11 @@ async fn run_rule(
     {
         Ok(id) => {
             state.automations.record_order(&rule.id);
+            *attempt = Some(OrderAttempt {
+                ok: true,
+                summary: format!("{side_label} {quantity} {} {} via {} (order {})", rule.symbol, rule.broker_id, rule.name, id.0),
+                details: None,
+            });
             format!(
                 "placed {side} {qty} {sym} @ mkt (order {oid}) — signal={sig} prob={prob:.2}",
                 side = side_label,
@@ -322,7 +402,14 @@ async fn run_rule(
                 prob = prob,
             )
         }
-        Err(e) => format!("order rejected: {e}"),
+        Err(e) => {
+            *attempt = Some(OrderAttempt {
+                ok: false,
+                summary: format!("Order rejected: {side_label} {quantity} {} {} via {}", rule.symbol, rule.broker_id, rule.name),
+                details: Some(e.to_string()),
+            });
+            format!("order rejected: {e}")
+        }
     }
 }
 
@@ -352,9 +439,23 @@ pub fn spawn_automation_loop(app: &AppHandle) {
             let paths = app.state::<RuntimePaths>();
 
             for rule in due {
-                let result = run_rule(&rule, &state, &models, &paths).await;
+                let (result, attempt) = run_rule(&rule, &state, &models, &paths).await;
                 tracing::info!(rule = %rule.id, %result, "automation ran");
                 state.automations.record_run(&rule.id, result.clone());
+                // Logged after the rule's counters are saved, so the panel that reloads on this
+                // entry shows the new order count and result together.
+                if let Some(order) = attempt {
+                    crate::activity::record(
+                        &state,
+                        "automation",
+                        "automation.order",
+                        "automation",
+                        &rule.id,
+                        &order.summary,
+                        order.ok,
+                        order.details,
+                    );
+                }
                 // Surface the outcome via the alert channel → in-app banner.
                 let _ = state.bus.publish(
                     apex_core::bus::message_bus::Topic::Alert,
@@ -374,4 +475,18 @@ pub fn spawn_automation_loop(app: &AppHandle) {
 /// Eagerly construct the engine so rules load at startup.
 pub fn new_engine(data_dir: &std::path::Path) -> Arc<AutomationEngine> {
     Arc::new(AutomationEngine::new(data_dir.join("automations.json")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_up_buys_and_every_other_known_class_exits() {
+        assert!(side_for_signal(1) == Some(OrderSide::Buy));
+        assert!(side_for_signal(0) == Some(OrderSide::Sell));
+        // A bearish class from a 3-class (return_threshold) model must exit a long, not be ignored.
+        assert!(side_for_signal(-1) == Some(OrderSide::Sell));
+        assert!(side_for_signal(2).is_none());
+    }
 }

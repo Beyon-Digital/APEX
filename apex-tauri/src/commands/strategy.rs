@@ -293,8 +293,19 @@ pub async fn create_strategy_file(
     path: String,
     content: Option<String>,
     runtime_paths: State<'_, python_runtime::RuntimePaths>,
+    state: State<'_, AppState>,
 ) -> Result<StrategyFileDto, String> {
-    let runtime_paths = runtime_paths.inner();
+    let result = create_strategy_file_inner(&path, content, runtime_paths.inner());
+    record_file_change(state.inner(), "strategy.create", "Created", "create", &path, &result.as_ref().map(|f| f.path.clone()).map_err(|e| e.clone()));
+    result
+}
+
+fn create_strategy_file_inner(
+    path: &str,
+    content: Option<String>,
+    runtime_paths: &python_runtime::RuntimePaths,
+) -> Result<StrategyFileDto, String> {
+    let path = path.to_string();
     let root = strategy_root(runtime_paths)?;
     let full_path = normalize_strategy_path(&path, runtime_paths)?;
 
@@ -323,8 +334,18 @@ pub async fn save_strategy_file(
     path: String,
     content: String,
     runtime_paths: State<'_, python_runtime::RuntimePaths>,
+    state: State<'_, AppState>,
 ) -> Result<StrategyFileDto, String> {
-    let runtime_paths = runtime_paths.inner();
+    let result = save_strategy_file_inner(&path, content, runtime_paths.inner());
+    record_file_change(state.inner(), "strategy.save", "Saved", "save", &path, &result.as_ref().map(|f| f.path.clone()).map_err(|e| e.clone()));
+    result
+}
+
+fn save_strategy_file_inner(
+    path: &str,
+    content: String,
+    runtime_paths: &python_runtime::RuntimePaths,
+) -> Result<StrategyFileDto, String> {
     let root = strategy_root(runtime_paths)?;
     let full_path = normalize_strategy_path(&path, runtime_paths)?;
 
@@ -347,8 +368,28 @@ pub async fn save_strategy_file(
 pub async fn delete_strategy_file(
     path: String,
     runtime_paths: State<'_, python_runtime::RuntimePaths>,
+    state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    let full_path = normalize_strategy_path(&path, runtime_paths.inner())?;
+    let result = delete_strategy_file_inner(&path, runtime_paths.inner());
+    // Deleting a file that was already gone changed nothing, so it is not logged.
+    if !matches!(result, Ok(false)) {
+        record_file_change(
+            state.inner(),
+            "strategy.delete",
+            "Deleted",
+            "delete",
+            &path,
+            &result.as_ref().map(|_| super::copilot_tools::audit::strategy_target(&path)).map_err(|e| e.clone()),
+        );
+    }
+    result
+}
+
+fn delete_strategy_file_inner(
+    path: &str,
+    runtime_paths: &python_runtime::RuntimePaths,
+) -> Result<bool, String> {
+    let full_path = normalize_strategy_path(path, runtime_paths)?;
 
     if !full_path.exists() {
         return Ok(false);
@@ -385,7 +426,7 @@ pub async fn run_strategy_file(
 
     let started_at = Utc::now();
     let result =
-        super::strategy_worker::run(&app, path, params_value, state.inner(), runtime_paths).await;
+        super::strategy_worker::run(&app, path, params_value, state.inner(), runtime_paths, "user").await;
     let finished_at = Utc::now();
     let (success, output, error) = match result {
         Ok(lines) => (true, lines, None),
@@ -407,7 +448,44 @@ pub async fn run_strategy_backtest(
     state: State<'_, AppState>,
     runtime_paths: State<'_, python_runtime::RuntimePaths>,
 ) -> Result<StrategyBacktestResultDto, String> {
-    run_backtest_inner(request, state.inner(), runtime_paths.inner()).await
+    let target = super::copilot_tools::audit::strategy_target(&request.path);
+    let symbol = request.symbol.trim().to_uppercase();
+    let result = run_backtest_inner(request, state.inner(), runtime_paths.inner()).await;
+    // A backtest changes nothing, so it is logged without telling panels to reload.
+    let (summary, details) = match &result {
+        Ok(r) => (backtest_summary(&target, &symbol, &r.metrics, r.trades.len()), None),
+        Err(error) => (format!("Backtest of {target} on {symbol} failed"), Some(error.clone())),
+    };
+    crate::activity::record_info(state.inner(), "user", "strategy.backtest", "strategy", &target, &summary, result.is_ok(), details);
+    result
+}
+
+fn backtest_summary(target: &str, symbol: &str, metrics: &BacktestMetrics, trades: usize) -> String {
+    format!(
+        "Backtested {target} on {symbol}: return {:.2}%, Sharpe {:.2}, {trades} trades",
+        metrics.total_return_pct, metrics.sharpe_ratio
+    )
+}
+
+/// Log a user-made change to a strategy file. `path` is what the caller asked for; on success
+/// `saved_path` is the canonical `strategies/...` path the UI knows the file by.
+fn record_file_change(
+    state: &AppState,
+    action: &str,
+    past: &str,
+    infinitive: &str,
+    path: &str,
+    saved_path: &Result<String, String>,
+) {
+    let target = saved_path
+        .as_ref()
+        .map(String::clone)
+        .unwrap_or_else(|_| super::copilot_tools::audit::strategy_target(path));
+    let (summary, details) = match saved_path {
+        Ok(_) => (format!("{past} {target}"), None),
+        Err(error) => (format!("Could not {infinitive} {target}"), Some(error.clone())),
+    };
+    crate::activity::record(state, "user", action, "strategy", &target, &summary, saved_path.is_ok(), details);
 }
 
 /// Shared backtest implementation — also used by the copilot agent loop.

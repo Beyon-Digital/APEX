@@ -438,15 +438,35 @@ pub struct MLModelDto {
 }
 
 /// ML training request DTO from frontend.
+///
+/// Every field except `algorithm` has a default so older callers (and older saved JSON) keep
+/// working. When `dataset` is set it supplies `data_path`, the feature columns, the target and
+/// the return column.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MLTrainingRequestDto {
     pub algorithm: String,
+    #[serde(default)]
     pub data_path: String,
+    #[serde(default)]
     pub target_column: String,
+    #[serde(default)]
     pub feature_columns: Vec<String>,
+    #[serde(default)]
     pub hyperparams: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(default = "default_n_splits")]
     pub n_splits: usize,
+    #[serde(default)]
     pub lag_periods: Vec<i64>,
+    /// Name of a dataset built in the workbench; when set it supplies `data_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    /// Column holding each row's forward return, used to score trading performance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_column: Option<String>,
+}
+
+fn default_n_splits() -> usize {
+    5
 }
 
 /// ML training result DTO for frontend.
@@ -456,6 +476,161 @@ pub struct MLTrainingResultDto {
     pub metrics: std::collections::HashMap<String, f64>,
     pub feature_names: Vec<String>,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f64>,
+}
+
+// ── ML workbench: features, datasets, model detail ───────────────────
+
+/// One entry of the shared feature catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureDefDto {
+    pub id: String,
+    pub label: String,
+    /// "Price" | "Trend" | "Momentum" | "Volatility" | "Volume"
+    pub group: String,
+    pub description: String,
+    /// Number of leading bars for which the value is not yet defined.
+    pub warmup_bars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelSpecDto {
+    pub horizon_bars: usize,
+    /// "direction" | "return_threshold"
+    pub kind: String,
+    #[serde(default)]
+    pub threshold_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildDatasetRequestDto {
+    pub name: String,
+    pub symbols: Vec<String>,
+    pub timeframe: String,
+    pub bars: usize,
+    pub features: Vec<String>,
+    pub label: LabelSpecDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetInfoDto {
+    pub name: String,
+    /// Path usable as `data_path` when training (relative to the work root).
+    pub path: String,
+    pub rows: usize,
+    pub symbols: Vec<String>,
+    pub timeframe: String,
+    pub features: Vec<String>,
+    pub label: LabelSpecDto,
+    pub class_counts: std::collections::BTreeMap<String, usize>,
+    pub created_at: String,
+    pub first_time: Option<String>,
+    pub last_time: Option<String>,
+    /// "user" | "copilot"
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetPreviewDto {
+    #[serde(flatten)]
+    pub info: DatasetInfoDto,
+    pub columns: Vec<String>,
+    pub sample: Vec<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CvFoldDto {
+    pub fold: usize,
+    pub train_rows: usize,
+    pub test_rows: usize,
+    pub accuracy: f64,
+    pub f1: f64,
+    pub precision: f64,
+    pub recall: f64,
+    #[serde(default)]
+    pub baseline_accuracy: Option<f64>,
+    #[serde(default)]
+    pub trade_return_pct: Option<f64>,
+    #[serde(default)]
+    pub hit_rate: Option<f64>,
+    #[serde(default)]
+    pub trades: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradingSummaryDto {
+    pub strategy_return_pct: f64,
+    pub buy_hold_return_pct: f64,
+    pub hit_rate: f64,
+    pub trades: usize,
+    pub max_drawdown_pct: f64,
+    pub sharpe: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureImportanceDto {
+    pub feature: String,
+    pub importance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUsageDto {
+    /// Always "automation".
+    pub kind: String,
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub symbol: String,
+}
+
+/// Everything the workbench shows about one model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDetailDto {
+    pub model_id: String,
+    pub algorithm: String,
+    pub status: String,
+    pub metrics: std::collections::HashMap<String, f64>,
+    pub feature_names: Vec<String>,
+    pub created_at: String,
+    pub data_path: String,
+    pub target_column: String,
+    pub display_name: String,
+    pub notes: String,
+    pub tags: Vec<String>,
+    /// "user" | "copilot" | "unknown"
+    pub source: String,
+    pub hyperparams: std::collections::HashMap<String, serde_json::Value>,
+    pub n_splits: usize,
+    pub lag_periods: Vec<i64>,
+    pub dataset: Option<String>,
+    pub symbols: Vec<String>,
+    pub timeframe: Option<String>,
+    pub label: Option<LabelSpecDto>,
+    pub rows: Option<usize>,
+    pub duration_secs: Option<f64>,
+    pub artifact_bytes: Option<u64>,
+    pub library_versions: std::collections::HashMap<String, String>,
+    pub cv_folds: Vec<CvFoldDto>,
+    pub feature_importance: Vec<FeatureImportanceDto>,
+    pub trading: Option<TradingSummaryDto>,
+    pub log_tail: String,
+    pub used_by: Vec<ModelUsageDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSignalPointDto {
+    pub time: String,
+    pub close: f64,
+    pub signal: i64,
+    pub probability: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSignalHistoryDto {
+    pub model_id: String,
+    pub symbol: String,
+    pub points: Vec<ModelSignalPointDto>,
 }
 
 /// Adapter health DTO for frontend.
