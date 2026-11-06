@@ -62,7 +62,15 @@ impl TimescaleAdapter {
 
             SELECT create_hypertable('ticks', 'time', if_not_exists => TRUE);
 
-            -- Add compression policy (compress after 7 days)
+            -- Compression must be enabled on the hypertable before a policy can be added.
+            -- TimescaleDB 2.18+ (columnstore) rejects the policy otherwise.
+            ALTER TABLE ticks SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'symbol',
+                timescaledb.compress_orderby = 'time DESC'
+            );
+
+            -- Compress after 7 days
             SELECT add_compression_policy('ticks', INTERVAL '7 days', if_not_exists => TRUE);
 
             -- Create index for symbol lookups
@@ -89,7 +97,13 @@ impl TimescaleAdapter {
 
             SELECT create_hypertable('ohlcv', 'time', if_not_exists => TRUE);
 
-            -- Add compression policy
+            ALTER TABLE ohlcv SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'symbol,timeframe',
+                timescaledb.compress_orderby = 'time DESC'
+            );
+
+            -- Compress after 30 days
             SELECT add_compression_policy('ohlcv', INTERVAL '30 days', if_not_exists => TRUE);
 
             -- Create unique index to prevent duplicates
@@ -721,5 +735,18 @@ mod tests {
         assert_eq!(TimescaleAdapter::timeframe_to_string(&Timeframe::M1), "M1");
         assert_eq!(TimescaleAdapter::timeframe_to_string(&Timeframe::H1), "H1");
         assert_eq!(TimescaleAdapter::timeframe_to_string(&Timeframe::W1), "W1");
+    }
+
+    /// Runs the schema setup against a real TimescaleDB. Opt in with
+    /// `APEX_TEST_TIMESCALE_URL=postgresql://user:pass@host:port/dbname` (a scratch database).
+    /// Setup must also be safe to run twice, since the app runs it on every launch.
+    #[tokio::test]
+    async fn schema_setup_works_on_a_real_timescaledb_and_is_repeatable() {
+        let Ok(url) = std::env::var("APEX_TEST_TIMESCALE_URL") else {
+            eprintln!("skipped: APEX_TEST_TIMESCALE_URL not set");
+            return;
+        };
+        TimescaleAdapter::new(&url).await.expect("first setup");
+        TimescaleAdapter::new(&url).await.expect("second setup");
     }
 }

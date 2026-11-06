@@ -122,7 +122,7 @@ async fn build_storage_or_fallback(
             sqlite_config.storage.backend = "sqlite".to_string();
             let mut bootstrap = build_storage(runtime_paths, &sqlite_config).await?;
             bootstrap.fallback_reason = Some(format!(
-                "Postgres/Timescale storage is configured but could not start ({reason}). Running on local SQLite instead. Fix the connection in Settings > General > Storage, or switch the backend back to SQLite."
+                "Postgres/Timescale storage is configured but could not start ({reason}). Running on local SQLite instead. Fix the database, or change the storage backend in Settings > General > Storage & runtime. Changes apply after restart."
             ));
             Ok(bootstrap)
         }
