@@ -169,8 +169,7 @@ pub async fn modify_order(
     };
 
     state
-        .otm
-        .modify_order(&OrderId(order_id), &broker_id, &params)
+        .guarded_modify(&OrderId(order_id), &broker_id, &params)
         .await
         .map_err(|e| format!("Failed to modify order: {}", e))
 }

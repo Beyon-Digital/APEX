@@ -37,7 +37,10 @@ export const useMarketStore = create<MarketState>()(
         set((state) => {
           const time = Date.parse(quote.updated_at);
           const previous = state.quotes.get(quote.symbol);
-          if (previous && Number.isFinite(Date.parse(previous.updated_at)) && (!Number.isFinite(time) || time < Date.parse(previous.updated_at))) return state;
+          // A pinned feed is the user's explicit choice. A delayed feed's timestamps are older
+          // than the live quote it replaced, and ignoring them would freeze the row.
+          const pinned = Boolean(state.providerPrefs[quote.symbol]);
+          if (!pinned && previous && Number.isFinite(Date.parse(previous.updated_at)) && (!Number.isFinite(time) || time < Date.parse(previous.updated_at))) return state;
           const newQuotes = new Map(state.quotes);
           newQuotes.set(quote.symbol, quote);
           const lastQuoteAt = Number.isFinite(time) && time <= Date.now() + 5_000
@@ -59,9 +62,11 @@ export const useMarketStore = create<MarketState>()(
       },
 
       removeFromWatchlist: (symbol: string) => {
-        set((state) => ({
-          watchlist: state.watchlist.filter((s) => s !== symbol),
-        }));
+        set((state) => {
+          const providerPrefs = { ...state.providerPrefs };
+          delete providerPrefs[symbol];
+          return { watchlist: state.watchlist.filter((s) => s !== symbol), providerPrefs };
+        });
       },
 
       getQuote: (symbol: string) => get().quotes.get(symbol),

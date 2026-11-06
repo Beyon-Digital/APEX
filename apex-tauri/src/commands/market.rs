@@ -76,12 +76,48 @@ pub async fn subscribe_symbols(
     symbols: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if symbols.len() > 500 {
+        return Err("Too many symbols in one request".into());
+    }
+    for symbol in &symbols {
+        validation::validate_symbol(symbol)?;
+    }
     let syms: Vec<Symbol> = symbols.into_iter().map(Symbol).collect();
     state
         .aggregator
         .start(&syms)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Symbols something other than the watchlist still needs live: running strategy
+/// sessions, price alerts and automations. Removing a ticker from the watchlist
+/// must not cut their data.
+async fn symbols_in_use(state: &AppState) -> std::collections::HashSet<String> {
+    let mut keep = std::collections::HashSet::new();
+    for session in crate::commands::strategy_worker::session_details() {
+        if session.state == "running" || session.state == "starting" {
+            keep.insert(session.symbol);
+        }
+    }
+    for rule in state.automations.list() {
+        if rule.enabled {
+            keep.insert(rule.symbol);
+        }
+    }
+    if let Ok(alerts) = state.alert_store.list().await {
+        for alert in alerts {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(&alert.rule) {
+                // AlertRule serializes as { "Variant": { "symbol": ... } }.
+                for inner in map.values() {
+                    if let Some(symbol) = inner.get("symbol").and_then(|s| s.as_str()) {
+                        keep.insert(symbol.to_string());
+                    }
+                }
+            }
+        }
+    }
+    keep
 }
 
 /// Stop streaming symbols that were removed from the watchlist.
@@ -94,7 +130,8 @@ pub async fn unsubscribe_symbols(
         validation::validate_symbol(symbol)?;
     }
     let syms: Vec<Symbol> = symbols.into_iter().map(Symbol).collect();
-    state.aggregator.unsubscribe(&syms).await;
+    let keep = symbols_in_use(&state).await;
+    state.aggregator.unsubscribe_except(&syms, &keep).await;
     Ok(())
 }
 

@@ -122,6 +122,7 @@ fn main() {
             commands::chatgpt::chatgpt_status,
             commands::chatgpt::chatgpt_sign_in,
             commands::chatgpt::chatgpt_sign_out,
+            commands::chatgpt::chatgpt_cancel_sign_in,
             commands::chatgpt::chatgpt_list_models,
             commands::chatgpt::chatgpt_set_preferences,
             commands::chatgpt::open_external_url,

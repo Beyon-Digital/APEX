@@ -44,12 +44,17 @@ export const LiveControls: React.FC = () => {
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'k') {
+        // This chord means "stop everything" app-wide. Swallow it completely so the code
+        // editor never also runs its own binding (Delete Line) on the same keypress.
         event.preventDefault();
+        event.stopImmediatePropagation();
         void stopEverything();
       }
     };
-    document.addEventListener('keydown', handler);
-    return () => document.removeEventListener('keydown', handler);
+    // Capture phase on window: the code editor handles Ctrl+Shift+K itself (Delete Line) and
+    // stops the event, so a bubbling document listener would never see it there.
+    window.addEventListener('keydown', handler, true);
+    return () => window.removeEventListener('keydown', handler, true);
   }, [stopEverything]);
 
   useEffect(() => {

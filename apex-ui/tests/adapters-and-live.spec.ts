@@ -174,3 +174,73 @@ test.describe('Per-ticker data feed', () => {
     await expect(badge).toHaveAttribute('title', /automatic/);
   });
 });
+
+test.describe('Live safeguards in the real layout', () => {
+  test('the kill-switch hotkey works while typing in the strategy editor', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    await page.getByTestId('live-arm-toggle').click();
+    await expect(page.getByTestId('live-arm-toggle')).toContainText('armed');
+    await page.getByTestId('tab-strategy').click();
+    const editor = page.getByTestId('strategy-editor');
+    await expect(editor.locator('.monaco-editor')).toBeVisible({ timeout: 15000 });
+    await editor.locator('.view-lines').click();
+    const textBefore = await editor.locator('.view-lines').innerText();
+    // The editor binds Ctrl+Shift+K to "Delete Line" and swallows it before page-level
+    // listeners run, so use the real Ctrl chord (not ControlOrMeta, which is Cmd on a Mac).
+    await page.keyboard.press('Control+Shift+K');
+    await expect(page.getByTestId('live-message')).toContainText('Kill switch');
+    await expect(page.getByTestId('live-arm-toggle')).toContainText('off');
+    // Compare the text, not a count of rendered rows (the editor virtualizes rows).
+    expect(await editor.locator('.view-lines').innerText()).toBe(textBefore);
+  });
+
+  test('the live order confirmation is a page-level modal whose button can be clicked', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    await page.getByTestId('open-settings').click();
+    await page.getByTestId('session-tokens-details').locator('summary').click();
+    await page.getByTestId('broker-token-zerodha').fill('session-token');
+    await page.getByTestId('broker-connect-zerodha').click();
+    await expect(page.getByTestId('broker-card-zerodha')).toContainText(/connected/i, { timeout: 5000 });
+    await page.getByTestId('settings-close-x').click();
+    await page.getByTestId('live-arm-toggle').click();
+    await page.getByTestId('order-broker-select').selectOption('zerodha');
+    await page.getByTestId('order-symbol-input').fill('RELIANCE.NS');
+    await page.getByTestId('order-quantity-input').fill('1');
+    await page.getByTestId('order-submit-button').click();
+    await expect(page.getByTestId('order-confirm-dialog')).toBeVisible();
+    const state = await page.getByTestId('order-confirm-submit').evaluate((button) => {
+      const rect = button.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+      return {
+        // A modal belongs to the page, not to whichever grid tile opened it. (We checked: the
+        // button was not actually clipped when it lived inside the tile, so this guards the
+        // structure and usability rather than a reproduced clipping bug.)
+        insideTile: Boolean(button.closest('[data-testid^="tile-"]')),
+        clickable: hit === button || button.contains(hit),
+        withinViewport: rect.x >= 0 && rect.y >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight,
+      };
+    });
+    expect(state).toEqual({ insideTile: false, clickable: true, withinViewport: true });
+    await page.getByTestId('order-confirm-submit').click();
+    await expect(page.getByTestId('order-confirmation')).toContainText('Submitted');
+  });
+
+  test('a STOP order from the command bar sends its number as the stop trigger, not a limit price', async ({ page }) => {
+    await page.addInitScript(() => { (window as unknown as { __ipcLog: unknown[] }).__ipcLog = []; });
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    const input = page.getByTestId('command-bar-input');
+    await input.click();
+    await input.fill('SELL AAPL 5 STOP 300');
+    await input.press('Enter');
+    await expect(page.getByTestId('command-bar-feedback')).toContainText('Order placed');
+    const request = await page.evaluate(() => {
+      const log = (window as unknown as { __ipcLog: { cmd: string; args: { request: Record<string, unknown> } }[] }).__ipcLog;
+      return log.filter((entry) => entry.cmd === 'place_order').pop()?.args.request;
+    });
+    expect(request).toMatchObject({ symbol: 'AAPL', side: 'Sell', order_type: 'Stop', quantity: 5, price: null, stop_price: 300 });
+  });
+});

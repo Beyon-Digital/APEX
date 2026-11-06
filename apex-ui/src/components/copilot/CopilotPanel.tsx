@@ -98,8 +98,8 @@ const ApprovalCard: React.FC<{
         Approval required — the copilot wants to run:
       </div>
       {approvals.map((a) => (
-        <div key={a.key} className="font-mono text-[10px] text-text-secondary truncate">
-          {TOOL_LABELS[a.name] ?? a.name} · {a.detail}
+        <div key={a.key} className="whitespace-pre-wrap break-words font-mono text-[10px] text-text-secondary" data-testid="copilot-approval-line">
+          <span className={a.detail.startsWith('[LIVE') ? 'font-bold text-bear' : ''}>{TOOL_LABELS[a.name] ?? a.name}</span> · {a.detail}
         </div>
       ))}
       {entry.approvalState === 'pending' ? (

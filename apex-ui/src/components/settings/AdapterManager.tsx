@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   clearBrokerSession, deleteAdapterConfig, getAdapterConfigs, importEnvCredentials, listAdapterSchemas,
   listBrokerConnections, saveAdapterConfig, setAdapterEnabled, testAdapterConnection, vaultLock, vaultStatus,
-  zerodhaLogin, zerodhaLoginUrl,
+  openExternalUrl, zerodhaLogin, zerodhaLoginUrl,
 } from '../../lib/tauri';
 import type { AdapterConfigDto, AdapterSchemaDto, AdapterTestResultDto, BrokerConnectionDto } from '../../lib/types';
 import { useBrokerStore } from '../../stores/brokerStore';
@@ -36,7 +36,16 @@ const AdapterCard: React.FC<CardProps> = ({ schema, config, connection, vaultUnl
   // Rows start collapsed so the Accounts tab is a short list, not a wall of fields.
   const [expanded, setExpanded] = useState(false);
 
-  useEffect(() => setSettings(config.settings), [config.settings]);
+  // Reset only when the saved values really change, not whenever another card triggers a reload.
+  const savedSettingsKey = JSON.stringify(config.settings);
+  useEffect(() => setSettings(config.settings), [savedSettingsKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Typed-but-unsaved secrets must not outlive the vault being locked.
+  useEffect(() => {
+    if (!vaultUnlocked) {
+      setSecrets({});
+      setCleared([]);
+    }
+  }, [vaultUnlocked]);
 
   const dirty = Object.values(secrets).some((v) => v.trim() !== '')
     || cleared.length > 0
@@ -191,7 +200,7 @@ const ZerodhaLogin: React.FC<{ ready: boolean; connection?: BrokerConnectionDto;
     try {
       const loginUrl = await zerodhaLoginUrl();
       setUrl(loginUrl);
-      window.open(loginUrl, '_blank', 'noopener');
+      await openExternalUrl(loginUrl);
     } catch (err) {
       setNotice({ ok: false, text: errorText(err) });
     }

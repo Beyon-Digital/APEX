@@ -73,7 +73,9 @@ fn canon_args(v: &Value) -> String {
             entries.sort_by(|a, b| a.0.cmp(b.0));
             let inner = entries
                 .iter()
-                .map(|(k, v)| format!("{}:{}", k, canon_args(v)))
+                // Keys are JSON-escaped like values, so two different objects can never
+                // produce the same string (a key containing `\":` would otherwise forge one).
+                .map(|(k, v)| format!("{}:{}", Value::String((*k).clone()), canon_args(v)))
                 .collect::<Vec<_>>()
                 .join(",");
             format!("{{{inner}}}")
@@ -104,7 +106,8 @@ async fn dispatch_tool(
 ) -> Option<Value> {
     let detail = trace_detail(name, args);
     let gated = state.copilot.require_approval
-        && (WRITE_TOOLS.contains(&name) || copilot_tools::EXTRA_WRITE_TOOLS.contains(&name));
+        && (WRITE_TOOLS.contains(&name)
+            || copilot_tools::needs_approval(name, args, state, runtime_paths));
 
     let result = if gated {
         let key = tool_approval_key(name, args);
@@ -200,7 +203,15 @@ fn resolve_provider(state: &AppState) -> Result<ResolvedProvider, String> {
     let prefs = crate::chatgpt_auth::preferences(&state.vault);
     if prefs.use_for_copilot {
         let status = crate::chatgpt_auth::status(state);
-        if status.state == "connected" && status.plan_usage {
+        if !(status.state == "connected" && status.plan_usage) {
+            // The user chose their ChatGPT plan; quietly using another provider (and
+            // sending their trading data there) would be a surprise.
+            return Err(
+                "Your ChatGPT sign-in is not active. Sign in again under Settings > AI Copilot, or turn off \"Use my ChatGPT plan\"."
+                    .to_string(),
+            );
+        }
+        {
             // Model names differ per account, so never guess one.
             let model = prefs.model.filter(|m| !m.trim().is_empty()).ok_or_else(|| {
                 "Choose a ChatGPT model under Settings > AI Copilot > ChatGPT plan.".to_string()
@@ -587,7 +598,17 @@ async fn exec_tool(
             let full = strategy::normalize_strategy_path(path, runtime_paths)?;
             let content =
                 std::fs::read_to_string(&full).map_err(|e| format!("cannot read {path}: {e}"))?;
-            Ok(json!({"path": path, "content": content.chars().take(12000).collect::<String>()}))
+            let total = content.chars().count();
+            let truncated = total > 12000;
+            Ok(json!({
+                "path": path,
+                "content": content.chars().take(12000).collect::<String>(),
+                "total_chars": total,
+                "truncated": truncated,
+                "note": if truncated {
+                    "Only the first 12000 characters are shown. Do NOT overwrite this file with rewritten content: you have not seen all of it."
+                } else { "" },
+            }))
         }
         "save_strategy" => {
             let path = arg_str(args, "path")?;
@@ -602,8 +623,19 @@ async fn exec_tool(
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
+            if full.exists() {
+                // Never destroy the only copy: keep the previous version next to it.
+                let backup = full.with_extension("py.bak");
+                std::fs::copy(&full, &backup).map_err(|e| format!("cannot back up {path}: {e}"))?;
+            }
             std::fs::write(&full, content).map_err(|e| format!("cannot write {path}: {e}"))?;
-            Ok(json!({"path": path, "saved": true}))
+            // The user approved this exact content, so running it needs no second approval.
+            state
+                .copilot_trusted_files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), copilot_tools::content_hash(content));
+            Ok(json!({"path": path, "saved": true, "hash": copilot_tools::content_hash(content)}))
         }
         "run_backtest" => {
             let req = StrategyBacktestRequestDto {
@@ -1350,5 +1382,23 @@ pub async fn copilot_chat(
                 pending_approvals,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod approval_key_tests {
+    use super::*;
+
+    #[test]
+    fn different_arguments_never_share_an_approval_key() {
+        // A key crafted to look like `"broker_id":"zerodha"` must not collide with the real one.
+        let forged = json!({"symbol":"AAPL","side":"buy","quantity":1,"broker_id\":\"zerodha\",zz":1});
+        let real = json!({"symbol":"AAPL","side":"buy","quantity":1,"broker_id":"zerodha","zz":1});
+        assert_ne!(canon_args(&forged), canon_args(&real));
+        // Key order still does not matter.
+        assert_eq!(
+            canon_args(&json!({"a":1,"b":{"y":2,"x":1}})),
+            canon_args(&json!({"b":{"x":1,"y":2},"a":1}))
+        );
     }
 }

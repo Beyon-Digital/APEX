@@ -73,6 +73,20 @@ impl std::fmt::Display for KiteApiError {
 
 impl std::error::Error for KiteApiError {}
 
+/// A `POST` whose result is not known: the request may or may not have reached
+/// Kite's order system (timeout, dropped connection, 5xx, unreadable reply). It
+/// must NOT be reported as a plain rejection, or the caller may send it again.
+#[derive(Debug, Clone)]
+pub struct AmbiguousOutcome(pub String);
+
+impl std::fmt::Display for AmbiguousOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "outcome unknown: {}", self.0)
+    }
+}
+
+impl std::error::Error for AmbiguousOutcome {}
+
 impl KiteApiError {
     pub fn is_token_error(&self) -> bool {
         self.error_type == "TokenException"
@@ -215,13 +229,18 @@ impl KiteSession {
 
     /// GET returning the raw body (instruments CSV).
     pub async fn get_text(&self, path: &str, bucket: Bucket) -> Result<String> {
+        let used = self.token();
         let response = self
             .send_once(Method::GET, path, &[], &[], bucket)
             .await?;
         let status = response.status();
         let body = response.text().await.context("Failed to read Kite response")?;
         if !status.is_success() {
-            return Err(self.parse_error(status.as_u16(), &body).into());
+            let error = self.parse_error(status.as_u16(), &body);
+            if error.is_token_error() {
+                self.expire_token(used);
+            }
+            return Err(error.into());
         }
         Ok(body)
     }
@@ -274,6 +293,7 @@ impl KiteSession {
     ) -> Result<Value> {
         let attempts = if retry { 3 } else { 1 };
         let mut last_err = anyhow!("Kite request not attempted");
+        let used = self.token();
         for attempt in 0..attempts {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(300 * (1 << attempt))).await;
@@ -288,25 +308,34 @@ impl KiteSession {
                         return Err(e);
                     }
                     self.set_health(AdapterHealth::Degraded(e.to_string()));
+                    if !retry {
+                        // The request may have been written before the connection failed.
+                        return Err(AmbiguousOutcome(e.to_string()).into());
+                    }
                     last_err = e;
                     continue;
                 }
             };
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(e) if !retry => return Err(AmbiguousOutcome(format!("reply unreadable: {e}")).into()),
+                Err(_) => String::new(),
+            };
             if status.is_success() {
                 self.set_health(AdapterHealth::Healthy);
-                let parsed: Value = serde_json::from_str(&body)
-                    .with_context(|| format!("Invalid Kite response from {path}"))?;
+                let parsed: Value = match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(e) if !retry => {
+                        return Err(AmbiguousOutcome(format!("unparseable reply from {path}: {e}")).into())
+                    }
+                    Err(e) => return Err(anyhow!("Invalid Kite response from {path}: {e}")),
+                };
                 return Ok(parsed.get("data").cloned().unwrap_or(Value::Null));
             }
             let error = self.parse_error(status.as_u16(), &body);
             if error.is_token_error() {
-                *self.token.write().unwrap() = None;
-                self.token_expired.store(true, Ordering::Relaxed);
-                self.set_health(AdapterHealth::Unhealthy(
-                    "Session expired. Log in to Zerodha again.".to_string(),
-                ));
+                self.expire_token(used);
                 return Err(error.into());
             }
             let transient = status.as_u16() == 429 || status.is_server_error();
@@ -314,11 +343,29 @@ impl KiteSession {
             if !transient {
                 return Err(error.into());
             }
+            if !retry && status.is_server_error() {
+                // A 5xx on an order write does not say whether the order was accepted.
+                return Err(AmbiguousOutcome(format!("Kite returned {status}")).into());
+            }
             warn!(path, status = status.as_u16(), "Transient Kite error, will retry");
             last_err = error.into();
         }
         debug!(path, "Kite request failed after retries");
         Err(last_err)
+    }
+
+    /// Mark the session expired, but only if the token that failed is still the
+    /// current one. A late rejection of an old token must not wipe a fresh login.
+    fn expire_token(&self, used: Option<String>) {
+        let mut guard = self.token.write().unwrap();
+        if *guard == used {
+            *guard = None;
+            drop(guard);
+            self.token_expired.store(true, Ordering::Relaxed);
+            self.set_health(AdapterHealth::Unhealthy(
+                "Session expired. Log in to Zerodha again.".to_string(),
+            ));
+        }
     }
 
     fn parse_error(&self, status: u16, body: &str) -> KiteApiError {
@@ -440,5 +487,28 @@ mod tests {
         assert_eq!(a.to_rfc3339(), "2024-01-15T03:45:00+00:00");
         let b = parse_kite_time("2024-01-15T09:15:00+0530").unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_late_rejection_of_an_old_token_cannot_wipe_a_fresh_login() {
+        let session = KiteSession::new("key".into(), Some("old".into())).unwrap();
+        let used = session.token();
+        session.set_token("fresh".into()); // the user logged in again while a request was in flight
+        session.expire_token(used);
+        assert_eq!(session.token().as_deref(), Some("fresh"));
+        assert!(!session.token_expired());
+        // The same rejection for the current token does expire it.
+        session.expire_token(session.token());
+        assert!(session.token().is_none() && session.token_expired());
+    }
+
+    #[test]
+    fn an_ambiguous_outcome_is_distinguishable_from_a_rejection() {
+        let ambiguous: anyhow::Error = AmbiguousOutcome("timed out".into()).into();
+        assert!(ambiguous.downcast_ref::<AmbiguousOutcome>().is_some());
+        assert!(ambiguous.to_string().contains("outcome unknown"));
+        let rejected: anyhow::Error =
+            KiteApiError { status: 400, error_type: "InputException".into(), message: "x".into() }.into();
+        assert!(rejected.downcast_ref::<AmbiguousOutcome>().is_none());
     }
 }

@@ -148,6 +148,7 @@ fn config_dto(state: &AppState, adapter_id: &str) -> Result<AdapterConfigDto, St
                 serde_json::from_str::<HashMap<String, serde_json::Value>>(&record.settings_json)
                     .unwrap_or_default()
                     .into_iter()
+                    .filter(|(k, _)| !k.ends_with("_expires_at"))
                     .map(|(k, v)| {
                         let text = match v {
                             serde_json::Value::String(s) => s,
@@ -194,6 +195,10 @@ pub async fn save_adapter_config(
     request: SaveAdapterConfigRequest,
     state: State<'_, AppState>,
 ) -> Result<AdapterConfigDto, String> {
+    let mut request = request;
+    // Keys the app manages itself (such as a login token's expiry) can come back from
+    // the form; they are not editable fields, so drop them instead of rejecting the save.
+    request.settings.retain(|key, _| !key.ends_with("_expires_at"));
     let adapter_id = request.adapter_id.as_str();
     validation::validate_adapter_id(adapter_id)?;
     if !state.vault.is_unlocked() {
@@ -281,6 +286,9 @@ pub async fn delete_adapter_config(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validation::validate_adapter_id(&adapter_id)?;
+    if !state.vault.is_unlocked() {
+        return Err("Vault is locked. Unlock it to remove credentials.".into());
+    }
     state.vault.delete_adapter(&adapter_id)?;
     if !adapter_id.starts_with("llm:") {
         state.reset_broker(&adapter_id).await.map_err(|e| e.to_string())?;

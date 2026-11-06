@@ -51,6 +51,13 @@ pub async fn chatgpt_sign_in(state: State<'_, AppState>) -> Result<String, Strin
     Ok(chatgpt_auth::redact_authorize_url(&url))
 }
 
+/// Abandon a pending browser sign-in.
+#[tauri::command]
+pub async fn chatgpt_cancel_sign_in(state: State<'_, AppState>) -> Result<ChatGptStatusDto, String> {
+    chatgpt_auth::cancel_sign_in(&state);
+    Ok(status_dto(&state))
+}
+
 #[tauri::command]
 pub async fn chatgpt_sign_out(state: State<'_, AppState>) -> Result<String, String> {
     let note = chatgpt_auth::sign_out(&state).await?;
@@ -92,9 +99,18 @@ pub async fn chatgpt_set_preferences(
 const OPENABLE_HOSTS: &[&str] = &["auth.openai.com", "kite.zerodha.com", "chatgpt.com"];
 
 fn openable(url: &str) -> bool {
+    // Whitespace, quotes and control characters have no place in these URLs and are
+    // what shells and argument parsers trip over.
+    if url.len() > 4096
+        || url
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | '^' | '|' | '\\'))
+    {
+        return false;
+    }
     let Some(rest) = url.strip_prefix("https://") else { return false };
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    !host.contains('@') && OPENABLE_HOSTS.contains(&host)
+    !host.contains('@') && !host.contains(':') && OPENABLE_HOSTS.contains(&host)
 }
 
 fn open_in_browser(url: &str) -> Result<(), String> {
@@ -103,10 +119,11 @@ fn open_in_browser(url: &str) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     let mut command = std::process::Command::new("open");
+    // Never go through cmd.exe: `&` in a query string would be run as a second command.
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", ""]);
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
         c
     };
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -133,5 +150,13 @@ mod tests {
         assert!(!openable("https://auth.openai.com@evil.example/"));
         assert!(!openable("file:///etc/passwd"));
         assert!(!openable("javascript:alert(1)"));
+        // Characters a Windows shell would treat as commands or separators.
+        assert!(!openable("https://auth.openai.com/?x&calc.exe b"));
+        assert!(!openable("https://auth.openai.com/?x|calc"));
+        assert!(!openable("https://auth.openai.com/?x^y"));
+        assert!(!openable("https://auth.openai.com/\"quoted"));
+        assert!(!openable("https://auth.openai.com:8443/"));
+        // The real URLs, which legitimately contain & and %, still open.
+        assert!(openable("https://auth.openai.com/api/accounts/authorize?client_id=a&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&state=S"));
     }
 }

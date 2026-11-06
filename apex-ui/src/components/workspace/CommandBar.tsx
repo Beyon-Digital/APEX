@@ -245,8 +245,9 @@ export const CommandBar: React.FC<CommandBarProps> = ({ onSelectSymbol, onSwitch
           side: cmd.side === 'BUY' ? 'Buy' : 'Sell',
           order_type: cmd.orderType === 'LIMIT' ? 'Limit' : cmd.orderType === 'STOP' ? 'Stop' : 'Market',
           quantity: cmd.quantity,
-          price: cmd.price ?? null,
-          stop_price: null,
+          // A STOP order's number is its trigger, not a limit price.
+          price: cmd.orderType === 'STOP' ? null : cmd.price ?? null,
+          stop_price: cmd.orderType === 'STOP' ? cmd.price ?? null : null,
           broker_id: activeBrokerId,
           tag: 'command-bar',
         };

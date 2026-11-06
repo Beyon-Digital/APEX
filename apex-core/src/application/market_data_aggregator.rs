@@ -27,7 +27,10 @@ pub struct FeedOption {
 
 /// How long a feed keeps a symbol after its last tick before lower-priority
 /// feeds may take over again.
-const SOURCE_HOLD: Duration = Duration::from_secs(10);
+const SOURCE_HOLD: Duration = Duration::from_secs(20);
+
+/// A feed the user pinned keeps its symbol through slower polls and short outages.
+const PINNED_HOLD: Duration = Duration::from_secs(60);
 
 /// Decide whether a tick from a feed of `priority` may update `symbol`.
 /// A higher-priority feed that ticked within [`SOURCE_HOLD`] blocks lower ones.
@@ -39,7 +42,8 @@ fn claim_symbol(
     let now = std::time::Instant::now();
     let mut entry = owners.entry(symbol.to_string()).or_insert((priority, now));
     let (owner_priority, last_seen) = *entry;
-    if owner_priority > priority && now.duration_since(last_seen) < SOURCE_HOLD {
+    let hold = if owner_priority == u8::MAX { PINNED_HOLD } else { SOURCE_HOLD };
+    if owner_priority > priority && now.duration_since(last_seen) < hold {
         return false;
     }
     *entry = (priority, now);
@@ -70,6 +74,13 @@ pub struct MarketDataAggregator {
     provider_overrides: Arc<DashMap<String, String>>,
     /// The feed that most recently supplied each symbol's quote.
     symbol_sources: Arc<DashMap<String, String>>,
+    /// Symbols that should currently flow. A stream that cannot be stopped keeps
+    /// delivering ticks after an unsubscribe; ticks for inactive symbols are dropped.
+    active_symbols: Arc<DashMap<String, ()>>,
+    /// Bumped whenever an adapter id is (re)registered so a dying stream task can
+    /// tell it belongs to a replaced adapter and must not touch the new one's state.
+    adapter_generation: Arc<DashMap<String, u64>>,
+    generation_counter: Arc<std::sync::atomic::AtomicU64>,
     data_quality_checker: Arc<DataQualityChecker>,
 }
 
@@ -90,6 +101,9 @@ impl MarketDataAggregator {
             source_priority: Arc::new(DashMap::new()),
             provider_overrides: Arc::new(DashMap::new()),
             symbol_sources: Arc::new(DashMap::new()),
+            active_symbols: Arc::new(DashMap::new()),
+            adapter_generation: Arc::new(DashMap::new()),
+            generation_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             data_quality_checker: Arc::new(DataQualityChecker::new()),
         }
     }
@@ -104,6 +118,8 @@ impl MarketDataAggregator {
         adapters.retain(|existing| existing.adapter_id() != id);
         // A replaced adapter starts with a clean subscription slate.
         self.subscribed_symbols.remove(&id);
+        let generation = self.generation_counter.fetch_add(1, Ordering::SeqCst);
+        self.adapter_generation.insert(id.clone(), generation);
         adapters.push(adapter);
     }
 
@@ -114,8 +130,12 @@ impl MarketDataAggregator {
             .iter()
             .position(|adapter| adapter.adapter_id() == adapter_id)?;
         self.subscribed_symbols.remove(adapter_id);
+        self.adapter_generation.remove(adapter_id);
         info!("Removed market data adapter: {adapter_id}");
-        Some(adapters.remove(index))
+        let removed = adapters.remove(index);
+        // Stop its background tasks and drop its credentials.
+        removed.shutdown();
+        Some(removed)
     }
 
     /// Re-run `start` for every symbol requested so far (idempotent per adapter).
@@ -166,8 +186,27 @@ impl MarketDataAggregator {
     }
 
     /// Stop tracking symbols: they are no longer re-subscribed on new adapters and
-    /// polling adapters stop fetching them.
-    pub async fn unsubscribe(&self, symbols: &[Symbol]) {
+    /// polling adapters stop fetching them. `keep` lists symbols other consumers
+    /// still need (strategy sessions, alerts, automations); those are left running.
+    /// Feeds whose streams cannot be stopped stay marked as subscribed (so adding
+    /// the symbol again does not open a second stream) and their ticks are dropped
+    /// while the symbol is inactive.
+    pub async fn unsubscribe_except(
+        &self,
+        symbols: &[Symbol],
+        keep: &std::collections::HashSet<String>,
+    ) {
+        let symbols: Vec<Symbol> = symbols
+            .iter()
+            .filter(|s| !keep.contains(&s.0))
+            .cloned()
+            .collect();
+        if symbols.is_empty() {
+            return;
+        }
+        for symbol in &symbols {
+            self.active_symbols.remove(&symbol.0);
+        }
         self.requested_symbols
             .write()
             .expect("requested symbols lock poisoned")
@@ -175,6 +214,9 @@ impl MarketDataAggregator {
         let adapters: Vec<Arc<dyn MarketDataPort>> =
             self.adapters.read().expect("adapters lock poisoned").clone();
         for adapter in adapters {
+            if !adapter.releases_on_unsubscribe() {
+                continue;
+            }
             let id = adapter.adapter_id().to_string();
             let owned: Vec<Symbol> = match self.subscribed_symbols.get_mut(&id) {
                 Some(mut known) => symbols.iter().filter(|s| known.remove(&s.0)).cloned().collect(),
@@ -187,6 +229,11 @@ impl MarketDataAggregator {
                 warn!(adapter = %id, %error, "Unsubscribe failed");
             }
         }
+    }
+
+    /// Stop tracking symbols nobody else needs.
+    pub async fn unsubscribe(&self, symbols: &[Symbol]) {
+        self.unsubscribe_except(symbols, &std::collections::HashSet::new()).await;
     }
 
     /// Symbols requested through `start` so far.
@@ -235,6 +282,7 @@ impl MarketDataAggregator {
                 if !requested.contains(symbol) {
                     requested.push(symbol.clone());
                 }
+                self.active_symbols.insert(symbol.0.clone(), ());
             }
         }
 
@@ -301,6 +349,9 @@ impl MarketDataAggregator {
             let data_quality_checker = self.data_quality_checker.clone();
             let subscribed_symbols = self.subscribed_symbols.clone();
             let source_priority = self.source_priority.clone();
+            let active_symbols = self.active_symbols.clone();
+            let adapter_generation = self.adapter_generation.clone();
+            let my_generation = self.adapter_generation.get(&adapter_id).map(|g| *g).unwrap_or(0);
             let provider_overrides = self.provider_overrides.clone();
             let symbol_sources = self.symbol_sources.clone();
             let priority = adapter.priority();
@@ -309,18 +360,8 @@ impl MarketDataAggregator {
             tokio::spawn(async move {
                 while let Some(tick) = tick_stream.recv().await {
                     let symbol_key = tick.symbol.0.clone();
-                    // The user's chosen feed outranks everything while it is ticking; if
-                    // it goes quiet the normal hold timeout lets another feed fill in.
-                    let chosen = provider_overrides
-                        .get(&symbol_key)
-                        .map(|v| v.as_str() == adapter_id)
-                        .unwrap_or(false);
-                    let effective = if chosen { u8::MAX } else { priority };
-                    if !claim_symbol(&source_priority, &symbol_key, effective) {
-                        continue; // a higher-priority feed is live for this symbol
-                    }
-                    if symbol_sources.get(&symbol_key).map(|v| v.as_str() != adapter_id).unwrap_or(true) {
-                        symbol_sources.insert(symbol_key.clone(), adapter_id.clone());
+                    if !active_symbols.contains_key(&symbol_key) {
+                        continue; // unsubscribed, but this feed's stream cannot be stopped
                     }
                     let span =
                         info_span!("tick_pipeline", symbol = %symbol_key, source = %adapter_id);
@@ -355,6 +396,22 @@ impl MarketDataAggregator {
                             }
                         }
                         continue;
+                    }
+
+                    // Only a tick that passed validation may take ownership of the symbol,
+                    // otherwise a feed sending garbage could lock out a healthy one.
+                    // The user's chosen feed outranks everything while it is ticking; if
+                    // it goes quiet the normal hold timeout lets another feed fill in.
+                    let chosen = provider_overrides
+                        .get(&symbol_key)
+                        .map(|v| v.as_str() == adapter_id)
+                        .unwrap_or(false);
+                    let effective = if chosen { u8::MAX } else { priority };
+                    if !claim_symbol(&source_priority, &symbol_key, effective) {
+                        continue; // a higher-priority feed is live for this symbol
+                    }
+                    if symbol_sources.get(&symbol_key).map(|v| v.as_str() != adapter_id).unwrap_or(true) {
+                        symbol_sources.insert(symbol_key.clone(), adapter_id.clone());
                     }
 
                     let tick_clone = span.in_scope(|| {
@@ -402,9 +459,14 @@ impl MarketDataAggregator {
                     // Add to tick buffer for batch write
                     tick_buffer.lock().await.push(tick_clone);
                 }
-                if let Some(mut known) = subscribed_symbols.get_mut(&adapter_id) {
-                    for symbol in &new_symbols {
-                        known.remove(&symbol.0);
+                // Only clean up if this adapter registration is still the current one; a
+                // replaced adapter's dying stream must not wipe the new one's state.
+                let current = adapter_generation.get(&adapter_id).map(|g| *g).unwrap_or(0);
+                if current == my_generation {
+                    if let Some(mut known) = subscribed_symbols.get_mut(&adapter_id) {
+                        for symbol in &new_symbols {
+                            known.remove(&symbol.0);
+                        }
                     }
                 }
                 warn!("Tick stream ended for adapter: {}", adapter_id);
@@ -748,5 +810,61 @@ mod tests {
         agg.set_provider_override("AAPL", None);
         assert_eq!(agg.provider_override("AAPL"), None);
         assert_eq!(agg.quote_source("AAPL"), None);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_keeps_symbols_other_consumers_still_need() {
+        let agg = MarketDataAggregator::new(Arc::new(MessageBus::new()));
+        let wanted = Symbol("RELIANCE.NS".into());
+        let other = Symbol("TCS.NS".into());
+        agg.active_symbols.insert(wanted.0.clone(), ());
+        agg.active_symbols.insert(other.0.clone(), ());
+        agg.requested_symbols
+            .write()
+            .unwrap()
+            .extend([wanted.clone(), other.clone()]);
+        let keep: std::collections::HashSet<String> = ["RELIANCE.NS".to_string()].into();
+        agg.unsubscribe_except(&[wanted.clone(), other.clone()], &keep).await;
+        assert!(agg.active_symbols.contains_key("RELIANCE.NS"), "a live strategy still needs it");
+        assert!(!agg.active_symbols.contains_key("TCS.NS"));
+        assert_eq!(agg.requested_symbols(), vec![wanted]);
+    }
+
+    #[test]
+    fn replacing_an_adapter_bumps_its_generation() {
+        struct Dummy;
+        #[async_trait::async_trait]
+        impl MarketDataPort for Dummy {
+            async fn subscribe(&self, _: &[Symbol]) -> Result<crate::ports::market_data::TickStream> {
+                let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                Ok(rx)
+            }
+            async fn unsubscribe(&self, _: &[Symbol]) -> Result<()> { Ok(()) }
+            async fn get_snapshot(&self, _: &Symbol) -> Result<Quote> { anyhow::bail!("unused") }
+            async fn get_historical_ohlcv(&self, _: &Symbol, _: Timeframe, _: chrono::DateTime<Utc>, _: chrono::DateTime<Utc>) -> Result<Vec<OHLCV>> { Ok(vec![]) }
+            fn adapter_id(&self) -> &'static str { "dummy" }
+            fn health(&self) -> AdapterHealth { AdapterHealth::Healthy }
+        }
+        let agg = MarketDataAggregator::new(Arc::new(MessageBus::new()));
+        agg.add_adapter(Arc::new(Dummy));
+        let first = *agg.adapter_generation.get("dummy").unwrap();
+        agg.add_adapter(Arc::new(Dummy));
+        let second = *agg.adapter_generation.get("dummy").unwrap();
+        assert!(second > first, "a dying stream from the first registration must be able to tell");
+        assert!(agg.remove_adapter("dummy").is_some());
+        assert!(agg.adapter_generation.get("dummy").is_none());
+    }
+
+    #[test]
+    fn a_pinned_feed_keeps_its_symbol_longer_than_an_automatic_one() {
+        let owners = DashMap::new();
+        let long_ago = |secs: u64| std::time::Instant::now() - Duration::from_secs(secs);
+        // An automatic owner quiet for 30s loses the symbol; a pinned one does not.
+        owners.insert("A".to_string(), (1u8, long_ago(30)));
+        assert!(claim_symbol(&owners, "A", 0));
+        owners.insert("B".to_string(), (u8::MAX, long_ago(30)));
+        assert!(!claim_symbol(&owners, "B", 0), "pinned feed polling slowly must not flap");
+        owners.insert("C".to_string(), (u8::MAX, long_ago(90)));
+        assert!(claim_symbol(&owners, "C", 0), "a pinned feed that is truly dead is eventually replaced");
     }
 }

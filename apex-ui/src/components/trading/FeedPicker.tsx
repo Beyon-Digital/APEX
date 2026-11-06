@@ -36,11 +36,25 @@ export const FeedPicker: React.FC<FeedPickerProps> = ({ symbol, feed, onChanged 
     setPos({ top: rect.bottom + 2, left: Math.max(8, Math.min(rect.left, window.innerWidth - 268)) });
   }, [open]);
 
+  // Move focus into the menu so it is usable from the keyboard.
+  useEffect(() => {
+    if (!open || !pos) return;
+    const first = document.querySelector<HTMLButtonElement>('[data-feed-menu] button:not([disabled])');
+    first?.focus();
+  }, [open, pos]);
+
   useEffect(() => {
     if (!open) return;
     const close = (event: MouseEvent | KeyboardEvent) => {
       if (event instanceof KeyboardEvent && event.key !== 'Escape') return;
-      if (event instanceof MouseEvent && (event.target as HTMLElement).closest('[data-feed-menu]')) return;
+      if (event instanceof KeyboardEvent) buttonRef.current?.focus();
+      if (event instanceof MouseEvent) {
+        const target = event.target as Node;
+        if ((target as HTMLElement).closest?.('[data-feed-menu]')) return;
+        // Clicking the badge again is the toggle's own job; closing here would let the
+        // same click reopen it.
+        if (buttonRef.current?.contains(target)) return;
+      }
       setOpen(false);
     };
     document.addEventListener('mousedown', close);

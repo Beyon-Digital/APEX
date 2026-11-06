@@ -210,6 +210,19 @@ pub fn stop_all_sessions() -> Vec<String> {
         .collect()
 }
 
+/// Stop only the sessions that trade a live broker (used when the vault locks).
+pub fn stop_live_sessions() -> Vec<String> {
+    let live: Vec<String> = session_details()
+        .into_iter()
+        .filter(|s| s.broker_id != "paper" && (s.state == "running" || s.state == "starting"))
+        .map(|s| s.path)
+        .collect();
+    for path in &live {
+        stop_session(path);
+    }
+    live
+}
+
 /// Details of running and recently finished sessions, newest first.
 pub fn session_details() -> Vec<SessionInfo> {
     let mut all: Vec<SessionInfo> = info_map()
@@ -588,7 +601,10 @@ async fn run_inner(
                                     // A halted risk engine ends the session; any other
                                     // rejection (risk cap, guard) is logged and retried
                                     // on the next signal rather than killing the strategy.
-                                    if error.to_lowercase().contains("halted") {
+                                    let lower = error.to_lowercase();
+                                    if lower.contains("halted") || lower.contains("outcome unknown") {
+                                        // An unknown outcome means the order may be live at the
+                                        // broker: stop rather than risk sending it again.
                                         return Err(error);
                                     }
                                     log!("{side} {symbol} rejected: {error}");
@@ -621,6 +637,31 @@ async fn run_inner(
         }
     }
     worker.finish().await;
+
+    // An order that was still working when the session ended must be settled before
+    // deciding what to close: a pending exit would otherwise be sold twice, and a
+    // pending entry would fill later with nobody managing it.
+    if let Some((id, long)) = pending.take() {
+        match tracked_status(state, &id) {
+            Some(status) if is_working(&status) => {
+                match state.otm.cancel_order(&id, broker_id).await {
+                    Ok(()) => log!("Cancelled order {} that was still working", id.0),
+                    Err(error) => log!("Could not cancel working order {} ({error}); check {broker_id}", id.0),
+                }
+            }
+            _ => {}
+        }
+        // Whatever happened to it (it may have filled while we cancelled), the book is the truth.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        if let Some(position) = state.otm.position(broker_id, &symbol) {
+            held = position.quantity > 0.0 && position.side == OrderSide::Buy;
+        } else if matches!(tracked_status(state, &id), Some(OrderStatus::Filled)) {
+            held = long;
+        } else {
+            held = false;
+        }
+        update_info(path, |info| info.held = held);
+    }
     if held {
         let close = NewOrderRequest {
             symbol: Symbol(symbol.clone()),

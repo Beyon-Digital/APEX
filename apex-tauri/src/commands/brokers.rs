@@ -26,6 +26,8 @@ pub async fn set_broker_session(
     state
         .set_broker_session(&broker_id, session_token.trim())
         .map_err(|err| err.to_string())?;
+    // The feed just became usable; give it the symbols that were requested earlier.
+    let _ = state.aggregator.sync_subscriptions().await;
     state
         .persist_session_token(&broker_id, session_token.trim(), None)
         .map_err(|err| err.to_string())?;
@@ -114,6 +116,7 @@ pub async fn zerodha_login(
     state
         .set_broker_session("zerodha", &token)
         .map_err(|e| e.to_string())?;
+    let _ = state.aggregator.sync_subscriptions().await;
     state
         .persist_session_token(
             "zerodha",
@@ -157,10 +160,15 @@ pub async fn zerodha_login_url(state: State<'_, AppState>) -> Result<String, Str
         .get_secret("zerodha", "api_key")?
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| "Zerodha API key not set. Add it under Settings > Adapters.".to_string())?;
-    Ok(format!(
-        "https://kite.zerodha.com/connect/login?v=3&api_key={}",
-        api_key.trim()
-    ))
+    let encoded: String = api_key
+        .trim()
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    Ok(format!("https://kite.zerodha.com/connect/login?v=3&api_key={encoded}"))
 }
 
 /// Accept either a bare request token or the full redirect URL containing

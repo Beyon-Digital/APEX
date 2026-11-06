@@ -244,6 +244,22 @@ async fn run_rule(
         other => return format!("no-op: unrecognized signal {other}"),
     };
 
+    // An order from an earlier run may still be working (market closed, partial fill).
+    // Sending another would stack them all up to fill together later.
+    let order_working = state.otm.open_orders().iter().any(|o| {
+        o.broker_id == rule.broker_id
+            && o.symbol.0 == rule.symbol
+            && matches!(
+                o.status,
+                apex_core::domain::models::OrderStatus::Pending
+                    | apex_core::domain::models::OrderStatus::Open
+                    | apex_core::domain::models::OrderStatus::PartiallyFilled
+            )
+    });
+    if order_working {
+        return format!("no-op: an earlier {} order is still working", rule.symbol);
+    }
+
     // Long/flat semantics: buy only when flat, sell only to exit a long. This stops
     // a signal that stays "1" from pyramiding on every run and never shorts.
     let held = state

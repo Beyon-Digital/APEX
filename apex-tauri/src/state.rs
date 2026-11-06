@@ -81,6 +81,12 @@ pub struct AppState {
     pub copilot_turn: std::sync::Mutex<Option<String>>,
     /// ChatGPT sign-in state (pending flow, refresh lock).
     pub chatgpt: crate::chatgpt_auth::Runtime,
+    /// Serializes changes to the live adapters (apply, reset, lock) so a lock can
+    /// never be undone by an apply that was already in flight.
+    broker_change_lock: tokio::sync::Mutex<()>,
+    /// Strategy files the copilot wrote and the user approved: path -> content hash.
+    /// A backtest of one of these runs without a second approval.
+    pub copilot_trusted_files: std::sync::Mutex<HashMap<String, String>>,
     market_data_feed: String,
     pub started_at: Instant,
 }
@@ -304,6 +310,8 @@ impl AppState {
             app: std::sync::OnceLock::new(),
             copilot_turn: std::sync::Mutex::new(None),
             chatgpt: crate::chatgpt_auth::Runtime::default(),
+            broker_change_lock: tokio::sync::Mutex::new(()),
+            copilot_trusted_files: std::sync::Mutex::new(HashMap::new()),
             market_data_feed,
             started_at: Instant::now(),
         })
@@ -471,12 +479,40 @@ impl AppState {
         }
         let slot = self.live_guard.reserve()?;
         match self.otm.submit_order(order, broker_id).await {
-            Ok(id) => Ok(id),
+            Ok(id) => {
+                // The order was past the checks when the user pulled the plug (kill
+                // switch, disarm, or a risk halt). It is now at the broker, so cancel it.
+                if !self.live_guard.is_armed() || self.risk.is_halted() {
+                    let _ = self.otm.cancel_order(&id, broker_id).await;
+                    return Err(
+                        "Live trading was disarmed while this order was being placed; it was cancelled."
+                            .to_string(),
+                    );
+                }
+                Ok(id)
+            }
             Err(error) => {
                 slot.refund();
                 Err(error.to_string())
             }
         }
+    }
+
+    /// Change a working order. Live modifications are gated like new orders: they
+    /// need live trading armed, stay within the per-order cap, and are risk checked.
+    pub async fn guarded_modify(
+        &self,
+        order_id: &apex_core::domain::models::OrderId,
+        broker_id: &str,
+        params: &apex_core::domain::models::ModifyParams,
+    ) -> std::result::Result<(), String> {
+        if broker_id != "paper" {
+            self.live_guard.check_modify(params.quantity)?;
+        }
+        self.otm
+            .modify_order(order_id, broker_id, params)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Emergency stop: disarm live trading, halt the risk engine, pause
@@ -503,7 +539,20 @@ impl AppState {
             })
             .collect();
         let (mut cancelled, mut failed) = (Vec::new(), Vec::new());
+        let mut handled = std::collections::HashSet::new();
         for order in working {
+            handled.insert((order.broker_id.clone(), order.id.0.clone()));
+            match self.otm.cancel_order(&order.id, &order.broker_id).await {
+                Ok(()) => cancelled.push(order.id.0.clone()),
+                Err(error) => failed.push(format!("{}: {error}", order.id.0)),
+            }
+        }
+        // Also reach orders APEX never tracked (placed before a restart, or from
+        // another app) by asking each connected broker what it has working.
+        for order in self.otm.broker_open_orders().await {
+            if !handled.insert((order.broker_id.clone(), order.id.0.clone())) {
+                continue;
+            }
             match self.otm.cancel_order(&order.id, &order.broker_id).await {
                 Ok(()) => cancelled.push(order.id.0.clone()),
                 Err(error) => failed.push(format!("{}: {error}", order.id.0)),
@@ -540,6 +589,14 @@ impl AppState {
     /// (Re)build one broker from the vault and swap it into the running registries.
     /// A disabled adapter is replaced by its unconfigured form.
     pub async fn apply_broker(&self, broker_id: &str) -> Result<()> {
+        let _serialized = self.broker_change_lock.lock().await;
+        self.apply_broker_locked(broker_id).await
+    }
+
+    async fn apply_broker_locked(&self, broker_id: &str) -> Result<()> {
+        if !self.vault.is_unlocked() {
+            return Err(anyhow!("The vault is locked."));
+        }
         if !CONFIGURABLE_BROKERS.contains(&broker_id) {
             return Err(anyhow!("Unknown broker: {}", broker_id));
         }
@@ -555,14 +612,20 @@ impl AppState {
             BrokerCredentials::default()
         };
         let built = build_broker(broker_id, &creds, &self.market_data_feed)?;
+        // The lock above prevents a lock_vault from interleaving; this catches one that
+        // finished while we were decrypting.
+        if !self.vault.is_unlocked() {
+            return Err(anyhow!("The vault was locked while applying; nothing was installed."));
+        }
         self.replace_broker(broker_id, built).await;
         Ok(())
     }
 
     /// Build every configurable broker from the vault (after unlock).
     pub async fn apply_all_brokers(&self) {
+        let _serialized = self.broker_change_lock.lock().await;
         for broker_id in CONFIGURABLE_BROKERS {
-            if let Err(error) = self.apply_broker(broker_id).await {
+            if let Err(error) = self.apply_broker_locked(broker_id).await {
                 tracing::warn!(broker = broker_id, %error, "Failed to apply broker configuration");
             }
         }
@@ -570,16 +633,26 @@ impl AppState {
 
     /// Reset a broker to its unconfigured form, dropping any held credentials.
     pub async fn reset_broker(&self, broker_id: &str) -> Result<()> {
+        let _serialized = self.broker_change_lock.lock().await;
+        self.reset_broker_locked(broker_id).await
+    }
+
+    async fn reset_broker_locked(&self, broker_id: &str) -> Result<()> {
         let built = build_broker(broker_id, &BrokerCredentials::default(), &self.market_data_feed)?;
         self.replace_broker(broker_id, built).await;
         Ok(())
     }
 
-    /// Lock the vault and drop every in-memory credential.
+    /// Lock the vault and drop every in-memory credential. Live trading is
+    /// disarmed and live strategy sessions stop: nothing can trade live without
+    /// the vault, and it must not come back armed after the next unlock.
     pub async fn lock_vault(&self) {
+        let _serialized = self.broker_change_lock.lock().await;
+        self.live_guard.set_armed(false);
+        crate::commands::strategy_worker::stop_live_sessions();
         self.vault.lock();
         for broker_id in CONFIGURABLE_BROKERS {
-            if let Err(error) = self.reset_broker(broker_id).await {
+            if let Err(error) = self.reset_broker_locked(broker_id).await {
                 tracing::warn!(broker = broker_id, %error, "Failed to reset broker on lock");
             }
         }

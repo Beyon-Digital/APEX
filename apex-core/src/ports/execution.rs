@@ -37,6 +37,21 @@ pub trait ExecutionPort: Send + Sync {
     fn latest_quote(&self, _symbol: &Symbol) -> Option<Quote> {
         None
     }
+    /// Orders currently working at the broker, including ones APEX never tracked
+    /// (placed before a restart or from another app). Used by the kill switch.
+    async fn list_open_orders(&self) -> Result<Vec<Order>> {
+        Ok(Vec::new())
+    }
+    /// True when [`realized_pnl`](Self::realized_pnl) is a real figure. Brokers
+    /// that return `false` have their realized P&L derived from fills instead.
+    fn reports_realized_pnl(&self) -> bool {
+        false
+    }
+    /// The account's realized P&L for the day, or an error when it cannot be
+    /// read right now (callers must not treat an error as zero).
+    async fn realized_pnl(&self) -> Result<Option<f64>> {
+        Ok(None)
+    }
     /// Long-term holdings (delivery portfolio), for brokers that distinguish them
     /// from intraday positions.
     async fn get_holdings(&self) -> Result<Vec<Position>> {

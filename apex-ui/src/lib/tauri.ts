@@ -359,6 +359,9 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     }
   }
   
+  // Web-mode test hook: specs can opt in by defining `window.__ipcLog = []`.
+  const ipcLog = (globalThis as { __ipcLog?: unknown }).__ipcLog;
+  if (Array.isArray(ipcLog)) ipcLog.push({ cmd, args });
   if (cmd === 'list_strategy_sessions' || cmd === 'list_strategy_session_details') return [] as any;
   if (cmd === 'list_automations') return [...mockAutomations] as any;
   if (cmd === 'create_automation') {

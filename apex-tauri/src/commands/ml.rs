@@ -319,9 +319,14 @@ pub(crate) async fn model_signal_inner(
     validation::validate_symbol(symbol)?;
     // model_id selects a file inside models_dir — restrict to a safe
     // filename charset (no separators, no `..`) so it can't escape.
-    validation::validate_symbol(model_id)?;
-    if model_id.contains("..") {
-        return Err("model_id must not contain '..'".into());
+    // A model id names a file inside models_dir: letters, digits, `_`, `-` and `.` only.
+    // (validate_symbol also allows `/` and `:`, which would let an id walk out of the directory.)
+    if model_id.is_empty()
+        || model_id.len() > 128
+        || !model_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        || model_id.contains("..")
+    {
+        return Err("model_id may only contain letters, digits, '_', '-' and '.'".into());
     }
 
     // Model metadata → artifact + required feature order.

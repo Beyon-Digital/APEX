@@ -61,7 +61,15 @@ pub struct OrderTradeManager {
     live_realized: tokio::sync::Mutex<HashMap<String, f64>>,
     /// Latest quotes, used to price live market orders for risk checks.
     quote_cache: RwLock<Option<Arc<DashMap<String, Quote>>>>,
+    /// Fill quantity and average price already accounted for, per order.
+    fill_seen: DashMap<String, (f64, f64)>,
+    /// Signed position and average cost per (broker, symbol), for brokers that
+    /// do not report realized P&L themselves.
+    cost_basis: std::sync::Mutex<HashMap<(String, String), (f64, f64)>>,
 }
+
+/// Live market orders are valued from a quote no older than this.
+const MAX_QUOTE_AGE_SECS: i64 = 120;
 
 impl OrderTradeManager {
     /// Create a new Order & Trade Manager
@@ -76,6 +84,8 @@ impl OrderTradeManager {
             paper_operations: tokio::sync::Mutex::new(()),
             live_realized: tokio::sync::Mutex::new(HashMap::new()),
             quote_cache: RwLock::new(None),
+            fill_seen: DashMap::new(),
+            cost_basis: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -85,13 +95,17 @@ impl OrderTradeManager {
         *self.quote_cache.write().expect("quote cache lock poisoned") = Some(cache);
     }
 
+    /// Last price from a recent quote. A stale quote is not used to value a live order.
     fn reference_price(&self, symbol: &Symbol) -> Option<f64> {
         self.quote_cache
             .read()
             .expect("quote cache lock poisoned")
             .as_ref()
-            .and_then(|cache| cache.get(&symbol.0).map(|q| q.last))
-            .filter(|p| *p > 0.0)
+            .and_then(|cache| cache.get(&symbol.0).map(|q| q.clone()))
+            .filter(|q| {
+                q.last > 0.0 && (chrono::Utc::now() - q.updated_at).num_seconds() <= MAX_QUOTE_AGE_SECS
+            })
+            .map(|q| q.last)
     }
 
     /// Register (or replace) an execution adapter. Safe to call at runtime.
@@ -153,17 +167,25 @@ impl OrderTradeManager {
                 (a, b) => a.or(b),
             };
         }
-        if broker_id != "paper" && risk_request.price.is_none() {
-            // Live market/stop orders carry no price; value them from the latest
-            // quote so max_order_value still applies, and fail closed without one.
-            risk_request.price = self
-                .reference_price(&request.symbol)
-                .or(request.stop_price);
-            if risk_request.price.is_none() {
-                return Err(anyhow!(
-                    "No live quote for {}; cannot verify the order against risk limits",
-                    request.symbol.0
-                ));
+        if broker_id != "paper" {
+            // A market order is valued from a fresh quote, never from a caller-supplied
+            // price (a tiny price would hide a huge order from max_order_value; Zerodha
+            // ignores the price on MARKET anyway). Take the higher of the two. Other
+            // order types keep their own price, falling back to the stop or the quote.
+            let reference = self.reference_price(&request.symbol);
+            let valued = if request.order_type == OrderType::Market {
+                reference.map(|quote| quote.max(request.price.unwrap_or(0.0)))
+            } else {
+                risk_request.price.or(reference).or(request.stop_price)
+            };
+            match valued {
+                Some(price) => risk_request.price = Some(price),
+                None => {
+                    return Err(anyhow!(
+                        "No live quote for {}; cannot verify the order against risk limits",
+                        request.symbol.0
+                    ))
+                }
             }
         }
         let verdict = self.risk_engine.check(&risk_request, &account);
@@ -179,9 +201,39 @@ impl OrderTradeManager {
         // 3. Dispatch to broker adapter
         let order_id = adapter.place_order(&request).await?;
 
-        // 4. Get order status and track it
-        if let Ok(order) = adapter.get_order_status(&order_id).await {
+        // 4. Get order status and track it. If the lookup fails the order may still be
+        // live at the broker, so track a placeholder (the kill switch and the status
+        // poller then still see it).
+        let looked_up = adapter.get_order_status(&order_id).await;
+        if let Err(error) = &looked_up {
+            warn!(order = %order_id.0, %error, "Order placed but its status could not be read; tracking a placeholder");
+            let now = chrono::Utc::now();
+            let placeholder = Order {
+                id: order_id.clone(),
+                symbol: request.symbol.clone(),
+                side: request.side.clone(),
+                order_type: request.order_type.clone(),
+                quantity: request.quantity,
+                price: request.price,
+                stop_price: request.stop_price,
+                status: OrderStatus::Pending,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                created_at: now,
+                updated_at: now,
+                broker_id: broker_id.to_string(),
+                source: request.tag.clone().unwrap_or_else(|| "api".into()),
+                rejection_reason: None,
+            };
+            self.open_orders.insert(order_id.0.clone(), placeholder.clone());
+            self.bus.publish(
+                Topic::OrderUpdate(order_id.0.clone()),
+                BusMessage::OrderData(placeholder),
+            );
+        }
+        if let Ok(order) = looked_up {
             let has_fill = order.filled_qty > 0.0;
+            let order_for_pnl = order.clone();
             self.open_orders.insert(order_id.0.clone(), order.clone());
 
             // 5. Publish OrderUpdate to message bus
@@ -202,6 +254,7 @@ impl OrderTradeManager {
                 }
                 if broker_id != "paper" {
                     self.sync_live_pnl(broker_id).await;
+                    self.account_fill_pnl(&order_for_pnl);
                 }
                 if let Err(error) = self.reconcile_positions(broker_id).await {
                     warn!(%error, "Order filled; position reconciliation will retry");
@@ -279,6 +332,42 @@ impl OrderTradeManager {
             None
         };
         let adapter = self.adapter(broker_id)?;
+
+        if broker_id != "paper" {
+            // A modify can turn a small confirmed order into a huge one, so it gets the
+            // same risk check as a new order, and nothing changes while trading is halted.
+            if self.risk_engine.is_halted() {
+                return Err(anyhow!("Trading is halted by the risk engine. Resolve it before modifying orders."));
+            }
+            if params.quantity.is_some() || params.price.is_some() || params.stop_price.is_some() {
+                let tracked = self.open_orders.get(&order_id.0).map(|o| o.clone());
+                let existing = match tracked {
+                    Some(order) => order,
+                    None => adapter.get_order_status(order_id).await?,
+                };
+                let price = params
+                    .price
+                    .or(existing.price)
+                    .or(params.stop_price)
+                    .or(existing.stop_price)
+                    .or_else(|| self.reference_price(&existing.symbol))
+                    .ok_or_else(|| anyhow!("No price available to check the modified order against risk limits"))?;
+                let check = NewOrderRequest {
+                    symbol: existing.symbol.clone(),
+                    side: existing.side.clone(),
+                    order_type: existing.order_type.clone(),
+                    quantity: params.quantity.unwrap_or(existing.quantity),
+                    price: Some(price),
+                    stop_price: params.stop_price.or(existing.stop_price),
+                    tag: None,
+                    broker_params: None,
+                };
+                let account = adapter.get_account_balance().await?;
+                if let RiskVerdict::Reject(reason) = self.risk_engine.check_resting(&check, &account) {
+                    return Err(anyhow!("Risk check failed: {reason}"));
+                }
+            }
+        }
 
         adapter.modify_order(order_id, params).await?;
 
@@ -421,16 +510,96 @@ impl OrderTradeManager {
     /// Report a live broker's realized P&L change to the risk engine so the
     /// daily-loss halt covers live trading, not only paper.
     pub async fn sync_live_pnl(&self, broker_id: &str) {
-        let Ok(balance) = self.get_account_balance(broker_id).await else {
+        let Ok(adapter) = self.adapter(broker_id) else { return };
+        // Brokers without a realized-P&L figure are accounted from fills instead
+        // (see `account_fill_pnl`).
+        if !adapter.reports_realized_pnl() {
             return;
+        }
+        let realized_now = match adapter.realized_pnl().await {
+            Ok(Some(value)) if value.is_finite() => value,
+            Ok(_) => return,
+            Err(error) => {
+                // Unknown is not zero: skipping keeps a failed read from masking a loss.
+                warn!(broker = broker_id, %error, "Could not read realized P&L; daily-loss check skipped this time");
+                return;
+            }
         };
         let mut realized = self.live_realized.lock().await;
         let previous = realized.get(broker_id).copied().unwrap_or(0.0);
-        let delta = balance.realized_pnl - previous;
+        let delta = realized_now - previous;
         if delta != 0.0 {
             self.risk_engine.update_pnl(delta);
-            realized.insert(broker_id.to_string(), balance.realized_pnl);
+            realized.insert(broker_id.to_string(), realized_now);
         }
+    }
+
+    /// Realized P&L from a newly reported fill, for brokers that do not report it.
+    /// Tracks a per-(broker, symbol) average cost and feeds closed P&L to the risk engine.
+    pub fn account_fill_pnl(&self, order: &Order) {
+        let Ok(adapter) = self.adapter(&order.broker_id) else { return };
+        if adapter.reports_realized_pnl() {
+            return;
+        }
+        let realized = self.fill_pnl_delta(order);
+        if realized != 0.0 {
+            self.risk_engine.update_pnl(realized);
+        }
+    }
+
+    fn fill_pnl_delta(&self, order: &Order) -> f64 {
+        let (seen_qty, seen_avg) = self
+            .fill_seen
+            .get(&order.id.0)
+            .map(|v| *v)
+            .unwrap_or((0.0, 0.0));
+        let delta_qty = order.filled_qty - seen_qty;
+        if delta_qty <= 0.0 {
+            return 0.0;
+        }
+        self.fill_seen
+            .insert(order.id.0.clone(), (order.filled_qty, order.avg_price));
+        // Price of just the new part of the fill, from the cumulative averages.
+        let delta_price = (order.filled_qty * order.avg_price - seen_qty * seen_avg) / delta_qty;
+        let signed = if order.side == OrderSide::Buy { delta_qty } else { -delta_qty };
+
+        let mut basis = self.cost_basis.lock().expect("cost basis lock poisoned");
+        let entry = basis
+            .entry((order.broker_id.clone(), order.symbol.0.clone()))
+            .or_insert((0.0, 0.0));
+        let (position, average) = *entry;
+        if position == 0.0 || position.signum() == signed.signum() {
+            let total = position + signed;
+            let new_average = (position * average + signed * delta_price) / total;
+            *entry = (total, new_average);
+            return 0.0;
+        }
+        let closing = position.abs().min(signed.abs());
+        let realized = closing * (delta_price - average) * position.signum();
+        let remaining = position + signed;
+        *entry = if remaining == 0.0 || remaining.signum() == position.signum() {
+            (remaining, average)
+        } else {
+            (remaining, delta_price) // flipped through zero: the rest opens at this price
+        };
+        realized
+    }
+
+    /// Every order working at the connected live brokers, including ones APEX never
+    /// tracked. Errors are logged and skipped so one broker cannot block the others.
+    pub async fn broker_open_orders(&self) -> Vec<Order> {
+        let mut found = Vec::new();
+        for broker_id in self.authenticated_broker_ids() {
+            if broker_id == "paper" {
+                continue;
+            }
+            let Ok(adapter) = self.adapter(&broker_id) else { continue };
+            match adapter.list_open_orders().await {
+                Ok(orders) => found.extend(orders),
+                Err(error) => warn!(broker = %broker_id, %error, "Could not list open orders"),
+            }
+        }
+        found
     }
 
     /// Apply an order state pushed by (or polled from) a live broker: track it,
@@ -447,6 +616,7 @@ impl OrderTradeManager {
             }
         }
         let broker_id = order.broker_id.clone();
+        let order_key = order.id.0.clone();
         let new_fill = order.filled_qty > previous_fill.map(|(f, _)| f).unwrap_or(0.0);
         self.open_orders.insert(order.id.0.clone(), order.clone());
         self.bus.publish(
@@ -455,6 +625,9 @@ impl OrderTradeManager {
         );
         if new_fill && broker_id != "paper" {
             self.sync_live_pnl(&broker_id).await;
+            if let Some(tracked) = self.open_orders.get(&order_key).map(|o| o.clone()) {
+                self.account_fill_pnl(&tracked);
+            }
             if let Err(error) = self.reconcile_positions(&broker_id).await {
                 warn!(%error, "Broker fill received; position reconciliation will retry");
             }
@@ -791,6 +964,12 @@ mod tests {
                 currency: "INR".into(),
             })
         }
+        fn reports_realized_pnl(&self) -> bool {
+            true
+        }
+        async fn realized_pnl(&self) -> Result<Option<f64>> {
+            Ok(Some(*self.realized.lock().unwrap()))
+        }
         fn broker_id(&self) -> &'static str {
             "live"
         }
@@ -938,5 +1117,113 @@ mod tests {
         assert_eq!(otm.position("paper", "RELIANCE.NS").unwrap().quantity, 5.0);
         assert_eq!(otm.position("zerodha", "RELIANCE.NS").unwrap().quantity, 7.0);
         assert!(otm.position("binance", "RELIANCE.NS").is_none());
+    }
+
+    fn quote_at(symbol: &str, last: f64, age_secs: i64) -> Quote {
+        Quote {
+            symbol: Symbol(symbol.into()),
+            bid: last,
+            ask: last,
+            last,
+            open: last,
+            high: last,
+            low: last,
+            volume: 1,
+            change_pct: 0.0,
+            vwap: last,
+            updated_at: chrono::Utc::now() - chrono::Duration::seconds(age_secs),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tiny_caller_price_cannot_hide_a_large_market_order() {
+        let (otm, broker, _) = live_otm();
+        let cache = Arc::new(DashMap::new());
+        cache.insert("RELIANCE.NS".to_string(), quote_at("RELIANCE.NS", 1_000_000.0, 1));
+        otm.set_quote_cache(cache);
+        *broker.status.lock().unwrap() = Some(live_order(OrderStatus::Open, 0.0));
+        let mut order = market_buy("RELIANCE.NS");
+        order.price = Some(0.01); // pretends the order is worth a few paise
+        let err = otm.submit_order(order, "live").await.unwrap_err();
+        assert!(err.to_string().contains("Risk check failed"), "{err}");
+        assert!(broker.placed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_quote_is_not_used_to_value_a_live_order() {
+        let (otm, broker, _) = live_otm();
+        let cache = Arc::new(DashMap::new());
+        cache.insert("RELIANCE.NS".to_string(), quote_at("RELIANCE.NS", 100.0, 3600));
+        otm.set_quote_cache(cache);
+        let err = otm.submit_order(market_buy("RELIANCE.NS"), "live").await.unwrap_err();
+        assert!(err.to_string().contains("No live quote"), "{err}");
+        assert!(broker.placed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn modifying_a_live_order_is_risk_checked_and_blocked_when_halted() {
+        let (otm, broker, risk) = live_otm();
+        otm.apply_broker_order_update(live_order(OrderStatus::Open, 0.0)).await;
+        *broker.status.lock().unwrap() = Some(live_order(OrderStatus::Open, 0.0));
+        let id = OrderId("live-1".into());
+
+        // 10 -> 100000 shares at 100 is far over max_order_value.
+        let huge = ModifyParams { quantity: Some(100_000.0), price: None, stop_price: None };
+        let err = otm.modify_order(&id, "live", &huge).await.unwrap_err();
+        assert!(err.to_string().contains("Risk check failed"), "{err}");
+
+        // A sensible modify passes.
+        let ok = ModifyParams { quantity: Some(5.0), price: Some(99.0), stop_price: None };
+        otm.modify_order(&id, "live", &ok).await.unwrap();
+
+        // And nothing is modified while trading is halted.
+        risk.halt();
+        let err = otm.modify_order(&id, "live", &ok).await.unwrap_err();
+        assert!(err.to_string().contains("halted"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_order_whose_status_lookup_fails_is_still_tracked() {
+        let (otm, broker, _) = live_otm();
+        let cache = Arc::new(DashMap::new());
+        cache.insert("RELIANCE.NS".to_string(), quote_at("RELIANCE.NS", 100.0, 1));
+        otm.set_quote_cache(cache);
+        *broker.status.lock().unwrap() = None; // get_order_status errors
+        otm.submit_order(market_buy("RELIANCE.NS"), "live").await.unwrap();
+        let tracked = otm.open_orders();
+        assert_eq!(tracked.len(), 1, "the kill switch must be able to find it");
+        assert_eq!(tracked[0].status, OrderStatus::Pending);
+    }
+
+    #[test]
+    fn realized_pnl_is_derived_from_fills_with_average_cost() {
+        let bus = Arc::new(MessageBus::new());
+        let risk = Arc::new(RiskEngine::new(RiskConfig::default()));
+        let otm = OrderTradeManager::new(risk, bus);
+        let fill = |id: &str, side: OrderSide, qty: f64, avg: f64| Order {
+            id: OrderId(id.into()),
+            symbol: Symbol("X".into()),
+            side,
+            order_type: OrderType::Market,
+            quantity: qty,
+            price: None,
+            stop_price: None,
+            status: OrderStatus::Filled,
+            filled_qty: qty,
+            avg_price: avg,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            broker_id: "binance".into(),
+            source: "t".into(),
+            rejection_reason: None,
+        };
+        assert_eq!(otm.fill_pnl_delta(&fill("a", OrderSide::Buy, 10.0, 100.0)), 0.0);
+        assert_eq!(otm.fill_pnl_delta(&fill("b", OrderSide::Buy, 10.0, 110.0)), 0.0); // avg now 105
+        // Selling 10 at 95 realizes 10 * (95 - 105) = -100.
+        assert_eq!(otm.fill_pnl_delta(&fill("c", OrderSide::Sell, 10.0, 95.0)), -100.0);
+        // Re-reporting the same fill adds nothing.
+        assert_eq!(otm.fill_pnl_delta(&fill("c", OrderSide::Sell, 10.0, 95.0)), 0.0);
+        // Closing the rest at 115 realizes 10 * (115 - 105) = +100.
+        assert_eq!(otm.fill_pnl_delta(&fill("d", OrderSide::Sell, 10.0, 115.0)), 100.0);
     }
 }

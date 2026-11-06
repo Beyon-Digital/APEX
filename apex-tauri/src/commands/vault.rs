@@ -60,6 +60,9 @@ pub async fn vault_change_passphrase(
     state
         .vault
         .change_passphrase(&old_passphrase, &new_passphrase)?;
+    // Changing the passphrase leaves the vault unlocked. If it was locked before,
+    // bring the adapters online like a normal unlock would.
+    state.apply_all_brokers().await;
     Ok(status_dto(&state))
 }
 
@@ -81,8 +84,9 @@ const ENV_IMPORT_MAP: &[(&str, &str, &str, bool)] = &[
     ("COINBASE_API_KEY", "coinbase", "api_key", true),
     ("COINBASE_API_SECRET", "coinbase", "api_secret", true),
     ("COINBASE_PASSPHRASE", "coinbase", "passphrase", true),
-    ("OPEN_ROUTER", "llm:copilot", "api_key", true),
-    ("OPENROUTER_API_KEY", "llm:copilot", "api_key", true),
+    // `llm:@active` resolves at import time to the provider the copilot really uses.
+    ("OPEN_ROUTER", "llm:@active", "api_key", true),
+    ("OPENROUTER_API_KEY", "llm:@active", "api_key", true),
 ];
 
 fn is_placeholder(value: &str) -> bool {
@@ -112,8 +116,16 @@ pub async fn import_env_credentials(
         .collect();
 
     let mut imported = Vec::new();
-    let mut touched: Vec<&str> = Vec::new();
+    let mut touched: Vec<String> = Vec::new();
+    // The copilot reads its key from `llm:<active provider>`, or `llm:copilot` when
+    // none is selected. Importing to any other slot would look saved but never be read.
+    let llm_slot = if state.llm.active.trim().is_empty() {
+        "llm:copilot".to_string()
+    } else {
+        format!("llm:{}", state.llm.active)
+    };
     for (var, adapter_id, field, secret) in ENV_IMPORT_MAP {
+        let adapter_id: &str = if *adapter_id == "llm:@active" { llm_slot.as_str() } else { adapter_id };
         let Some(value) = vars.get(*var).filter(|v| !is_placeholder(v)) else {
             continue;
         };
@@ -136,11 +148,11 @@ pub async fn import_env_credentials(
                 .set_config(adapter_id, enabled, &serde_json::Value::Object(settings).to_string())?;
         }
         imported.push((*var).to_string());
-        if !touched.contains(adapter_id) {
-            touched.push(adapter_id);
+        if !touched.iter().any(|t| t == adapter_id) {
+            touched.push(adapter_id.to_string());
         }
     }
-    for adapter_id in touched {
+    for adapter_id in &touched {
         if !adapter_id.starts_with("llm:") {
             state
                 .apply_broker(adapter_id)

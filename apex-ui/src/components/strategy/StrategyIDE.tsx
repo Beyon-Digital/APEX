@@ -170,6 +170,11 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
   const saveCurrentFileRef = useRef<() => void>(() => {});
 
   const activeFile = files[activeFileIndex];
+  // The second click confirms what the first click showed: change the file, account,
+  // size or duration in between and the confirmation starts over.
+  useEffect(() => {
+    setLiveRunPending(false);
+  }, [activeFile?.path, runBroker, paperQuantity, runMinutes]);
   const backtestKey = JSON.stringify([activeFile?.path, activeFile?.content, backtestConfig]);
   const backtestValidation = !backtestConfig.symbol.trim() ? 'Enter a symbol.'
     : !backtestConfig.from || !backtestConfig.to ? 'Choose both dates.'

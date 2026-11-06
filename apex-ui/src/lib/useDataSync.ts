@@ -8,6 +8,9 @@ import { getQuote, subscribeSymbols, unsubscribeSymbols, setSymbolProvider, getP
 
 const POLL_INTERVAL_MS = 3000;
 
+/** Index and macro symbols other panels (ticker tape, Market tab) keep streaming. */
+const SHARED_SYMBOLS = new Set(['^GSPC', '^IXIC', '^DJI', '^NSEI', 'BTC-USD', 'ETH-USD', 'GC=F', 'CL=F', 'EURUSD=X', 'USDINR=X']);
+
 /**
  * Hook that initializes data subscriptions and polling on mount.
  * Subscribes to market data for the watchlist, then polls for
@@ -45,7 +48,11 @@ export function useDataSync() {
     }
     if (removed.length > 0) {
       removed.forEach((symbol) => subscribed.delete(symbol));
-      unsubscribeSymbols(removed).catch((err) => console.warn('[DataSync] unsubscribe failed:', err));
+      // The ticker tape and Market tab share these quotes; dropping one would blank them.
+      const releasable = removed.filter((symbol) => !SHARED_SYMBOLS.has(symbol));
+      if (releasable.length > 0) {
+        unsubscribeSymbols(releasable).catch((err) => console.warn('[DataSync] unsubscribe failed:', err));
+      }
     }
   }, [watchlist]);
 
@@ -72,7 +79,9 @@ export function useDataSync() {
   // Re-apply pinned data feeds (the backend forgets them on restart).
   useEffect(() => {
     const applied = appliedPrefsRef.current;
+    const onWatchlist = new Set(useMarketStore.getState().watchlist);
     for (const [symbol, adapter] of Object.entries(providerPrefs)) {
+      if (!onWatchlist.has(symbol)) continue; // a stale pin must not re-subscribe a removed symbol
       if (applied[symbol] === adapter) continue;
       applied[symbol] = adapter;
       setSymbolProvider(symbol, adapter).catch((err) => {

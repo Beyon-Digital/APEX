@@ -17,6 +17,44 @@ use apex_core::domain::models::{ModifyParams, OrderId};
 use serde_json::{json, Value};
 use tauri::Emitter;
 
+/// Short stable fingerprint of file content, shown on approval cards and used to
+/// remember which strategy files the user has already approved.
+pub fn content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(content.as_bytes())[..6])
+}
+
+/// Whether a tool call beyond the base write list needs the user's approval.
+///
+/// * `start_strategy` and `modify_order` always do.
+/// * `stop_strategy` does when the session trades a live broker, because stopping
+///   closes its position at market.
+/// * `run_backtest` and strategy runs execute the file's Python, so they need
+///   approval unless the copilot wrote that exact content and the user approved it.
+pub fn needs_approval(name: &str, args: &Value, state: &AppState, paths: &RuntimePaths) -> bool {
+    if EXTRA_WRITE_TOOLS.contains(&name) {
+        return true;
+    }
+    match name {
+        "stop_strategy" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            strategy_worker::session_details()
+                .iter()
+                .any(|s| s.path == path && s.broker_id != "paper" && (s.state == "running" || s.state == "starting"))
+        }
+        "run_backtest" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let current = strategy::normalize_strategy_path(path, paths)
+                .ok()
+                .and_then(|full| std::fs::read_to_string(full).ok())
+                .map(|text| content_hash(&text));
+            let trusted = state.copilot_trusted_files.lock().unwrap().get(path).cloned();
+            !(current.is_some() && current == trusted)
+        }
+        _ => false,
+    }
+}
+
 /// Tools added here that need user approval when `[copilot] require_approval` is set.
 pub const EXTRA_WRITE_TOOLS: &[&str] = &["start_strategy", "modify_order"];
 
@@ -296,21 +334,31 @@ async fn modify_order(args: &Value, state: &AppState) -> Result<Value, String> {
         validation::validate_quantity(q)?;
     }
     validation::validate_price(price)?;
+    super::automation::check_broker_allowed(state, &broker)?;
     state
-        .otm
-        .modify_order(
+        .guarded_modify(
             &OrderId(order_id.to_string()),
             &broker,
             &ModifyParams { quantity, price, stop_price: None },
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
     Ok(json!({"modified": order_id, "quantity": quantity, "price": price}))
 }
 
 /// Human-readable description of a tool call for the approval card and trace.
 /// For order-like tools this shows everything the user is agreeing to.
 pub fn describe_call(name: &str, args: &Value) -> String {
+    // A live broker is flagged at the very start so it is the last thing to get cut off.
+    let live = args
+        .get("broker_id")
+        .and_then(|v| v.as_str())
+        .filter(|b| *b != "paper")
+        .map(|b| format!("[LIVE {b}] "))
+        .unwrap_or_default();
+    format!("{live}{}", describe_call_inner(name, args))
+}
+
+fn describe_call_inner(name: &str, args: &Value) -> String {
     let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
     let n = |k: &str| {
         args.get(k)
@@ -376,11 +424,18 @@ pub fn describe_call(name: &str, args: &Value) -> String {
             args.get("threshold").or_else(|| args.get("pct")).map(|v| v.to_string()).unwrap_or_default()
         ),
         "remove_alert" => format!("Remove alert {}", s("id")),
-        "save_strategy" => format!(
-            "Write strategy file {}{}",
-            s("path"),
-            if args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false) { " (replace existing)" } else { "" }
-        ),
+        "save_strategy" => {
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let preview: String = content.chars().filter(|c| *c != '\r').take(160).collect::<String>().replace('\n', " ⏎ ");
+            format!(
+                "Write strategy file {}{} - {} chars, hash {}. This Python can run on your machine. Starts: {preview}",
+                s("path"),
+                if args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false) { " (replace existing, old copy kept as .bak)" } else { "" },
+                content.chars().count(),
+                content_hash(content),
+            )
+        }
+        "run_backtest" => format!("Backtest {} on {} (runs the file's Python)", s("path"), s("symbol")),
         "export_bars_csv" => format!("Export {} bars to CSV", s("symbol")),
         "train_ml_model" => format!("Train {} on {} (target {})", s("algorithm"), s("data_path"), s("target_column")),
         "add_to_watchlist" | "remove_from_watchlist" => format!(
@@ -507,7 +562,7 @@ mod tests {
             &json!({"symbol":"RELIANCE.NS","side":"buy","quantity":5,"order_type":"limit",
                     "price":1200.5,"broker_id":"zerodha"}),
         );
-        assert_eq!(text, "BUY 5 RELIANCE.NS LIMIT on LIVE zerodha @ 1200.5");
+        assert_eq!(text, "[LIVE zerodha] BUY 5 RELIANCE.NS LIMIT on LIVE zerodha @ 1200.5");
     }
 
     #[test]
@@ -547,5 +602,26 @@ mod tests {
         assert!(names.contains(&"kill_switch"));
         // The copilot must never be able to arm live trading or reset a halt.
         assert!(!names.contains(&"arm_live") && !names.contains(&"reset_halt"));
+    }
+
+    #[test]
+    fn the_live_flag_leads_every_card_even_with_a_long_name() {
+        let long = "x".repeat(300);
+        let text = describe_call(
+            "create_automation",
+            &json!({"name": long, "symbol":"TCS.NS","model_id":"m","broker_id":"zerodha","quantity":3}),
+        );
+        assert!(text.starts_with("[LIVE zerodha] "), "{text}");
+    }
+
+    #[test]
+    fn a_strategy_card_shows_a_hash_and_the_start_of_the_code() {
+        let text = describe_call(
+            "save_strategy",
+            &json!({"path":"a.py","content":"import os\nos.system('boom')\n","overwrite":true}),
+        );
+        assert!(text.contains("hash ") && text.contains("import os") && text.contains("replace existing"), "{text}");
+        assert_eq!(content_hash("abc"), content_hash("abc"));
+        assert_ne!(content_hash("abc"), content_hash("abd"));
     }
 }

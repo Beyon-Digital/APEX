@@ -20,7 +20,7 @@
 //! Tokens live only in the encrypted vault (adapter id `chatgpt`) and are never
 //! logged.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 use crate::state::AppState;
 use crate::vault::Vault;
@@ -231,44 +232,65 @@ pub fn redact_authorize_url(url: &str) -> String {
 }
 
 /// Accept the browser redirect on `listener` and return its query string.
-async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String, String> {
+///
+/// Every connection is served in its own task and any failure on one (an idle
+/// preconnect, a reset, a bad request) only drops that connection. Only a request
+/// that carries our one-time state can complete the sign-in, and `cancel` ends it.
+async fn wait_for_callback(
+    listener: TcpListener,
+    expected_state: &str,
+    cancel: &Notify,
+) -> Result<String, String> {
+    let (found_tx, mut found_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let expected = expected_state.to_string();
     let accept = async {
         loop {
-            let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
-            let mut buf = vec![0u8; 8192];
-            let n = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
-                .await
-                .map_err(|_| "callback read timed out".to_string())?
-                .map_err(|e| e.to_string())?;
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
-            let target = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or("")
-                .to_string();
-            let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
-            // Only the real redirect carries our one-time state. Anything else (favicon
-            // requests, or another local process poking the port) is ignored rather than
-            // allowed to abort the sign-in.
-            if path != CALLBACK_PATH || !query_has_state(query, expected_state) {
-                let _ = socket
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await;
-                continue;
-            }
-            let body = "<html><body style=\"font-family:sans-serif;background:#000;color:#ffa028;padding:3em\"><h2>APEX Terminal</h2><p>Signed in. You can close this tab and return to the app.</p></body></html>";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
-            return Ok(query.to_string());
+            let (mut socket, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => continue, // e.g. ECONNABORTED: keep listening
+            };
+            let found_tx = found_tx.clone();
+            let expected = expected.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => n,
+                    _ => return, // idle, reset or empty: just drop it
+                };
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let target = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+                // Only the real redirect carries our one-time state. Anything else
+                // (favicon, another local process poking the port) is ignored.
+                if path != CALLBACK_PATH || !query_has_state(query, &expected) {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                }
+                let body = "<html><body style=\"font-family:sans-serif;background:#000;color:#ffa028;padding:3em\"><h2>APEX Terminal</h2><p>Signed in. You can close this tab and return to the app.</p></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = found_tx.send(query.to_string());
+            });
         }
     };
-    tokio::time::timeout(SIGN_IN_TIMEOUT, accept)
-        .await
-        .map_err(|_| "Timed out waiting for the browser sign-in (5 minutes).".to_string())?
+    tokio::select! {
+        _ = accept => Err("The sign-in listener stopped unexpectedly.".to_string()),
+        found = found_rx.recv() => found.ok_or_else(|| "The sign-in listener closed.".to_string()),
+        _ = cancel.notified() => Err("Sign-in was cancelled.".to_string()),
+        _ = tokio::time::sleep(SIGN_IN_TIMEOUT) => {
+            Err("Timed out waiting for the browser sign-in (5 minutes).".to_string())
+        }
+    }
 }
 
 // ── Tokens ───────────────────────────────────────────────────────────
@@ -350,11 +372,12 @@ async fn token_request(
     if status.is_server_error() || status.as_u16() == 429 {
         return Err(AuthError::Transient(format!("ChatGPT sign-in is unavailable ({status}). Try again shortly.")));
     }
-    if TERMINAL_REFRESH_ERRORS.contains(&code.as_str()) || status.is_client_error() {
-        return Err(AuthError::Terminal(format!(
-            "ChatGPT rejected the sign-in ({})",
-            if code.is_empty() { status.to_string() } else { code }
-        )));
+    // Only a genuine OAuth rejection means the credentials are dead. Any other 4xx
+    // (a WAF or Cloudflare challenge, a 408, an error body without an OAuth code)
+    // says nothing about the grant, so keep the tokens and let the user retry.
+    let oauth_status = matches!(status.as_u16(), 400 | 401);
+    if oauth_status && TERMINAL_REFRESH_ERRORS.contains(&code.as_str()) {
+        return Err(AuthError::Terminal(format!("ChatGPT rejected the sign-in ({code})")));
     }
     Err(AuthError::Transient(format!("ChatGPT sign-in failed ({status})")))
 }
@@ -547,11 +570,12 @@ pub fn save_signed_in(
 }
 
 fn save_refreshed(vault: &Vault, tokens: &TokenSet) -> Result<(), String> {
-    vault.set_secret(VAULT_ID, "access_token", &tokens.access_token)?;
-    // The refresh token rotates: always keep the newest one.
+    // The refresh token rotates and the old one is already dead server-side, so it is
+    // written first: losing the access token costs one refresh, losing this costs the login.
     if let Some(refresh) = &tokens.refresh_token {
         vault.set_secret(VAULT_ID, "refresh_token", refresh)?;
     }
+    vault.set_secret(VAULT_ID, "access_token", &tokens.access_token)?;
     if let Some(id) = &tokens.id_token {
         vault.set_secret(VAULT_ID, "id_token", id)?;
     }
@@ -623,6 +647,11 @@ pub struct Runtime {
     transient: Mutex<Option<(String, String)>>, // (state, message): "waiting" | "error"
     pub refresh_lock: tokio::sync::Mutex<()>,
     endpoints_override: Mutex<Option<AuthEndpoints>>,
+    /// Rotated tokens the server issued but that could not be written to the vault
+    /// yet. They are retried before the next refresh; the old refresh token is dead.
+    rotated: Mutex<Option<TokenSet>>,
+    /// Ends a pending browser sign-in.
+    pub cancel: Notify,
 }
 
 impl Runtime {
@@ -711,8 +740,10 @@ pub async fn begin_sign_in(state: &AppState) -> Result<String, String> {
             state: &oauth_state,
             nonce: &nonce,
             code_challenge: &pkce.challenge,
-            id_token_hint: stored.id_token.as_deref(),
-            login_hint: stored.email.as_deref(),
+            // The account chooser is shown instead of hinting: a hint would put the
+            // user's email and ID token on a command line other local users can read.
+            id_token_hint: None,
+            login_hint: None,
         },
     );
 
@@ -722,7 +753,7 @@ pub async fn begin_sign_in(state: &AppState) -> Result<String, String> {
         use tauri::Manager;
         let state = app.state::<AppState>();
         let outcome = async {
-            let query = wait_for_callback(listener, &oauth_state).await?;
+            let query = wait_for_callback(listener, &oauth_state, &state.chatgpt.cancel).await?;
             let callback = parse_callback(&query, &oauth_state, saved_client.as_deref())?;
             let client_id = callback
                 .client_id
@@ -734,6 +765,8 @@ pub async fn begin_sign_in(state: &AppState) -> Result<String, String> {
                 .map_err(|e| e.to_string())?;
             let id_token = tokens.id_token.as_deref().ok_or("ChatGPT did not return an ID token")?;
             let claims = verify_id_token(&state.http, &endpoints, id_token, &client_id, &nonce).await?;
+            let _guard = state.chatgpt.refresh_lock.lock().await;
+            *state.chatgpt.rotated.lock().unwrap() = None;
             save_signed_in(&state.vault, &client_id, &claims, &tokens)?;
             Ok::<_, String>(tokens.has_plan_scope())
         }
@@ -746,11 +779,28 @@ pub async fn begin_sign_in(state: &AppState) -> Result<String, String> {
     Ok(url)
 }
 
+/// End a pending browser sign-in and free the callback port.
+pub fn cancel_sign_in(state: &AppState) {
+    state.chatgpt.cancel.notify_waiters();
+    state.chatgpt.clear();
+}
+
 /// A valid access token, refreshing (and rotating the refresh token) when needed.
 pub async fn access_token(state: &AppState) -> Result<String, String> {
     // Serialize refreshes: the refresh token rotates, so two racing refreshes would
     // invalidate each other.
     let _guard = state.chatgpt.refresh_lock.lock().await;
+    // A previous refresh rotated the token but could not save it: save it first.
+    let pending = state.chatgpt.rotated.lock().unwrap().clone();
+    if let Some(tokens) = pending {
+        match save_refreshed(&state.vault, &tokens) {
+            Ok(()) => {
+                *state.chatgpt.rotated.lock().unwrap() = None;
+                return Ok(tokens.access_token);
+            }
+            Err(_) => return Ok(tokens.access_token), // still usable; keep it in memory
+        }
+    }
     let stored = load(&state.vault)?;
     let (Some(client_id), Some(refresh)) = (stored.client_id.clone(), stored.refresh_token.clone()) else {
         return Err("Sign in with ChatGPT first (Copilot > Provider).".into());
@@ -766,7 +816,14 @@ pub async fn access_token(state: &AppState) -> Result<String, String> {
     let endpoints = state.chatgpt.endpoints();
     match refresh_tokens(&state.http, &endpoints, &client_id, &refresh).await {
         Ok(tokens) => {
-            save_refreshed(&state.vault, &tokens)?;
+            if let Err(error) = save_refreshed(&state.vault, &tokens) {
+                // The server already rotated the refresh token. Keep the new one in
+                // memory and still return the working access token.
+                tracing::warn!(%error, "Could not store the rotated ChatGPT token; keeping it in memory");
+                let access = tokens.access_token.clone();
+                *state.chatgpt.rotated.lock().unwrap() = Some(tokens);
+                return Ok(access);
+            }
             Ok(tokens.access_token)
         }
         Err(AuthError::Terminal(_)) => {
@@ -779,6 +836,9 @@ pub async fn access_token(state: &AppState) -> Result<String, String> {
 
 /// Revoke the refresh token (best effort) and forget the tokens.
 pub async fn sign_out(state: &AppState) -> Result<String, String> {
+    // Wait for any refresh in flight, so it cannot save fresh tokens after we clear them.
+    let _guard = state.chatgpt.refresh_lock.lock().await;
+    *state.chatgpt.rotated.lock().unwrap() = None;
     let stored = load(&state.vault)?;
     let endpoints = state.chatgpt.endpoints();
     let mut note = "Signed out.".to_string();
@@ -1306,7 +1366,9 @@ mod tests {
     async fn a_stray_local_request_cannot_abort_the_sign_in() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let waiting = tokio::spawn(async move { wait_for_callback(listener, "GOODSTATE").await });
+        let cancel = Arc::new(Notify::new());
+        let cancel_for_task = cancel.clone();
+        let waiting = tokio::spawn(async move { wait_for_callback(listener, "GOODSTATE", &cancel_for_task).await });
         let http = reqwest::Client::new();
         // Wrong path, then the right path with the wrong state: both ignored.
         let stray = http.get(format!("http://127.0.0.1:{port}/favicon.ico")).send().await.unwrap();
@@ -1336,5 +1398,79 @@ mod tests {
         assert!(!shown.contains("id_token_hint") && !shown.contains("login_hint") && !shown.contains("example.com"));
         assert!(shown.contains("client_id=oaiapp_1") && shown.contains("state=S") && shown.contains("nonce=N"));
         assert_eq!(redact_authorize_url("no-query"), "no-query");
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_does_not_block_or_abort_the_sign_in() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cancel = Arc::new(Notify::new());
+        let cancel_for_task = cancel.clone();
+        let waiting = tokio::spawn(async move { wait_for_callback(listener, "S", &cancel_for_task).await });
+        // A browser preconnect: connect and say nothing.
+        let _idle = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // The genuine redirect still gets through immediately.
+        let ok = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}{CALLBACK_PATH}?code=c&state=S&client_id=oaiapp_1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        assert!(waiting.await.unwrap().unwrap().contains("code=c"));
+    }
+
+    #[tokio::test]
+    async fn a_pending_sign_in_can_be_cancelled() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let cancel = Arc::new(Notify::new());
+        let cancel_for_task = cancel.clone();
+        let waiting = tokio::spawn(async move { wait_for_callback(listener, "S", &cancel_for_task).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.notify_waiters();
+        assert!(waiting.await.unwrap().unwrap_err().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn only_real_oauth_rejections_clear_the_login() {
+        let server = MockServer::start().await;
+        for (token, status, body) in [
+            ("WAF", 403, json!({"detail": "challenge"})),
+            ("TIMEOUT", 408, json!({})),
+            ("NOCODE", 400, json!({"message": "bad"})),
+            ("DEAD", 400, json!({"error": "invalid_grant"})),
+            ("DEAD401", 401, json!({"error": "refresh_token_expired"})),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains(format!("refresh_token={token}")))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        let http = reqwest::Client::new();
+        let endpoints = endpoints_for(&server);
+        for token in ["WAF", "TIMEOUT", "NOCODE"] {
+            assert!(
+                matches!(refresh_tokens(&http, &endpoints, "oaiapp_1", token).await, Err(AuthError::Transient(_))),
+                "{token} must keep the stored tokens"
+            );
+        }
+        for token in ["DEAD", "DEAD401"] {
+            assert!(matches!(refresh_tokens(&http, &endpoints, "oaiapp_1", token).await, Err(AuthError::Terminal(_))), "{token}");
+        }
+    }
+
+    #[test]
+    fn the_rotated_refresh_token_is_written_before_the_access_token() {
+        let vault = Vault::open_in_memory().unwrap();
+        vault.init("correct horse").unwrap();
+        vault.set_secret(VAULT_ID, "refresh_token", "OLD").unwrap();
+        save_refreshed(
+            &vault,
+            &TokenSet { access_token: "AT".into(), refresh_token: Some("NEW".into()), id_token: None, expires_in: Some(3600), scope: None },
+        )
+        .unwrap();
+        assert_eq!(vault.get_secret(VAULT_ID, "refresh_token").unwrap().as_deref(), Some("NEW"));
+        assert_eq!(vault.get_secret(VAULT_ID, "access_token").unwrap().as_deref(), Some("AT"));
     }
 }
