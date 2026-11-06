@@ -35,6 +35,8 @@ pub const WRITE_TOOLS: &[&str] = &[
     "delete_estimator_file",
     "save_recipe",
     "delete_recipe",
+    // Adds a NEW version whose content equals an older one; erases nothing.
+    "ledger_restore",
 ];
 
 const MAX_NOTEBOOK_CELLS: usize = 50;
@@ -90,7 +92,7 @@ fn save_recipe_schema() -> Value {
 
 /// OpenAI function-calling definitions for these tools.
 pub fn schemas() -> Vec<Value> {
-    vec![
+    let mut all = vec![
         tool(
             "web_fetch",
             "Fetch a public web page or API (http/https) and return its readable text. Use it for filings, press releases, docs, \
@@ -319,7 +321,7 @@ pub fn schemas() -> Vec<Value> {
         ),
         tool(
             "delete_dataset",
-            "Delete a dataset (its CSV and description). Models trained from it are kept.",
+            "Delete a dataset. It is marked deleted, not erased: every version and its files stay in the audit ledger and can be restored with ledger_restore. Models trained from it are kept.",
             json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
         ),
         tool(
@@ -339,11 +341,17 @@ pub fn schemas() -> Vec<Value> {
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "max 12 tags of 30 chars"}},
                 "required": ["model_id"]}),
         ),
-    ]
+    ];
+    // The audit ledger: read tools and the restore (a new version). No tool can erase history.
+    all.extend(super::ledger_cmds::tool_schemas());
+    all
 }
 
 /// Short human description for approval cards and the tool trace.
 pub fn describe(name: &str, args: &Value) -> Option<String> {
+    if let Some(text) = super::ledger_cmds::describe(name, args) {
+        return Some(text);
+    }
     let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
     Some(match name {
         "web_fetch" => format!("Fetch {}", s("url")),
@@ -394,7 +402,7 @@ pub fn describe(name: &str, args: &Value) -> Option<String> {
                 copilot_tools::content_hash(content),
             )
         }
-        "delete_estimator_file" => format!("Delete estimator file {}", s("name")),
+        "delete_estimator_file" => format!("Delete estimator file {} (marked deleted; the history stays and can be restored)", s("name")),
         "list_recipes" => "List saved algorithm recipes".to_string(),
         "get_recipe" => format!("Read algorithm recipe {}", s("name")),
         "recipe_building_blocks" => "List the algorithm recipe building blocks".to_string(),
@@ -405,11 +413,11 @@ pub fn describe(name: &str, args: &Value) -> Option<String> {
             if args.get("overwrite").and_then(Value::as_bool).unwrap_or(false) { " (replaces a saved one with this name)" } else { "" },
             recipe_text(args)
         ),
-        "delete_recipe" => format!("Delete algorithm recipe {} (models already trained with it keep their copy)", s("name")),
+        "delete_recipe" => format!("Delete algorithm recipe {} (marked deleted; the history stays and can be restored; models already trained with it keep their copy)", s("name")),
         "list_datasets" => "List ML datasets".to_string(),
         "preview_dataset" => format!("Preview dataset {}", s("name")),
         "get_model" => format!("Read model {}", s("model_id")),
-        "delete_dataset" => format!("Delete dataset {} (the CSV file is removed)", s("name")),
+        "delete_dataset" => format!("Delete dataset {} (marked deleted; every version and its files stay in the audit ledger and can be restored)", s("name")),
         "build_dataset" => {
             let list = |k: &str| {
                 args.get(k)
@@ -1029,6 +1037,9 @@ pub async fn exec_ml(
     models_dir: &Path,
     paths: &RuntimePaths,
 ) -> Option<Result<Value, String>> {
+    if let Some(result) = super::ledger_cmds::exec_tool(name, args, state, paths).await {
+        return Some(result);
+    }
     Some(match name {
         "list_feature_catalog" => Ok(json!({"features": ml_features::catalog().iter().map(|f| json!({
             "id": f.id, "group": f.group, "description": f.description, "warmup_bars": f.warmup_bars,
@@ -1513,7 +1524,7 @@ mod tests {
         assert!(describe("save_recipe", &json!({"name": "w", "recipe": voting_recipe_args()})).unwrap().contains("voting"));
         assert!(describe("save_recipe", &json!({})).unwrap().contains("Save algorithm recipe ?"));
 
-        assert_eq!(describe("delete_recipe", &json!({"name": "calm_vote"})).unwrap(), "Delete algorithm recipe calm_vote (models already trained with it keep their copy)");
+        assert_eq!(describe("delete_recipe", &json!({"name": "calm_vote"})).unwrap(), "Delete algorithm recipe calm_vote (marked deleted; the history stays and can be restored; models already trained with it keep their copy)");
         assert_eq!(describe("get_recipe", &json!({"name": "a"})).unwrap(), "Read algorithm recipe a");
         assert_eq!(describe("list_recipes", &json!({})).unwrap(), "List saved algorithm recipes");
 

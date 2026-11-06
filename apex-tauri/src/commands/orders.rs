@@ -65,11 +65,13 @@ pub async fn place_order(
             .map_err(|e| format!("Could not subscribe to market data for paper order: {e}"))?;
     }
 
+    // Stated explicitly: a user-typed tag such as "copilot" must not pass for another origin.
     state
-        .guarded_submit(
+        .guarded_submit_with(
             new_order,
             &request.broker_id,
             LiveAuth::Manual(confirmation_id.as_deref()),
+            Some(crate::order_audit::manual_source()),
         )
         .await
         .map(|id| id.0)
@@ -139,9 +141,10 @@ pub async fn cancel_order(
     validation::validate_string_length(&order_id, "order_id")?;
     validation::validate_broker_id(&broker_id)?;
 
+    let ctx = crate::order_audit::AuditContext::new("user", Some(crate::order_audit::manual_source()));
     state
         .otm
-        .cancel_order(&OrderId(order_id), &broker_id)
+        .cancel_order_with(&OrderId(order_id), &broker_id, ctx)
         .await
         .map_err(|e| e.to_string())
 }
@@ -169,7 +172,7 @@ pub async fn modify_order(
     };
 
     state
-        .guarded_modify(&OrderId(order_id), &broker_id, &params)
+        .guarded_modify_with(&OrderId(order_id), &broker_id, &params, Some(crate::order_audit::manual_source()))
         .await
         .map_err(|e| format!("Failed to modify order: {}", e))
 }

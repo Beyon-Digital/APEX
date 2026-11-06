@@ -1,4 +1,5 @@
 //! Authored Python callbacks for historical replay and bounded paper sessions.
+use super::versioned_files::{self, Provenance};
 use super::{python_runtime, strategy::normalize_strategy_path};
 use crate::state::AppState;
 use apex_core::domain::models::*;
@@ -119,6 +120,12 @@ pub struct SessionInfo {
     pub last_error: Option<String>,
     /// Newest last. Capped so a long session cannot grow without bound.
     pub recent_logs: Vec<String>,
+    /// The audit-ledger version and content hash of the strategy file this session runs (absent
+    /// when it could not be resolved, which is only allowed for paper sessions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy_hash: Option<String>,
 }
 
 const MAX_RECENT_LOGS: usize = 60;
@@ -148,6 +155,32 @@ fn note(app: &tauri::AppHandle, path: &str, line: impl Into<String>) {
         }
     });
     let _ = app.emit("strategy-output", json!({"path": path, "line": line}));
+}
+
+/// The strategy version the latest session of `path` was started with, if that session started at
+/// or after `since` (an RFC 3339 UTC time), so an older run is never reported for a new one.
+pub fn session_provenance(path: &str, since: &str) -> Option<Provenance> {
+    let map = info_map().lock().ok()?;
+    let info = map.get(path).filter(|i| i.started_at.as_str() >= since)?;
+    Some(Provenance { version: info.strategy_version?, hash: info.strategy_hash.clone()? })
+}
+
+/// Pin the strategy file a session is about to run: any unsaved external edit becomes a version
+/// first, then the head's version and hash are returned. A live session must trace to an exact
+/// version, so it is refused when that cannot be established; a paper session proceeds without.
+fn resolve_provenance(path: &str, paths: &python_runtime::RuntimePaths, live: bool) -> Result<Option<Provenance>, String> {
+    let resolved = versioned_files::ledger()
+        .and_then(|ledger| super::strategy::strategy_provenance(ledger, paths, path));
+    match resolved {
+        Ok(Some(p)) => Ok(Some(p)),
+        Ok(None) if live => Err(format!("{path} is not in the audit ledger, so a live session cannot start; save the file in APEX first")),
+        Ok(None) => Ok(None),
+        Err(error) if live => Err(format!("Cannot record which version of {path} would trade, so the live session was not started: {error}")),
+        Err(error) => {
+            tracing::warn!(%path, %error, "paper session starts without a strategy version");
+            Ok(None)
+        }
+    }
 }
 
 fn register_info(info: SessionInfo) {
@@ -297,15 +330,23 @@ pub async fn run(
     actor: &str,
 ) -> Result<Vec<String>, String> {
     let mut reached_running = false;
+    let run_started = Utc::now().to_rfc3339();
     let result = run_session(app, path.clone(), params.clone(), state, paths, actor, &mut reached_running).await;
     if reached_running {
         let info = info_map().lock().ok().and_then(|m| m.get(&path).cloned());
         let (symbol, broker, orders) = info
             .map(|i| (i.symbol, i.broker_id, i.orders_placed))
             .unwrap_or_else(|| ("?".into(), "paper".into(), 0));
+        let provenance = session_provenance(&path, &run_started).map(|p| p.details("strategy"));
         let (summary, details) = match &result {
-            Ok(_) => (format!("Stopped {path} ({symbol} on {broker}, {orders} orders)"), None),
-            Err(error) => (format!("Session of {path} ended with an error ({symbol} on {broker})"), Some(error.clone())),
+            Ok(_) => (format!("Stopped {path} ({symbol} on {broker}, {orders} orders)"), provenance),
+            Err(error) => (
+                format!("Session of {path} ended with an error ({symbol} on {broker})"),
+                Some(match provenance {
+                    Some(p) => format!("{error} | {p}"),
+                    None => error.clone(),
+                }),
+            ),
         };
         crate::activity::record_info(state, actor, "strategy.stop", "strategy", &path, &summary, result.is_ok(), details);
     } else if let Err(error) = &result {
@@ -343,6 +384,7 @@ async fn run_session(
         }
     }
     let full_path = normalize_strategy_path(&path, paths)?;
+    let provenance = resolve_provenance(&path, paths, session.broker_id != "paper")?;
     let (tx, mut stop) = watch::channel(false);
     {
         let mut map = sessions().lock().map_err(|e| e.to_string())?;
@@ -351,7 +393,7 @@ async fn run_session(
         }
         map.insert(path.clone(), tx);
     }
-    let result = run_inner(app, &path, full_path, params, &session, state, paths, &mut stop, actor, reached_running).await;
+    let result = run_inner(app, &path, full_path, params, &session, state, paths, &mut stop, actor, reached_running, provenance).await;
     sessions().lock().map_err(|e| e.to_string())?.remove(&path);
     update_info(&path, |info| {
         info.state = if result.is_ok() { "stopped" } else { "error" }.into();
@@ -379,14 +421,46 @@ fn tracked_status(state: &AppState, id: &OrderId) -> Option<OrderStatus> {
         .map(|o| o.status)
 }
 
-/// Submit through the live-trading guard and wait briefly for a final status.
-async fn submit_and_wait(
+/// Who produced this session's orders, for the audit trail: the strategy's ledger id with the
+/// version and content hash the session PINNED when it started (the Python worker loaded exactly
+/// that code). It is never looked up again at order time: a newer version saved while the session
+/// runs must not take the credit for trades the older code made.
+pub(crate) fn pinned_strategy_source(
+    paths: &python_runtime::RuntimePaths,
+    full_path: &std::path::Path,
+    provenance: Option<&Provenance>,
+) -> crate::order_audit::OrderSource {
+    crate::order_audit::OrderSource {
+        kind: "strategy".into(),
+        // The canonical ledger id ("strategies/foo.py"), whatever spelling the session was started with.
+        id: super::strategy::strategy_id(paths, full_path),
+        version: provenance.map(|p| p.version),
+        hash: provenance.map(|p| p.hash.clone()),
+        ..Default::default()
+    }
+}
+
+/// Cancel an order the session left working, as the strategy (not as "unattributed").
+pub(crate) async fn cancel_working_order(
+    state: &AppState,
+    id: &OrderId,
+    broker_id: &str,
+    source: &crate::order_audit::OrderSource,
+) -> Result<(), String> {
+    let ctx = crate::order_audit::AuditContext::new("strategy", Some(source.clone()));
+    state.otm.cancel_order_with(id, broker_id, ctx).await.map_err(|e| e.to_string())
+}
+
+/// Submit through the live-trading guard and wait briefly for a final status. `source` is the
+/// session's pinned strategy version (see [`pinned_strategy_source`]).
+pub(crate) async fn submit_and_wait(
     state: &AppState,
     broker_id: &str,
     order: NewOrderRequest,
+    source: &crate::order_audit::OrderSource,
 ) -> Result<(OrderId, OrderStatus), String> {
     let id = state
-        .guarded_submit(order, broker_id, crate::state::LiveAuth::Unattended)
+        .guarded_submit_with(order, broker_id, crate::state::LiveAuth::Unattended, Some(source.clone()))
         .await?;
     let mut status = OrderStatus::Pending;
     for _ in 0..20 {
@@ -432,12 +506,14 @@ async fn run_inner(
     stop: &mut watch::Receiver<bool>,
     actor: &str,
     reached_running: &mut bool,
+    provenance: Option<Provenance>,
 ) -> Result<Vec<String>, String> {
     let broker_id = session.broker_id.as_str();
     let is_paper = broker_id == "paper";
     let label = if is_paper { "PAPER" } else { "LIVE" };
     let quantity = session.quantity;
 
+    let order_source = pinned_strategy_source(paths, &full_path, provenance.as_ref());
     let mut worker = Worker::spawn(paths).await?;
     let init = worker
         .request(json!({"op":"init","path":full_path,"params":params}))
@@ -475,6 +551,8 @@ async fn run_inner(
         orders_placed: 0,
         last_error: None,
         recent_logs: Vec::new(),
+        strategy_version: provenance.as_ref().map(|p| p.version),
+        strategy_hash: provenance.as_ref().map(|p| p.hash.clone()),
     });
     let mut logs: Vec<String> = Vec::new();
     macro_rules! log {
@@ -548,7 +626,7 @@ async fn run_inner(
         path,
         &format!("Started {path}: {symbol} {tf} on {broker_id} ({label}), quantity {quantity}"),
         true,
-        None,
+        provenance.as_ref().map(|p| p.details("strategy")),
     );
 
     let mut held = false;
@@ -635,7 +713,7 @@ async fn run_inner(
                                 broker_params: None,
                             };
                             let side = if long { "BUY" } else { "SELL" };
-                            match submit_and_wait(state, broker_id, order).await {
+                            match submit_and_wait(state, broker_id, order, &order_source).await {
                                 Ok((id, status)) => {
                                     update_info(path, |info| info.orders_placed += 1);
                                     log!("{side} {symbol} {quantity} {broker_id} order {} ({status:?})", id.0);
@@ -695,7 +773,7 @@ async fn run_inner(
     if let Some((id, long)) = pending.take() {
         match tracked_status(state, &id) {
             Some(status) if is_working(&status) => {
-                match state.otm.cancel_order(&id, broker_id).await {
+                match cancel_working_order(state, &id, broker_id, &order_source).await {
                     Ok(()) => log!("Cancelled order {} that was still working", id.0),
                     Err(error) => log!("Could not cancel working order {} ({error}); check {broker_id}", id.0),
                 }
@@ -725,7 +803,7 @@ async fn run_inner(
             broker_params: None,
         };
         match state
-            .guarded_submit(close, broker_id, crate::state::LiveAuth::Unattended)
+            .guarded_submit_with(close, broker_id, crate::state::LiveAuth::Unattended, Some(order_source.clone()))
             .await
         {
             Ok(id) => {
@@ -819,5 +897,45 @@ mod tests {
         assert!(is_working(&OrderStatus::PartiallyFilled));
         assert!(!is_working(&OrderStatus::Filled));
         assert!(!is_working(&OrderStatus::Rejected));
+    }
+
+    fn info(path: &str, started_at: &str, version: Option<u32>) -> SessionInfo {
+        SessionInfo {
+            path: path.into(), symbol: "X".into(), timeframe: "5m".into(), broker_id: "paper".into(), quantity: 1.0,
+            started_at: started_at.into(), state: "running".into(), held: false, bars_processed: 0, orders_placed: 0,
+            last_error: None, recent_logs: vec![], strategy_version: version, strategy_hash: version.map(|v| format!("hash{v}")),
+        }
+    }
+
+    #[test]
+    fn a_session_reports_the_strategy_version_it_started_with_and_never_an_older_runs() {
+        register_info(info("strategies/prov_a.py", "2030-01-01T00:00:10+00:00", Some(3)));
+        let p = session_provenance("strategies/prov_a.py", "2030-01-01T00:00:00+00:00").unwrap();
+        assert_eq!((p.version, p.hash.as_str()), (3, "hash3"));
+        assert!(session_provenance("strategies/prov_a.py", "2030-01-01T00:00:11+00:00").is_none(), "an older session is not this run's");
+        register_info(info("strategies/prov_b.py", "2030-01-01T00:00:10+00:00", None));
+        assert!(session_provenance("strategies/prov_b.py", "2030-01-01T00:00:00+00:00").is_none());
+        let json = serde_json::to_value(info("p", "t", Some(2))).unwrap();
+        assert_eq!((json["strategy_version"].as_u64(), json["strategy_hash"].as_str()), (Some(2), Some("hash2")));
+        assert!(serde_json::to_value(info("p", "t", None)).unwrap().get("strategy_version").is_none());
+    }
+
+    #[test]
+    fn a_live_session_needs_a_known_version_but_a_paper_session_does_not() {
+        let root = std::env::temp_dir().join(format!("apex-worker-prov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = python_runtime::RuntimePaths::for_test(&root);
+        // The file was never saved or seen by the ledger.
+        assert_eq!(resolve_provenance("strategies/never_saved_worker.py", &paths, false).unwrap(), None);
+        let err = resolve_provenance("strategies/never_saved_worker.py", &paths, true).unwrap_err();
+        assert!(err.contains("not in the audit ledger"), "{err}");
+        // Once the file exists on disk the ledger adopts it, so a live session gets a version.
+        let file = root.join("strategies").join("seen_worker.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "x = 1\n").unwrap();
+        let p = resolve_provenance("strategies/seen_worker.py", &paths, true).unwrap().unwrap();
+        assert_eq!(p.hash, crate::ledger::Ledger::sha256_hex(b"x = 1\n"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

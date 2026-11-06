@@ -33,6 +33,7 @@ Evaluation notes
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import logging
@@ -107,6 +108,19 @@ class TrainingConfig:
     #: The full spec is stored in the model's metadata so the model outlives the saved recipe.
     recipe: dict[str, Any] | None = None
     recipe_name: str | None = None
+    #: audit ledger versions of what the model is built from, copied into its metadata:
+    #: {"dataset_version", "dataset_csv_sha256", "estimator_file_version", "recipe_version"}.
+    #: When "dataset_csv_sha256" is given, the data file must hash to it or the run is refused.
+    provenance: dict[str, Any] | None = None
+
+
+def _sha256_file(path: Path) -> str:
+    """SHA-256 of a file, streamed."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass
@@ -200,6 +214,7 @@ class ModelTrainer:
             raise ValueError(f"random_state must be an integer from 0 to {MAX_SEED}")
         estimator = self._load_estimator_source(config)
 
+        data_sha256 = self._verify_data_file(config)
         df = self._load_data(config)
         data = self._build_features(df, config)
         logger.info(
@@ -255,6 +270,7 @@ class ModelTrainer:
         return self._register(
             model, data, metrics, folds, trading, importances, hyperparams, duration, config, buffer,
             holdout=holdout, estimator=estimator, total_rows=usable_rows, recipe=recipe,
+            data_sha256=data_sha256,
         )
 
     # ------------------------------------------------------------------
@@ -356,6 +372,33 @@ class ModelTrainer:
     # ------------------------------------------------------------------
     # Pipeline stages
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _verify_data_file(config: TrainingConfig) -> str | None:
+        """Hash the data file and, when the audit ledger's hash was passed, require it to match.
+
+        Dataset files are write-once, so a mismatch means the file is not the version the ledger
+        recorded. The hash and the versions go into the run log and the model's metadata.
+        """
+        prov = config.provenance or {}
+        path = Path(config.data_path)
+        sha = _sha256_file(path) if path.is_file() else None
+        expected = prov.get("dataset_csv_sha256")
+        if expected and sha != expected:
+            raise ValueError(
+                f"dataset file {config.data_path} does not match the audit ledger "
+                f"(expected sha256 {expected}, found {sha}); it was changed after it was recorded"
+            )
+        if config.dataset or prov.get("dataset_version") is not None:
+            logger.info(
+                "Dataset %s version %s, data file sha256 %s",
+                config.dataset or "-", prov.get("dataset_version", "-"), sha,
+            )
+        if prov.get("estimator_file_version") is not None:
+            logger.info("Custom estimator %s version %s", config.estimator_file, prov["estimator_file_version"])
+        if prov.get("recipe_version") is not None:
+            logger.info("Recipe %s version %s", config.recipe_name, prov["recipe_version"])
+        return sha
 
     def _load_data(self, config: TrainingConfig) -> pl.DataFrame:
         """Load data from Parquet or CSV into a Polars DataFrame."""
@@ -774,6 +817,7 @@ class ModelTrainer:
         estimator: dict[str, Any] | None = None,
         total_rows: int | None = None,
         recipe: dict[str, Any] | None = None,
+        data_sha256: str | None = None,
     ) -> TrainedModel:
         """Persist model with joblib + companion metadata json and log."""
         out_dir = Path(config.output_dir)
@@ -785,7 +829,9 @@ class ModelTrainer:
         while True:
             model_filename = f"{model_id}.joblib"
             model_path = out_dir / model_filename
-            if not (out_dir / f"{model_id}.json").exists():
+            # An id that was used by a deleted (archived) model is never handed out again.
+            archived = any((out_dir / "archive").glob(f"{model_id}@v*")) if (out_dir / "archive").is_dir() else False
+            if not (out_dir / f"{model_id}.json").exists() and not archived:
                 try:
                     # Exclusive creation claims the id atomically: a concurrent training that
                     # picked the same id gets FileExistsError instead of overwriting this model.
@@ -798,6 +844,7 @@ class ModelTrainer:
             model_id = f"{config.algorithm}_{timestamp}_{suffix}"
 
         logger.info("Model saved to %s", model_path)
+        artifact_sha256 = _sha256_file(model_path)
 
         estimator_meta: dict[str, Any] = {}
         if estimator is not None:
@@ -861,6 +908,14 @@ class ModelTrainer:
             **({"recipe": recipe, "recipe_name": recipe.get("name") or config.recipe_name} if recipe is not None else {}),
             **({"estimator_file": None} if estimator is None else {}),
             **estimator_meta,
+            # Audit trail: the exact artifact and data, and the ledger versions of dataset, code and recipe.
+            "artifact_sha256": artifact_sha256,
+            "data_file_sha256": data_sha256,
+            **{
+                key: (config.provenance or {})[key]
+                for key in ("dataset_version", "dataset_csv_sha256", "estimator_file_version", "recipe_version")
+                if key in (config.provenance or {})
+            },
         }
         metadata_path = out_dir / f"{model_id}.json"
         metadata_path.write_text(json.dumps(_clean(metadata), indent=2, allow_nan=False))

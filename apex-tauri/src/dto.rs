@@ -478,6 +478,9 @@ pub struct MLTrainingRequestDto {
     /// Seed for estimators that take one. Omitted: a fixed default, so runs repeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub random_state: Option<i64>,
+    /// With `dataset`: train on this version of it. Omitted: the latest version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_version: Option<u32>,
 }
 
 impl Default for MLTrainingRequestDto {
@@ -497,6 +500,7 @@ impl Default for MLTrainingRequestDto {
             estimator_file: None,
             recipe: None,
             random_state: None,
+            dataset_version: None,
         }
     }
 }
@@ -626,6 +630,16 @@ pub struct DatasetInfoDto {
     pub context_symbols: Vec<String>,
     #[serde(default)]
     pub fee_pct: f64,
+    /// Version of the dataset object in the audit ledger (1 for the first build under this name).
+    /// Every build is a new version under the same name; earlier versions are never overwritten.
+    #[serde(default)]
+    pub version: u32,
+    /// SHA-256 of this version's CSV file (the file is write-once).
+    #[serde(default)]
+    pub csv_sha256: String,
+    /// Size of that CSV file in bytes.
+    #[serde(default)]
+    pub csv_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -743,6 +757,21 @@ pub struct ModelDetailDto {
     /// The recipe this model was built from when `algorithm` is "recipe" (a copy).
     #[serde(default)]
     pub recipe: Option<RecipeDto>,
+    /// Provenance. Version of the dataset the model was trained on (see `ledger_history('dataset', name)`).
+    #[serde(default)]
+    pub dataset_version: Option<u32>,
+    /// SHA-256 of the dataset CSV the trainer read.
+    #[serde(default)]
+    pub dataset_csv_sha256: Option<String>,
+    /// Ledger version of the custom estimator file whose code produced this model.
+    #[serde(default)]
+    pub estimator_version: Option<u32>,
+    /// Ledger version of the recipe this model was built from.
+    #[serde(default)]
+    pub recipe_version: Option<u32>,
+    /// Current version of this model's own metadata in the audit ledger (display name, notes, tags).
+    #[serde(default)]
+    pub ledger_version: Option<u32>,
 }
 
 // ── Algorithm catalog and custom estimators ──────────────────────────

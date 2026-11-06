@@ -719,15 +719,10 @@ async fn exec_tool(
                     "{path} already exists; read it first, then pass overwrite=true to replace it"
                 ));
             }
-            if let Some(parent) = full.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            if full.exists() {
-                // Never destroy the only copy: keep the previous version next to it.
-                let backup = full.with_extension("py.bak");
-                std::fs::copy(&full, &backup).map_err(|e| format!("cannot back up {path}: {e}"))?;
-            }
-            std::fs::write(&full, content).map_err(|e| format!("cannot write {path}: {e}"))?;
+            // Every save is a new version of the same strategy in the audit ledger (actor "copilot"):
+            // the previous content stays in the history, so no backup copy is made and nothing is lost.
+            strategy::save_strategy_as(runtime_paths, path, content.to_string(), "copilot")
+                .map_err(|e| format!("cannot write {path}: {e}"))?;
             // The user approved this exact content, so running it needs no second approval.
             state
                 .copilot_trusted_files
@@ -859,6 +854,7 @@ async fn exec_tool(
                 estimator_file: optional_str(args, "estimator_file")?,
                 recipe: recipe.map(|r| r.trim().to_string()),
                 random_state: optional_integer(args, "random_state")?,
+                ..Default::default()
             };
             if req.algorithm == "custom" {
                 // Reaching here means the user approved this run or already approved this exact
@@ -986,7 +982,7 @@ async fn exec_tool(
                     .map_err(|e| format!("Could not subscribe to market data for paper order: {e}"))?;
             }
             let id = state
-                .guarded_submit(
+                .guarded_submit_with(
                     NewOrderRequest {
                         symbol: Symbol(symbol.clone()),
                         side,
@@ -999,6 +995,8 @@ async fn exec_tool(
                     },
                     &broker_id,
                     crate::state::LiveAuth::Unattended,
+                    // The audit trail ties this order to the Copilot turn that produced it.
+                    Some(crate::order_audit::copilot_source(&copilot_tools::current_turn(state))),
                 )
                 .await?;
             Ok(json!({"order_id": id.0, "symbol": symbol, "broker_id": broker_id}))
@@ -1010,9 +1008,14 @@ async fn exec_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("paper");
             validation::validate_broker_id(broker_id)?;
+            let source = crate::order_audit::copilot_source(&copilot_tools::current_turn(state));
             state
                 .otm
-                .cancel_order(&OrderId(order_id.to_string()), broker_id)
+                .cancel_order_with(
+                    &OrderId(order_id.to_string()),
+                    broker_id,
+                    crate::order_audit::AuditContext::new("copilot", Some(source)),
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(json!({"cancelled": order_id}))
@@ -1062,14 +1065,16 @@ async fn exec_tool(
                 .get("enabled")
                 .and_then(|v| v.as_bool())
                 .ok_or("missing `enabled`")?;
-            if !state.automations.set_enabled(id, enabled) {
+            // The rule's new version is attributed to the Copilot.
+            if !apex_core::application::automation::with_actor("copilot", || state.automations.set_enabled(id, enabled)) {
                 return Err(format!("no automation `{id}`"));
             }
             Ok(json!({"id": id, "enabled": enabled}))
         }
         "delete_automation" => {
             let id = arg_str(args, "id")?;
-            if !state.automations.remove_rule(id) {
+            // Deleting a rule is a tombstone version; the rule's history stays and it can be restored.
+            if !apex_core::application::automation::with_actor("copilot", || state.automations.remove_rule(id)) {
                 return Err(format!("no automation `{id}`"));
             }
             Ok(json!({"deleted": id}))
@@ -2171,5 +2176,314 @@ mod approval_flow_tests {
         assert_eq!(optional_number(&json!({"holdout_pct": 20}), "holdout_pct").unwrap(), Some(20.0));
         assert!(optional_integer(&json!({"random_state": 1.5}), "random_state").is_err());
         assert_eq!(optional_integer(&json!({"random_state": null}), "random_state").unwrap(), None);
+    }
+}
+
+/// The audit ledger as the Copilot sees it: its saves and deletes are versions, its orders carry the
+/// turn id, and no tool can erase history.
+#[cfg(test)]
+mod ledger_flow_tests {
+    use super::*;
+    use crate::ledger::{self, Kind, Ledger};
+    use copilot_tools::test_support::{state as test_state, write_estimator, ESTIMATOR};
+    use std::sync::Arc;
+
+    type Run = (Option<Value>, Vec<ToolCallTrace>, Vec<PendingApprovalDto>);
+
+    async fn run(state: &AppState, paths: &python_runtime::RuntimePaths, mode: ChatMode, name: &str, args: Value) -> Run {
+        let models = ml::ModelRegistry::new(paths);
+        let (mut trace, mut pending) = (Vec::new(), Vec::new());
+        let out = dispatch_tool(name, &args, state, &models, paths, mode, &mut trace, &mut pending).await;
+        (out, trace, pending)
+    }
+
+    /// (version, action, actor) of every version.
+    fn versions(ledger: &Ledger, kind: Kind, id: &str) -> Vec<(u32, String, String)> {
+        ledger.history(kind, id).into_iter().map(|r| (r.version, r.action, r.actor)).collect()
+    }
+
+    fn tool_names() -> Vec<String> {
+        tool_schemas().as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str().map(String::from)).collect()
+    }
+
+    #[tokio::test]
+    async fn two_tool_driven_saves_of_a_strategy_leave_two_versions_by_the_copilot_and_no_backup_file() {
+        let (state, paths) = test_state("ledger-flow-save").await;
+        let ledger = crate::commands::versioned_files::ledger().unwrap();
+        let id = "strategies/ledger_flow_a.py";
+        let file = paths.work_root().join(id);
+
+        let first = "def on_bar(ctx, bar):\n    return None\n";
+        let (out, _, _) = run(&state, &paths, ChatMode::Agent, "save_strategy", json!({"path": "ledger_flow_a.py", "content": first})).await;
+        assert_eq!(out.unwrap()["saved"], true);
+        // Replacing needs the explicit flag, and then it is a second version, not an overwrite.
+        let (refused, _, _) = run(&state, &paths, ChatMode::Agent, "save_strategy", json!({"path": "ledger_flow_a.py", "content": "x = 1\n"})).await;
+        assert!(refused.unwrap()["error"].as_str().unwrap().contains("already exists"));
+        let second = "def on_bar(ctx, bar):\n    return 'buy'\n";
+        let (out, _, _) = run(&state, &paths, ChatMode::Agent, "save_strategy", json!({"path": "ledger_flow_a.py", "content": second, "overwrite": true})).await;
+        assert_eq!(out.unwrap()["saved"], true);
+
+        assert_eq!(
+            versions(&ledger, Kind::Strategy, id),
+            vec![(1, "create".to_string(), "copilot".to_string()), (2, "update".to_string(), "copilot".to_string())]
+        );
+        assert_eq!(ledger.content(Kind::Strategy, id, 1).unwrap(), first.as_bytes(), "version 1 is still the first text");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), second);
+        assert!(!file.with_extension("py.bak").exists(), "history replaces the backup copy");
+        // Saving identical content again adds nothing.
+        run(&state, &paths, ChatMode::Agent, "save_strategy", json!({"path": "ledger_flow_a.py", "content": second, "overwrite": true})).await;
+        assert_eq!(ledger.history(Kind::Strategy, id).len(), 2, "{:#?}", ledger.history(Kind::Strategy, id).iter().map(|r| (r.version, &r.action, &r.actor, &r.summary)).collect::<Vec<_>>());
+
+        // The Copilot reads its own history, and restores version 1 as a third version.
+        let (hist, _, _) = run(&state, &paths, ChatMode::Ask, "ledger_history", json!({"kind": "strategy", "id": id})).await;
+        let hist = hist.unwrap();
+        assert_eq!(hist["total_versions"], 2);
+        assert_eq!(hist["versions"][1]["actor"], "copilot");
+        let (v1, _, _) = run(&state, &paths, ChatMode::Ask, "ledger_version", json!({"kind": "strategy", "id": id, "version": 1})).await;
+        assert_eq!(v1.unwrap()["text"], first);
+        let (restored, _, _) = run(&state, &paths, ChatMode::Agent, "ledger_restore", json!({"kind": "strategy", "id": id, "version": 1})).await;
+        assert_eq!(restored.unwrap()["new_version"], 3);
+        let history = ledger.history(Kind::Strategy, id);
+        assert_eq!((history[2].action.as_str(), history[2].actor.as_str(), history[2].restored_from), ("restore", "copilot", Some(1)));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
+        assert_eq!(ledger.content(Kind::Strategy, id, 2).unwrap(), second.as_bytes(), "the replaced text is still in version 2");
+    }
+
+    #[tokio::test]
+    async fn the_copilots_delete_tools_leave_a_tombstone_and_the_history() {
+        let (state, paths) = test_state("ledger-flow-delete").await;
+        let ledger = crate::commands::versioned_files::ledger().unwrap();
+
+        // Estimator file
+        let (saved, _, _) = run(&state, &paths, ChatMode::Agent, "save_estimator_file", json!({"name": "ledger_flow_e.py", "content": ESTIMATOR})).await;
+        assert!(saved.unwrap().get("error").is_none());
+        let (gone, _, _) = run(&state, &paths, ChatMode::Agent, "delete_estimator_file", json!({"name": "ledger_flow_e.py"})).await;
+        assert_eq!(gone.unwrap()["deleted"], "ledger_flow_e.py");
+        let e = versions(&ledger, Kind::Estimator, "ledger_flow_e.py");
+        assert_eq!(e.iter().map(|v| v.1.as_str()).collect::<Vec<_>>(), ["create", "delete"]);
+        assert!(e.iter().all(|v| v.2 == "copilot"));
+        assert!(ledger.head(Kind::Estimator, "ledger_flow_e.py").unwrap().is_tombstone());
+        assert_eq!(ledger.content(Kind::Estimator, "ledger_flow_e.py", 1).unwrap(), ESTIMATOR.as_bytes(), "the deleted text is still readable");
+        assert!(!paths.work_root().join("estimators/ledger_flow_e.py").exists());
+        // Writing the same name again continues the same object.
+        run(&state, &paths, ChatMode::Agent, "save_estimator_file", json!({"name": "ledger_flow_e.py", "content": ESTIMATOR})).await;
+        assert_eq!(ledger.history(Kind::Estimator, "ledger_flow_e.py").len(), 3);
+
+        // Recipe
+        let recipe_file = paths.work_root().join("algorithms").join("ledger_flow_r.json");
+        std::fs::create_dir_all(recipe_file.parent().unwrap()).unwrap();
+        crate::commands::versioned_files::save(&ledger, Kind::Recipe, "ledger_flow_r", &recipe_file, b"{\"name\":\"ledger_flow_r\"}", "user").unwrap();
+        let (gone, _, _) = run(&state, &paths, ChatMode::Agent, "delete_recipe", json!({"name": "ledger_flow_r"})).await;
+        assert_eq!(gone.unwrap()["deleted"], "ledger_flow_r");
+        assert!(ledger.head(Kind::Recipe, "ledger_flow_r").unwrap().is_tombstone());
+        assert_eq!(ledger.history(Kind::Recipe, "ledger_flow_r").len(), 2);
+
+        // Dataset (its files stay, the object is marked deleted)
+        let dir = ml_datasets_dir(&paths);
+        let info = crate::dto::DatasetInfoDto { name: "ledger_flow_d".into(), path: "data/datasets/ledger_flow_d.csv".into(), rows: 1, timeframe: "1d".into(), created_at: "2026-01-01T00:00:00Z".into(), source: "copilot".into(), ..Default::default() };
+        crate::commands::ml_datasets::write_dataset(&dir, "a\n1\n", &info).unwrap();
+        let (gone, _, _) = run(&state, &paths, ChatMode::Agent, "delete_dataset", json!({"name": "ledger_flow_d"})).await;
+        assert_eq!(gone.unwrap()["deleted"], "ledger_flow_d");
+        let dataset_ledger = crate::activity::ledger_for(paths.data_dir()).unwrap();
+        assert!(dataset_ledger.head(Kind::Dataset, "ledger_flow_d").unwrap().is_tombstone());
+        assert!(dir.join("ledger_flow_d").join("v1.csv").is_file(), "the data file is kept");
+
+        // Automation
+        let (made, _, _) = run(&state, &paths, ChatMode::Agent, "create_automation", json!({"name": "flow rule", "symbol": "TCS.NS", "model_id": "m1"})).await;
+        let id = made.unwrap()["created"].as_str().unwrap().to_string();
+        let (off, _, _) = run(&state, &paths, ChatMode::Agent, "set_automation_enabled", json!({"id": id, "enabled": false})).await;
+        assert!(off.unwrap().get("error").is_none());
+        let (gone, _, _) = run(&state, &paths, ChatMode::Agent, "delete_automation", json!({"id": id})).await;
+        assert_eq!(gone.unwrap()["deleted"], id.as_str());
+        let a = versions(&ledger::global().unwrap().clone(), Kind::Automation, &id);
+        assert!(a.len() >= 3, "{a:?}");
+        assert!(a.iter().all(|v| v.2 == "copilot"), "{a:?}");
+        assert_eq!(a.last().unwrap().1, "delete");
+    }
+
+    fn ml_datasets_dir(paths: &python_runtime::RuntimePaths) -> std::path::PathBuf {
+        crate::commands::ml_datasets::datasets_dir(paths)
+    }
+
+    #[tokio::test]
+    async fn ledger_restore_follows_the_mode_rules_and_the_reads_stay_in_ask() {
+        let (state, paths) = test_state("ledger-flow-modes").await;
+        let args = json!({"kind": "strategy", "id": "strategies/x.py", "version": 1});
+        // Ask hides it and refuses it if it arrives anyway.
+        assert!(copilot_mode::is_write_tool("ledger_restore"));
+        let ask_names: Vec<String> = copilot_mode::tools_for_mode(tool_schemas(), ChatMode::Ask)
+            .as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str().map(String::from)).collect();
+        assert!(!ask_names.contains(&"ledger_restore".to_string()));
+        for read in ["ledger_history", "ledger_version", "ledger_verify", "list_order_events"] {
+            assert!(ask_names.contains(&read.to_string()), "{read} must stay available in Ask");
+            assert!(!copilot_mode::is_write_tool(read));
+            assert!(!copilot_mode::requires_approval(ChatMode::Review, read, &json!({}), &state, &paths), "{read} only reads");
+        }
+        let (refused, trace, _) = run(&state, &paths, ChatMode::Ask, "ledger_restore", args.clone()).await;
+        assert!(refused.unwrap()["error"].as_str().unwrap().contains("read-only"));
+        assert!(!trace[0].ok);
+        // Review asks, and the card says a new version is created.
+        let (out, _, pending) = run(&state, &paths, ChatMode::Review, "ledger_restore", args.clone()).await;
+        assert!(out.is_none(), "nothing runs before approval");
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].detail.contains("NEW version") && pending[0].detail.contains("history are kept"), "{}", pending[0].detail);
+        // Agent runs a strategy restore on its own (the error here is only that the strategy does not exist).
+        assert!(!copilot_mode::requires_approval(ChatMode::Agent, "ledger_restore", &args, &state, &paths));
+        let (out, _, pending) = run(&state, &paths, ChatMode::Agent, "ledger_restore", args).await;
+        assert!(pending.is_empty());
+        assert!(out.unwrap()["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn restoring_an_automation_that_trades_live_needs_approval_even_in_agent_mode() {
+        use apex_core::application::automation::AutomationRule;
+        let (state, paths) = test_state("ledger-flow-live").await;
+        let rule: AutomationRule = serde_json::from_value(json!({
+            "id": "live-restore-rule", "name": "live", "kind": "model_signal", "symbol": "TCS.NS", "model_id": "m",
+            "interval_secs": 300, "quantity": 1.0, "threshold": 0.5, "broker_id": "zerodha",
+            "enabled": false, "allow_short": false, "created_at": "2026-01-01T00:00:00Z",
+            "last_run_at": null, "last_result": null
+        })).unwrap();
+        state.automations.apply_restored(rule);
+        let live = json!({"kind": "automation", "id": "live-restore-rule", "version": 1});
+        let paper = json!({"kind": "automation", "id": "no-such-rule", "version": 1});
+        assert!(copilot_mode::requires_approval(ChatMode::Agent, "ledger_restore", &live, &state, &paths));
+        assert!(copilot_mode::requires_approval(ChatMode::Review, "ledger_restore", &live, &state, &paths));
+        assert!(!copilot_mode::requires_approval(ChatMode::Agent, "ledger_restore", &paper, &state, &paths));
+        // A pending call executes nothing.
+        let (out, _, pending) = run(&state, &paths, ChatMode::Agent, "ledger_restore", live).await;
+        assert!(out.is_none() && pending.len() == 1);
+        assert!(copilot_mode::live_involved("ledger_restore", &json!({"kind": "automation", "id": "x"}), &|_| Some("zerodha".into())));
+        assert!(!copilot_mode::live_involved("ledger_restore", &json!({"kind": "strategy", "id": "x"}), &|_| Some("zerodha".into())));
+    }
+
+    #[test]
+    fn no_copilot_tool_can_erase_history() {
+        let names = tool_names();
+        // Every tool that mentions the ledger is one of the known reads or the restore.
+        for name in &names {
+            if name.contains("ledger") || name.contains("audit") || name.contains("history") && name.starts_with("ledger") {
+                assert!(
+                    super::super::ledger_cmds::READ_TOOLS.contains(&name.as_str()) || super::super::ledger_cmds::WRITE_TOOLS.contains(&name.as_str()),
+                    "unexpected ledger tool {name}"
+                );
+            }
+            for word in ["purge", "erase", "wipe", "truncate", "compact", "rewrite", "prune", "vacuum", "forget", "overwrite_history"] {
+                assert!(!name.contains(word), "tool {name} sounds like it destroys history");
+            }
+        }
+        // The only delete-like tools are the ones that leave a tombstone version (tested above).
+        let known: &[&str] = &[
+            "delete_automation", "delete_dataset", "delete_estimator_file", "delete_recipe", "remove_alert", "remove_from_watchlist",
+        ];
+        for name in &names {
+            if name.contains("delete") || name.starts_with("remove") {
+                assert!(known.contains(&name.as_str()), "new delete-like tool {name}: make it a tombstone and list it here");
+            }
+        }
+        for forbidden in ["ledger_delete", "ledger_purge", "ledger_edit", "ledger_clear", "ledger_truncate", "ledger_write", "ledger_put", "ledger_reset"] {
+            assert!(!names.contains(&forbidden.to_string()));
+            assert!(!copilot_mode::is_write_tool(forbidden));
+        }
+        // The one ledger tool that changes anything is the restore, which only appends.
+        assert_eq!(super::super::ledger_cmds::WRITE_TOOLS, &["ledger_restore"]);
+        assert!(copilot_mode::is_write_tool("ledger_restore"));
+        // The executor does not know any other ledger tool either.
+        let src = include_str!("ledger_cmds.rs");
+        let exec = src.split("async fn exec_inner").nth(1).unwrap().split("/// [`verify_and_record`] for a named actor").next().unwrap();
+        assert!(!exec.contains("tombstone(") && !exec.contains("append_event") && !exec.contains(".put("), "the tool executor must not write to the ledger directly");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_ledger_tool_is_not_executed() {
+        let (state, paths) = test_state("ledger-flow-unknown").await;
+        for name in ["ledger_delete", "ledger_purge", "ledger_edit"] {
+            assert!(super::super::ledger_cmds::exec_tool(name, &json!({}), &state, &paths).await.is_none(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_system_prompt_says_everything_is_versioned() {
+        let (state, paths) = test_state("ledger-flow-prompt").await;
+        for mode in [ChatMode::Ask, ChatMode::Review, ChatMode::Agent] {
+            let prompt = copilot_tools::system_prompt(&state, &paths, mode);
+            assert!(prompt.contains("AUDIT HISTORY") && prompt.contains("Nothing can be erased") && prompt.contains("ledger_history"));
+            assert!(prompt.contains("Prefer a new version over deleting"));
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_and_the_order_trail_are_readable_by_the_copilot() {
+        let (state, paths) = test_state("ledger-flow-verify").await;
+        let (out, _, _) = run(&state, &paths, ChatMode::Ask, "ledger_verify", json!({})).await;
+        let out = out.unwrap();
+        assert!(out["ok"].is_boolean() && out["checked_records"].is_number(), "{out}");
+        assert!(out["limit"].as_str().unwrap().contains("middle of a log"));
+        let (events, _, _) = run(&state, &paths, ChatMode::Ask, "list_order_events", json!({"limit": 500})).await;
+        assert!(events.unwrap()["count"].as_u64().unwrap() <= 50);
+        let (bad, _, _) = run(&state, &paths, ChatMode::Ask, "ledger_history", json!({"kind": "nonsense", "id": "x"})).await;
+        assert!(bad.unwrap()["error"].as_str().unwrap().contains("unknown ledger kind"));
+    }
+
+    /// Orders and kill switches the Copilot triggers name the turn that produced them.
+    #[tokio::test]
+    async fn orders_the_copilot_places_changes_and_cancels_carry_its_turn_id() {
+        use apex_core::domain::models::{Quote, Symbol};
+        let (state, paths) = test_state("ledger-flow-orders").await;
+        let dir = std::env::temp_dir().join(format!("apex-ledger-flow-orders-{}", uuid::Uuid::new_v4()));
+        let ledger = Ledger::open(&dir).unwrap();
+        state.otm.set_audit_sink(Arc::new(crate::order_audit::LedgerOrderSink::with_ledger(ledger.clone())));
+        state.paper.update_quote(&Quote {
+            symbol: Symbol("AAPL".into()), bid: 99.9, ask: 100.1, last: 100.0, open: 100.0, high: 100.0, low: 100.0,
+            volume: 1, change_pct: 0.0, vwap: 100.0, updated_at: chrono::Utc::now(),
+        });
+        *state.copilot_turn.lock().unwrap() = Some("turn-ledger-7".to_string());
+
+        // place_order (market, fills at once on paper)
+        let (placed, _, _) = run(&state, &paths, ChatMode::Agent, "place_order", json!({"symbol": "AAPL", "side": "buy", "quantity": 2})).await;
+        let placed = placed.unwrap();
+        assert!(placed.get("error").is_none(), "{placed}");
+        // A resting order the Copilot then modifies and cancels.
+        let working = state
+            .guarded_submit_with(
+                apex_core::domain::models::NewOrderRequest {
+                    symbol: Symbol("AAPL".into()),
+                    side: apex_core::domain::models::OrderSide::Buy,
+                    order_type: apex_core::domain::models::OrderType::Limit,
+                    quantity: 1.0,
+                    price: Some(50.0),
+                    stop_price: None,
+                    tag: None,
+                    broker_params: None,
+                },
+                "paper",
+                crate::state::LiveAuth::Unattended,
+                Some(crate::order_audit::manual_source()),
+            )
+            .await
+            .unwrap();
+        let (modified, _, _) = run(&state, &paths, ChatMode::Agent, "modify_order", json!({"order_id": working.0, "price": 49.0})).await;
+        assert!(modified.unwrap().get("error").is_none());
+        let (cancelled, _, _) = run(&state, &paths, ChatMode::Agent, "cancel_order", json!({"order_id": working.0})).await;
+        assert!(cancelled.unwrap().get("error").is_none());
+        let (killed, _, _) = run(&state, &paths, ChatMode::Ask, "kill_switch", json!({})).await;
+        assert_eq!(killed.unwrap()["halted"], true);
+
+        let events = ledger.read_events("orders", &|_| true, 1000);
+        let find = |event: &str, actor: &str| {
+            events.iter().find(|e| e.value["event"] == event && e.value["actor"] == actor).map(|e| e.value.clone())
+        };
+        let submitted = events.iter().rev().find(|e| e.value["event"] == "submitted" && e.value["actor"] == "copilot").expect("the copilot's order").value.clone();
+        assert_eq!((submitted["source"]["kind"].as_str(), submitted["source"]["id"].as_str()), (Some("copilot"), Some("turn-ledger-7")));
+        for event in ["modified", "cancel_requested"] {
+            let e = find(event, "copilot").unwrap_or_else(|| panic!("no {event} by the copilot"));
+            assert_eq!(e["source"]["id"], "turn-ledger-7", "{event}");
+            assert_eq!(e["order_id"], working.0.as_str());
+        }
+        let kill = find("kill_switch", "copilot").expect("the kill switch names the copilot");
+        assert_eq!(kill["source"]["kind"], "kill_switch");
+        assert!(ledger.verify().ok);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = write_estimator; // shared helper import used by sibling modules
     }
 }

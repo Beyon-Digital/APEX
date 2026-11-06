@@ -1,19 +1,24 @@
 //! Activity log: a durable record of what changed, who did it, and when.
 //!
-//! Every strategy, model and automation that is created, changed or deleted writes one line to
-//! `<data_dir>/audit/activity.jsonl`, whether the user did it in the UI or the Copilot did it
-//! through a tool call. The same call announces the change to the UI (`artifacts-changed`), so
+//! Every strategy, model and automation that is created, changed or deleted writes one entry to the
+//! hash-chained "activity" stream of the audit ledger (`<data_dir>/ledger/streams/activity*.jsonl`),
+//! whether the user did it in the UI or the Copilot did it through a tool call. Editing or deleting an
+//! entry in the middle of the log breaks the chain and is reported by the ledger verify. Older
+//! installs kept `<data_dir>/audit/activity.jsonl`; it is imported on first open and renamed to
+//! `activity.jsonl.imported` (never deleted). The same call announces the change to the UI (`artifacts-changed`), so
 //! open panels refresh instead of showing a list that was loaded once at startup.
 //!
 //! Details never contain secrets: callers pass a short summary and, for failures, the error text.
 
+use crate::ledger::Ledger;
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 
-const MAX_FILE_BYTES: u64 = 5_000_000;
+const STREAM: &str = "activity";
 const MAX_SUMMARY: usize = 300;
 const MAX_DETAILS: usize = 2_000;
 
@@ -51,54 +56,138 @@ fn clip(text: &str, max: usize) -> String {
     }
 }
 
+/// The pre-ledger log. Only read as a legacy source and imported.
+#[allow(dead_code)]
 pub fn log_path(data_dir: &Path) -> PathBuf {
     data_dir.join("audit").join("activity.jsonl")
 }
 
-/// Held while appending so two writers cannot interleave inside a line or both rotate the file
-/// (the second rename would replace the previous history with the fresh, nearly empty log).
-static APPEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const LEGACY_FILES: [&str; 2] = ["activity.1.jsonl", "activity.jsonl"];
 
-/// Append one entry (rotating the file when it grows large).
-pub fn append(data_dir: &Path, entry: &ActivityDto) -> Result<(), String> {
-    let _guard = APPEND_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = log_path(data_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("could not create audit directory: {e}"))?;
+static LEDGERS: Mutex<Option<HashMap<PathBuf, Ledger>>> = Mutex::new(None);
+
+/// The ledger under `<data_dir>/ledger`, opened once per process (the first open imports the legacy
+/// activity log). The app installs the same instance as the process-wide ledger.
+pub fn ledger_for(data_dir: &Path) -> Result<Ledger, String> {
+    let dir = data_dir.join("ledger");
+    let mut guard = LEDGERS.lock().unwrap_or_else(|p| p.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some(l) = cache.get(&dir) {
+        if dir.is_dir() {
+            return Ok(l.clone());
+        }
     }
-    if std::fs::metadata(&path).map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(false) {
-        let _ = std::fs::rename(&path, path.with_file_name("activity.1.jsonl"));
+    let ledger = Ledger::open(&dir)?;
+    match import_legacy(&ledger, data_dir) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(entries = n, "imported the legacy activity log into the audit ledger"),
+        Err(error) => tracing::warn!(%error, "could not import the legacy activity log; it stays where it is and is still read"),
     }
+    cache.insert(dir, ledger.clone());
+    Ok(ledger)
+}
+
+fn legacy_paths(data_dir: &Path) -> Vec<PathBuf> {
+    LEGACY_FILES.iter().map(|n| data_dir.join("audit").join(n)).filter(|p| p.is_file()).collect()
+}
+
+fn legacy_entries(paths: &[PathBuf]) -> Vec<ActivityDto> {
+    let mut out = Vec::new();
+    for path in paths {
+        if let Ok(bytes) = std::fs::read(path) {
+            let text = String::from_utf8_lossy(&bytes);
+            out.extend(text.lines().filter_map(|l| serde_json::from_str::<ActivityDto>(l).ok()));
+        }
+    }
+    out
+}
+
+/// Copy the entries of the old activity files into the stream, in order, then rename the files to
+/// `*.imported`. Nothing is deleted. Entries already in the stream (an earlier import that was cut
+/// short) are skipped by id, so running this twice never duplicates. Returns the entries added.
+pub fn import_legacy(ledger: &Ledger, data_dir: &Path) -> Result<usize, String> {
+    let paths = legacy_paths(data_dir);
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let mut seen: HashSet<String> = ledger
+        .read_events(STREAM, &|_| true, usize::MAX)
+        .into_iter()
+        .filter_map(|e| e.value.get("id").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    let mut added = 0;
+    for entry in legacy_entries(&paths) {
+        if !seen.insert(entry.id.clone()) {
+            continue;
+        }
+        let value = serde_json::to_value(&entry).map_err(|e| e.to_string())?;
+        ledger.append_event(STREAM, value)?;
+        added += 1;
+    }
+    ledger.flush_stream(STREAM)?;
+    for path in &paths {
+        let mut target = PathBuf::from(format!("{}.imported", path.display()));
+        let mut n = 1;
+        while target.exists() {
+            target = PathBuf::from(format!("{}.imported.{n}", path.display()));
+            n += 1;
+        }
+        std::fs::rename(path, &target).map_err(|e| format!("imported, but could not rename {}: {e}", path.display()))?;
+    }
+    Ok(added)
+}
+
+fn prepare(entry: &ActivityDto) -> ActivityDto {
     let mut entry = entry.clone();
     entry.summary = clip(&entry.summary, MAX_SUMMARY);
     entry.details = entry.details.map(|d| clip(&d, MAX_DETAILS));
-    let mut line = serde_json::to_string(&entry).map_err(|e| format!("could not encode activity entry: {e}"))?;
-    line.push('\n');
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| format!("could not open activity log: {e}"))?;
-    file.write_all(line.as_bytes()).map_err(|e| format!("could not write activity log: {e}"))
+    entry
+}
+
+/// Append one entry to the activity stream of a ledger.
+pub fn append_to(ledger: &Ledger, entry: &ActivityDto) -> Result<(), String> {
+    let value = serde_json::to_value(prepare(entry)).map_err(|e| format!("could not encode activity entry: {e}"))?;
+    ledger.append_event(STREAM, value).map(|_| ())
+}
+
+/// Append one entry to the ledger under `data_dir`.
+pub fn append(data_dir: &Path, entry: &ActivityDto) -> Result<(), String> {
+    append_to(&ledger_for(data_dir)?, entry)
+}
+
+fn dto_of(event: crate::ledger::EventRecord) -> Option<ActivityDto> {
+    let mut value = event.value;
+    value.as_object_mut()?.insert("ts".into(), serde_json::Value::String(event.ts));
+    serde_json::from_value(value).ok()
+}
+
+/// Newest entries first, optionally filtered by kind and/or target, from a ledger plus any legacy
+/// files that are still waiting to be imported.
+pub fn read_from(ledger: Option<&Ledger>, legacy_dir: &Path, limit: usize, kind: Option<&str>, target_id: Option<&str>) -> Vec<ActivityDto> {
+    let limit = limit.clamp(1, 1000);
+    let matches = |kind_: &str, target: &str| kind.map(|k| kind_ == k).unwrap_or(true) && target_id.map(|t| target == t).unwrap_or(true);
+    let filter = |v: &serde_json::Value| {
+        matches(v.get("kind").and_then(|x| x.as_str()).unwrap_or(""), v.get("target_id").and_then(|x| x.as_str()).unwrap_or(""))
+    };
+    let from_stream: Vec<ActivityDto> = ledger.map(|l| l.read_events(STREAM, &filter, limit)).unwrap_or_default().into_iter().filter_map(dto_of).collect();
+    let legacy = legacy_entries(&legacy_paths(legacy_dir));
+    if legacy.is_empty() {
+        return from_stream;
+    }
+    // A failed or interrupted import: merge the old entries in by time, once each (stable for equal times).
+    let in_stream: HashSet<&str> = from_stream.iter().map(|e| e.id.as_str()).collect();
+    let mut all: Vec<ActivityDto> = legacy.into_iter().filter(|e| !in_stream.contains(e.id.as_str())).collect();
+    all.extend(from_stream.iter().rev().cloned());
+    let when = |e: &ActivityDto| chrono::DateTime::parse_from_rfc3339(&e.ts).map(|t| t.timestamp_millis()).unwrap_or(i64::MIN);
+    all.sort_by_key(when);
+    all.reverse();
+    all.into_iter().filter(|e| matches(&e.kind, &e.target_id)).take(limit).collect()
 }
 
 /// Newest entries first, optionally filtered by kind and/or target.
 pub fn read(data_dir: &Path, limit: usize, kind: Option<&str>, target_id: Option<&str>) -> Vec<ActivityDto> {
-    let mut entries: Vec<ActivityDto> = Vec::new();
-    // Older rotated file first so the combined order stays chronological.
-    for name in ["activity.1.jsonl", "activity.jsonl"] {
-        let path = data_dir.join("audit").join(name);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            entries.extend(text.lines().filter_map(|l| serde_json::from_str::<ActivityDto>(l).ok()));
-        }
-    }
-    entries.reverse();
-    entries
-        .into_iter()
-        .filter(|e| kind.map(|k| e.kind == k).unwrap_or(true))
-        .filter(|e| target_id.map(|t| e.target_id == t).unwrap_or(true))
-        .take(limit.clamp(1, 1000))
-        .collect()
+    let ledger = ledger_for(data_dir).ok();
+    read_from(ledger.as_ref(), data_dir, limit, kind, target_id)
 }
 
 fn data_dir(state: &AppState) -> Option<PathBuf> {
@@ -171,10 +260,12 @@ fn record_with(
         ok,
         details,
     };
-    if let Some(dir) = data_dir(state) {
-        if let Err(error) = append(&dir, &entry) {
-            tracing::warn!(%error, action, "could not write activity log");
-        }
+    let written = match crate::ledger::global() {
+        Some(ledger) => Some(append_to(ledger, &entry)),
+        None => data_dir(state).map(|dir| append(&dir, &entry)),
+    };
+    if let Some(Err(error)) = written {
+        tracing::warn!(%error, action, "could not write activity log");
     }
     if let Some(app) = state.app.get() {
         let _ = app.emit("activity-added", &entry);
@@ -200,12 +291,11 @@ pub async fn list_activity(
     target_id: Option<String>,
     runtime_paths: tauri::State<'_, crate::commands::python_runtime::RuntimePaths>,
 ) -> Result<Vec<ActivityDto>, String> {
-    Ok(read(
-        runtime_paths.data_dir(),
-        limit.unwrap_or(200),
-        kind.as_deref(),
-        target_id.as_deref(),
-    ))
+    let (limit, kind, target_id) = (limit.unwrap_or(200), kind.as_deref(), target_id.as_deref());
+    Ok(match crate::ledger::global() {
+        Some(ledger) => read_from(Some(ledger), runtime_paths.data_dir(), limit, kind, target_id),
+        None => read(runtime_paths.data_dir(), limit, kind, target_id),
+    })
 }
 
 #[cfg(test)]
@@ -259,14 +349,22 @@ mod tests {
         assert!(!announces_change("system", true, false));
     }
 
+    fn write_legacy(dir: &Path, name: &str, entries: &[ActivityDto], junk: bool) {
+        std::fs::create_dir_all(dir.join("audit")).unwrap();
+        let mut text: String = entries.iter().map(|e| serde_json::to_string(e).unwrap() + "\n").collect();
+        if junk {
+            text.push_str("not json\n");
+        }
+        std::fs::write(dir.join("audit").join(name), text).unwrap();
+    }
+
     #[test]
-    fn long_text_is_clipped_and_bad_lines_are_skipped() {
+    fn long_text_is_clipped() {
         let dir = temp("clip");
         let mut e = entry(1, "model", "m");
         e.summary = "s".repeat(1000);
         e.details = Some("d".repeat(5000));
         append(&dir, &e).unwrap();
-        std::fs::OpenOptions::new().append(true).open(log_path(&dir)).unwrap().write_all(b"not json\n").unwrap();
         let got = read(&dir, 10, None, None);
         assert_eq!(got.len(), 1);
         assert!(got[0].summary.chars().count() <= MAX_SUMMARY + 1);
@@ -275,21 +373,63 @@ mod tests {
     }
 
     #[test]
-    fn a_large_log_rotates_and_both_files_are_read() {
-        let dir = temp("rotate");
-        append(&dir, &entry(1, "model", "old")).unwrap();
-        let big = std::fs::OpenOptions::new().append(true).open(log_path(&dir)).unwrap();
-        big.set_len(MAX_FILE_BYTES + 10).unwrap();
-        append(&dir, &entry(2, "model", "new")).unwrap();
-        assert!(dir.join("audit").join("activity.1.jsonl").exists());
-        let ids: Vec<String> = read(&dir, 10, None, None).into_iter().map(|e| e.target_id).collect();
-        assert_eq!(ids.first().map(String::as_str), Some("new"));
-        assert!(ids.contains(&"old".to_string()));
+    fn entries_are_hash_chained_and_editing_one_is_detected() {
+        let dir = temp("chain");
+        for n in 1..=4 {
+            append(&dir, &entry(n, "model", &format!("m{n}"))).unwrap();
+        }
+        let ledger = ledger_for(&dir).unwrap();
+        assert!(ledger.verify().ok);
+        let path = dir.join("ledger").join("streams").join("activity.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 4);
+        std::fs::write(&path, text.replace("entry 2", "entry TWO")).unwrap();
+        let report = ledger.verify();
+        assert!(!report.ok);
+        assert_eq!(report.problems[0].kind, "stream_hash");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn concurrent_writers_never_interleave_inside_a_line() {
+    fn the_old_log_is_imported_in_order_without_losing_the_file() {
+        let dir = temp("import");
+        write_legacy(&dir, "activity.1.jsonl", &[entry(1, "model", "a")], false);
+        write_legacy(&dir, "activity.jsonl", &[entry(2, "model", "b"), entry(3, "strategy", "c")], true);
+        // Opening imports. New entries go after the imported ones.
+        append(&dir, &entry(4, "model", "d")).unwrap();
+        let ids: Vec<String> = read(&dir, 10, None, None).into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["id4", "id3", "id2", "id1"]);
+        let got = read(&dir, 10, Some("strategy"), None);
+        assert_eq!((got.len(), got[0].ts.as_str()), (1, "2026-01-01T00:00:03Z"), "original timestamps are kept");
+        // The old files are renamed, not deleted, and keep their content (including the line that was not JSON).
+        assert!(!log_path(&dir).exists());
+        let kept = std::fs::read_to_string(dir.join("audit").join("activity.jsonl.imported")).unwrap();
+        assert!(kept.contains("entry 2") && kept.contains("not json"));
+        assert!(dir.join("audit").join("activity.1.jsonl.imported").exists());
+        assert!(ledger_for(&dir).unwrap().verify().ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupted_import_is_finished_without_duplicates() {
+        let dir = temp("import-twice");
+        write_legacy(&dir, "activity.jsonl", &[entry(1, "model", "a"), entry(2, "model", "b")], false);
+        // Simulate a crash after the first entry was imported but before the rename.
+        let ledger = Ledger::open(&dir.join("ledger")).unwrap();
+        append_to(&ledger, &entry(1, "model", "a")).unwrap();
+        // The unrenamed file is still shown, once.
+        let ids: Vec<String> = read_from(Some(&ledger), &dir, 10, None, None).into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["id2", "id1"]);
+        assert_eq!(import_legacy(&ledger, &dir).unwrap(), 1);
+        let ids: Vec<String> = read_from(Some(&ledger), &dir, 10, None, None).into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["id2", "id1"]);
+        assert_eq!(import_legacy(&ledger, &dir).unwrap(), 0);
+        assert!(ledger.verify().ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_writers_keep_one_valid_chain() {
         let dir = temp("concurrent");
         let threads: Vec<_> = (0..8)
             .map(|t| {
@@ -306,9 +446,10 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        let text = std::fs::read_to_string(log_path(&dir)).unwrap();
-        assert_eq!(text.lines().count(), 8 * 100);
-        assert_eq!(read(&dir, 1000, None, None).len(), 8 * 100, "every line parses");
+        assert_eq!(read(&dir, 1000, None, None).len(), 8 * 100, "every entry reads back");
+        let report = ledger_for(&dir).unwrap().verify();
+        assert!(report.ok, "{:?}", report.problems);
+        assert_eq!(report.checked_events, 800);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

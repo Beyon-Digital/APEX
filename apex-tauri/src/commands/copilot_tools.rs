@@ -283,7 +283,7 @@ pub async fn exec_extra(
         "stop_strategy" => stop_strategy(args),
         "modify_order" => modify_order(args, state).await,
         "kill_switch" => {
-            let (cancelled, failed) = state.kill_switch().await;
+            let (cancelled, failed) = state.kill_switch_as("copilot").await;
             Ok(json!({"halted": true, "live_armed": false, "automations_paused": true,
                       "cancelled_orders": cancelled, "failed_cancels": failed,
                       "note": "Trading stays halted until the user resets it in the app."}))
@@ -409,6 +409,12 @@ fn stop_strategy(args: &Value) -> Result<Value, String> {
     }
 }
 
+/// The id of the Copilot turn that is running ("" when the caller sent none). Orders the Copilot
+/// places or changes carry it, so every trade traces to the turn that produced it.
+pub fn current_turn(state: &AppState) -> String {
+    state.copilot_turn.lock().ok().and_then(|t| t.clone()).unwrap_or_default()
+}
+
 async fn modify_order(args: &Value, state: &AppState) -> Result<Value, String> {
     let order_id = arg_str(args, "order_id")?;
     let broker = broker_arg(args)?;
@@ -422,11 +428,14 @@ async fn modify_order(args: &Value, state: &AppState) -> Result<Value, String> {
     }
     validation::validate_price(price)?;
     super::automation::check_broker_allowed(state, &broker)?;
+    // The audit trail names the Copilot turn that changed the order.
+    let source = crate::order_audit::copilot_source(&current_turn(state));
     state
-        .guarded_modify(
+        .guarded_modify_with(
             &OrderId(order_id.to_string()),
             &broker,
             &ModifyParams { quantity, price, stop_price: None },
+            Some(source),
         )
         .await?;
     Ok(json!({"modified": order_id, "quantity": quantity, "price": price}))
@@ -528,7 +537,7 @@ fn describe_call_inner(name: &str, args: &Value) -> String {
             format!(
                 "Write strategy file {}{} - {} chars, hash {}. This Python can run on your machine. Starts: {preview}",
                 s("path"),
-                if args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false) { " (replace existing, old copy kept as .bak)" } else { "" },
+                if args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false) { " (replace existing; the old version stays in the history)" } else { "" },
                 content.chars().count(),
                 content_hash(content),
             )
@@ -571,6 +580,12 @@ pub const RECIPE_NOTE: &str = "ALGORITHM RECIPES\n\
 - Scale features for linear models, clip_outliers for heavy tails, voting for stability, stacking when the members disagree. Run validate_recipe, fix what it reports, then save_recipe with a clear name.\n\
 - Train it with train_ml_model {algorithm: \"recipe\", recipe: name, dataset, holdout_pct}; no approval beyond the mode rules, since it runs no custom code. Judge it against baseline_accuracy and the hold-out like any model; extra parts raise overfitting risk.\n\
 - Stacking trains its final estimator on earlier data and predicts later data, so the oldest rows get no stacked prediction and it needs more rows than a single model.";
+
+/// The audit ledger, for the system prompt.
+pub const LEDGER_NOTE: &str = "AUDIT HISTORY\n\
+- Every change to a strategy, estimator, recipe, dataset, model, automation or notebook is saved as a new version under the same name, and every order is logged event by event. Nothing can be erased or overwritten.\n\
+- Prefer a new version over deleting: save the improved file again instead of removing and recreating it. A delete only marks the object deleted, and ledger_restore brings an older version back as another new version.\n\
+- When asked what changed, who changed it or when, call ledger_history (then ledger_version to compare content). list_order_events shows how an order progressed and which turn, rule or strategy version produced it.";
 
 /// Shorting rules for the system prompt.
 pub const SHORTING_NOTE: &str = "SHORTING\n\
@@ -645,6 +660,7 @@ pub fn system_prompt(state: &AppState, paths: &RuntimePaths, mode: super::copilo
          {ml_workflow}\n\n\
          {recipes}\n\n\
          {shorting}\n\n\
+         {ledger}\n\n\
          STATUS\n\
          risk_halted={} session_pnl={:.2} max_daily_loss={:.0}\n\
          live_armed={} live_orders_today={}/{} max_qty_per_order={} allow_live_trading={} vault={:?} \
@@ -677,6 +693,7 @@ pub fn system_prompt(state: &AppState, paths: &RuntimePaths, mode: super::copilo
         ml_workflow = ML_WORKFLOW,
         recipes = RECIPE_NOTE,
         shorting = SHORTING_NOTE,
+        ledger = LEDGER_NOTE,
     )
 }
 
@@ -702,6 +719,8 @@ pub mod audit {
         "delete_estimator_file",
         "save_recipe",
         "delete_recipe",
+        // Appends the new version and writes the `<kind>.restore` entry itself.
+        "ledger_restore",
     ];
 
     /// How a tool call turns into log entries.
@@ -764,6 +783,7 @@ pub mod audit {
             "delete_estimator_file" => class("system", "estimator.delete", SelfRecording, false),
             "save_recipe" => class("system", "recipe.save", SelfRecording, false),
             "delete_recipe" => class("system", "recipe.delete", SelfRecording, false),
+            "ledger_restore" => class("system", "ledger.restore", SelfRecording, false),
             _ => return None,
         })
     }

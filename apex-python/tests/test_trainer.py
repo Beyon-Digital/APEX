@@ -153,6 +153,74 @@ def test_id_is_claimed_atomically_even_if_the_exists_check_races(tmp_path, monke
 
 
 # ------------------------------------------------------------------
+# Audit provenance
+# ------------------------------------------------------------------
+
+
+def _sha(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_provenance_lands_in_the_metadata_and_the_run_log(tmp_path):
+    data = write_dataset(tmp_path / "ds.csv")
+    prov = {"dataset_version": 3, "dataset_csv_sha256": _sha(data), "estimator_file_version": None, "recipe_version": 4}
+    config = make_config(tmp_path, data_path=data, hyperparams={"n_estimators": 5}, n_splits=2, provenance=prov)
+    result = ModelTrainer().train(config)
+    meta = strict_json(result.metadata_path)
+    assert meta["dataset_version"] == 3
+    assert meta["dataset_csv_sha256"] == _sha(data) == meta["data_file_sha256"]
+    assert meta["recipe_version"] == 4 and meta["estimator_file_version"] is None
+    assert meta["artifact_sha256"] == _sha(result.model_path)
+    log = result.log_path.read_text()
+    assert "Dataset ds version 3" in log and _sha(data) in log
+
+
+def test_a_data_file_that_differs_from_the_ledger_hash_is_refused_before_training(tmp_path):
+    data = write_dataset(tmp_path / "ds.csv")
+    prov = {"dataset_version": 1, "dataset_csv_sha256": "0" * 64}
+    config = make_config(tmp_path, data_path=data, provenance=prov)
+    with pytest.raises(ValueError, match="does not match the audit ledger"):
+        ModelTrainer().train(config)
+    assert not Path(config.output_dir).exists() or not list(Path(config.output_dir).iterdir())
+
+
+def test_without_provenance_the_hash_of_the_data_is_still_recorded(trained):
+    config, result = trained
+    meta = strict_json(result.metadata_path)
+    assert meta["data_file_sha256"] == _sha(Path(config.data_path))
+    assert "dataset_version" not in meta
+
+
+def test_an_id_used_by_an_archived_model_is_never_reused(tmp_path, monkeypatch):
+    config = make_config(tmp_path, n_splits=2, hyperparams={"n_estimators": 5})
+    first = ModelTrainer().train(config)
+    out_dir = Path(config.output_dir)
+    # What the app does on delete: move the files into models/archive/<id>@v<n>/.
+    archive = out_dir / "archive" / f"{first.model_path.stem}@v2"
+    archive.mkdir(parents=True)
+    for f in (first.metadata_path, first.model_path, first.log_path):
+        f.rename(archive / f.name)
+    # Freeze the clock so the next run would pick the same timestamp-based id.
+    stem = first.model_path.stem
+
+    class Frozen:
+        @staticmethod
+        def now(tz=None):
+            from datetime import datetime as real
+
+            return real.strptime(stem.rsplit("_", 1)[-1], "%Y%m%dT%H%M%SZ").replace(tzinfo=tz)
+
+    import ml.trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, "datetime", Frozen)
+    second = ModelTrainer().train(config)
+    assert second.model_path.stem != stem
+    assert (archive / first.model_path.name).exists()
+
+
+# ------------------------------------------------------------------
 # Folds
 # ------------------------------------------------------------------
 

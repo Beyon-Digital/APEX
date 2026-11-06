@@ -4,7 +4,9 @@ mod chatgpt_auth;
 mod commands;
 mod config;
 mod dto;
+mod ledger;
 mod live_guard;
+mod order_audit;
 mod state;
 mod tracing_setup;
 mod validation;
@@ -86,6 +88,13 @@ fn main() {
             market::set_symbol_provider,
             orders::get_holdings,
             orders::place_order,
+            order_audit::list_order_events,
+            commands::ledger_cmds::ledger_history,
+            commands::ledger_cmds::ledger_version,
+            commands::ledger_cmds::ledger_objects,
+            commands::ledger_cmds::ledger_restore,
+            commands::ledger_cmds::ledger_verify,
+            commands::ledger_cmds::ledger_status,
             orders::preview_order,
             live::get_live_status,
             live::set_live_armed,

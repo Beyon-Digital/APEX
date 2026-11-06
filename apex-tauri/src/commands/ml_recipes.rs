@@ -17,6 +17,8 @@
 use super::python_runtime::{self, RuntimePaths};
 use super::ml_estimators::{self, run_python_module};
 use crate::dto::{RecipeCheckDto, RecipeDto, RecipeIssueDto, RecipeMemberDto, RecipeModelDto, RecipeParams};
+use super::versioned_files;
+use crate::ledger::{Kind, Ledger, VersionRecord};
 use crate::state::AppState;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -436,11 +438,18 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// Write a recipe atomically (temp file in the same directory, then rename). Keeps `created_at`
-/// of an existing recipe and sets `updated_at`. The recipe must already have passed the checks.
-pub(crate) fn write_recipe(work_root: &Path, recipe: &RecipeDto) -> Result<RecipeDto, String> {
+/// A recipe with its timestamps, ready to be written: checked, `created_at` kept from the existing
+/// file (a client cannot rewrite history) and `updated_at` set.
+struct Prepared {
+    #[allow(dead_code)] // only the test-only raw writer uses it
+    dir: PathBuf,
+    target: PathBuf,
+    saved: RecipeDto,
+    text: String,
+}
+
+fn prepare_recipe(work_root: &Path, recipe: &RecipeDto) -> Result<Prepared, String> {
     validate_recipe_name(&recipe.name)?;
-    let _guard = RECIPE_FILES.lock().unwrap_or_else(|p| p.into_inner());
     let dir = recipes_dir(work_root);
     if is_symlink(&dir) {
         return Err("The algorithms folder is a symbolic link; refusing to write through it".into());
@@ -475,11 +484,20 @@ pub(crate) fn write_recipe(work_root: &Path, recipe: &RecipeDto) -> Result<Recip
     let mut saved = recipe.clone();
     saved.created_at = Some(
         existing
-            .and_then(|e| e.created_at)
+            .as_ref()
+            .and_then(|e| e.created_at.clone())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| stamp.clone()),
     );
     saved.updated_at = Some(stamp);
+    // Saving what is already saved changes nothing, so it keeps the old timestamp and adds no version.
+    if let Some(old) = existing {
+        let mut same = saved.clone();
+        same.updated_at = old.updated_at.clone();
+        if same == old {
+            saved = old;
+        }
+    }
     let text = serde_json::to_string_pretty(&saved).map_err(|e| format!("Failed to encode the recipe: {e}"))?;
     if text.len() > MAX_RECIPE_BYTES {
         return Err(format!(
@@ -488,16 +506,57 @@ pub(crate) fn write_recipe(work_root: &Path, recipe: &RecipeDto) -> Result<Recip
             MAX_RECIPE_BYTES / 1024
         ));
     }
-    let tmp = dir.join(format!(".{}.json.tmp", recipe.name));
-    fs::write(&tmp, &text).map_err(|e| format!("Failed to write {}: {e}", recipe.name))?;
-    if let Err(e) = fs::rename(&tmp, &target) {
+    Ok(Prepared { dir, target, saved, text })
+}
+
+/// Save a recipe as the next version of its name in the audit ledger and mirror it to the
+/// algorithms folder (temp file, ledger, atomic rename). Keeps `created_at` of an existing recipe and
+/// sets `updated_at`; saving an unchanged recipe adds no version. The recipe must already have
+/// passed the checks. If the ledger write fails the file keeps its previous content.
+pub(crate) fn write_recipe_audited(ledger: &Ledger, work_root: &Path, recipe: &RecipeDto, actor: &str) -> Result<(RecipeDto, VersionRecord), String> {
+    validate_recipe_name(&recipe.name)?;
+    let _guard = RECIPE_FILES.lock().unwrap_or_else(|p| p.into_inner());
+    let p = prepare_recipe(work_root, recipe)?;
+    let record = versioned_files::save(ledger, Kind::Recipe, &recipe.name, &p.target, p.text.as_bytes(), actor)?;
+    Ok((p.saved, record))
+}
+
+/// Raw atomic write with no ledger. Tests only: the app has no unaudited write path.
+#[cfg(test)]
+pub(crate) fn write_recipe(work_root: &Path, recipe: &RecipeDto) -> Result<RecipeDto, String> {
+    validate_recipe_name(&recipe.name)?;
+    let _guard = RECIPE_FILES.lock().unwrap_or_else(|p| p.into_inner());
+    let p = prepare_recipe(work_root, recipe)?;
+    let tmp = p.dir.join(format!(".{}.json.tmp", recipe.name));
+    fs::write(&tmp, &p.text).map_err(|e| format!("Failed to write {}: {e}", recipe.name))?;
+    if let Err(e) = fs::rename(&tmp, &p.target) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("Failed to save {}: {e}", recipe.name));
     }
-    Ok(saved)
+    Ok(p.saved)
 }
 
-/// Delete a recipe. Returns whether it existed. Models trained from it keep their own copy.
+/// Delete a recipe as a tombstone in the audit ledger (its history stays, and saving the same name
+/// again continues the same object). Returns whether a file was removed. Models trained from it keep
+/// their own copy.
+pub(crate) fn remove_recipe_audited(ledger: &Ledger, work_root: &Path, name: &str, actor: &str) -> Result<bool, String> {
+    validate_recipe_name(name)?;
+    let _guard = RECIPE_FILES.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = recipes_dir(work_root);
+    if is_symlink(&dir) {
+        return Err("The algorithms folder is a symbolic link; refusing to delete through it".into());
+    }
+    let target = recipe_path(&dir, name);
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_dir() => Err(format!("{name} is not a file")),
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!("{name} is a symbolic link; refusing to delete it")),
+        // A missing file still goes through the ledger so a removal made outside the app is recorded.
+        _ => versioned_files::delete(ledger, Kind::Recipe, name, &target, actor),
+    }
+}
+
+/// Raw delete with no ledger. Tests only.
+#[cfg(test)]
 pub(crate) fn remove_recipe(work_root: &Path, name: &str) -> Result<bool, String> {
     validate_recipe_name(name)?;
     let _guard = RECIPE_FILES.lock().unwrap_or_else(|p| p.into_inner());
@@ -513,6 +572,18 @@ pub(crate) fn remove_recipe(work_root: &Path, name: &str) -> Result<bool, String
     }
 }
 
+/// Restore an older version of a recipe as a new version and rewrite the file.
+#[allow(dead_code)]
+pub(crate) fn restore_recipe(ledger: &Ledger, work_root: &Path, name: &str, version: u32, actor: &str) -> Result<VersionRecord, String> {
+    validate_recipe_name(name)?;
+    let _guard = RECIPE_FILES.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = recipes_dir(work_root);
+    if is_symlink(&dir) {
+        return Err("The algorithms folder is a symbolic link; refusing to write through it".into());
+    }
+    versioned_files::restore(ledger, Kind::Recipe, name, &recipe_path(&dir, name), version, actor)
+}
+
 // ── Commands ─────────────────────────────────────────────────────────
 
 /// Check, write and log a recipe. `actor` is "user" or "copilot".
@@ -524,26 +595,29 @@ pub(crate) async fn save_inner(
 ) -> Result<RecipeDto, String> {
     let replacing = recipe_exists(paths.work_root(), &recipe.name);
     let result = match require_valid(paths, recipe).await {
-        Ok(_) => write_recipe(paths.work_root(), recipe),
+        Ok(_) => versioned_files::ledger()
+            .and_then(|ledger| write_recipe_audited(ledger, paths.work_root(), recipe, actor))
+            .map(|(saved, record)| (saved, Some(record))),
         Err(e) => Err(e),
     };
     let shown = if recipe.label.trim().is_empty() { recipe.name.as_str() } else { recipe.label.as_str() };
     let target = activity_target(&recipe.name);
     match &result {
-        Ok(_) => crate::activity::record(
+        Ok((_, record)) => crate::activity::record(
             state, actor, "recipe.save", "system", &target,
-            &format!("{} algorithm {}", if replacing { "Replaced" } else { "Saved" }, clip(shown)), true, None,
+            &format!("{} algorithm {}", if replacing { "Replaced" } else { "Saved" }, clip(shown)), true,
+            record.as_ref().map(|r| format!("recipe_version={} recipe_hash={}", r.version, r.content_hash.as_deref().unwrap_or(""))),
         ),
         Err(error) => crate::activity::record(
             state, actor, "recipe.save", "system", &target,
             &format!("Saving algorithm {} failed", clip(shown)), false, Some(error.clone()),
         ),
     }
-    result
+    result.map(|(saved, _)| saved)
 }
 
 pub(crate) fn delete_inner(state: &AppState, work_root: &Path, name: &str, actor: &str) -> Result<bool, String> {
-    let result = remove_recipe(work_root, name);
+    let result = versioned_files::ledger().and_then(|ledger| remove_recipe_audited(ledger, work_root, name, actor));
     let target = activity_target(name);
     match &result {
         Ok(true) => crate::activity::record(
@@ -561,6 +635,8 @@ pub(crate) fn delete_inner(state: &AppState, work_root: &Path, name: &str, actor
 /// Every saved recipe, sorted by name.
 #[tauri::command]
 pub async fn list_recipes(runtime_paths: State<'_, RuntimePaths>) -> Result<Vec<RecipeDto>, String> {
+    // An edit made outside the app becomes a version the next time the user looks.
+    versioned_files::reconcile_for_listing(runtime_paths.inner(), Kind::Recipe);
     Ok(list_recipe_files(runtime_paths.work_root()))
 }
 
@@ -1014,5 +1090,60 @@ mod tests {
         // Validation never writes.
         assert!(!recipes_dir(&root).exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    mod audited {
+        use super::*;
+        use crate::commands::versioned_files::testutil::{open, tmp};
+
+        #[test]
+        fn saves_are_versions_an_unchanged_save_is_a_noop_and_deletes_are_tombstones() {
+            let root = tmp("rec");
+            let l = open(&root);
+            let work = root.0.as_path();
+            let (first, v1) = write_recipe_audited(&l, work, &recipe("ens"), "user").unwrap();
+            assert_eq!((v1.version, v1.action.as_str()), (1, "create"));
+            std::thread::sleep(Duration::from_millis(5));
+            let (again, same) = write_recipe_audited(&l, work, &recipe("ens"), "user").unwrap();
+            assert_eq!(same, v1, "saving what is already saved adds no version");
+            assert_eq!(again.updated_at, first.updated_at);
+
+            let mut edited = recipe("ens");
+            edited.label = "Renamed".into();
+            edited.created_at = Some("1999-01-01T00:00:00Z".into());
+            let (second, v2) = write_recipe_audited(&l, work, &edited, "copilot").unwrap();
+            assert_eq!((v2.version, v2.actor.as_str()), (2, "copilot"));
+            assert_eq!(second.created_at, first.created_at, "history cannot be rewritten by the client");
+            assert_eq!(load_recipe(work, "ens").unwrap().label, "Renamed");
+            let old: RecipeDto = serde_json::from_slice(&l.content(Kind::Recipe, "ens", 1).unwrap()).unwrap();
+            assert_eq!(old.label, "My algorithm", "version 1 still holds the original");
+
+            assert!(remove_recipe_audited(&l, work, "ens", "user").unwrap());
+            assert!(!remove_recipe_audited(&l, work, "ens", "user").unwrap());
+            assert!(load_recipe(work, "ens").is_err());
+            assert!(l.head(Kind::Recipe, "ens").unwrap().is_tombstone());
+            let (_, v4) = write_recipe_audited(&l, work, &recipe("ens"), "user").unwrap();
+            assert_eq!(v4.version, 4);
+            let restored = restore_recipe(&l, work, "ens", 2, "user").unwrap();
+            assert_eq!((restored.version, restored.restored_from), (5, Some(2)));
+            assert_eq!(load_recipe(work, "ens").unwrap().label, "Renamed");
+        }
+
+        #[test]
+        fn bad_names_and_size_limits_are_rejected_before_the_ledger_is_touched() {
+            let root = tmp("rec-bad");
+            let l = open(&root);
+            for bad in ["../x", "a/b", "Bad", "", "1x"] {
+                let mut r = recipe("ok");
+                r.name = bad.into();
+                assert!(write_recipe_audited(&l, &root.0, &r, "user").is_err(), "{bad:?}");
+                assert!(remove_recipe_audited(&l, &root.0, bad, "user").is_err(), "{bad:?}");
+                assert!(restore_recipe(&l, &root.0, bad, 1, "user").is_err(), "{bad:?}");
+            }
+            let mut big = recipe("big");
+            big.description = "x".repeat(MAX_RECIPE_BYTES);
+            assert!(write_recipe_audited(&l, &root.0, &big, "user").unwrap_err().contains("too large"));
+            assert!(l.objects(Kind::Recipe, true).is_empty());
+        }
     }
 }

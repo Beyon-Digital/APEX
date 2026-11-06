@@ -5,6 +5,7 @@ use crate::dto::{
     MLTrainingResultDto, ModelDetailDto, ModelSignalHistoryDto, ModelSignalPointDto,
     ModelUsageDto, RecipeDto, TradingSummaryDto,
 };
+use crate::ledger::{self, Kind, Ledger, VersionRecord};
 use crate::state::AppState;
 use crate::validation;
 use serde::Deserialize;
@@ -25,8 +26,72 @@ impl ModelRegistry {
     pub fn new(runtime_paths: &python_runtime::RuntimePaths) -> Self {
         let models_dir = runtime_paths.models_dir().to_path_buf();
         let _ = fs::create_dir_all(&models_dir);
+        remember_data_dir(&models_dir, runtime_paths.data_dir());
         Self { models_dir }
     }
+}
+
+// ── The audit ledger for models ──────────────────────────────────────
+//
+// A model is a versioned object (kind `model`, object id = model id). Its content is the metadata JSON:
+// display name, notes and tags change over time, and its existence changes (deleted = tombstone,
+// restorable). The artifact `.joblib` is written once by the trainer and never modified; deleting a model
+// MOVES its files to `models/archive/<id>@v<n>/` (n = the ledger version of the delete), never removes them.
+// The metadata file in `models/` is a convenience mirror of the ledger head.
+
+/// Which data directory (and so which ledger, `<data_dir>/ledger`) goes with a models directory. Filled by
+/// `ModelRegistry::new` and by training; without an entry the sibling directory `data` is used, which is
+/// the layout of both the app and the tests.
+static DATA_DIRS: std::sync::Mutex<Option<HashMap<PathBuf, PathBuf>>> = std::sync::Mutex::new(None);
+
+fn remember_data_dir(models_dir: &Path, data_dir: &Path) {
+    let mut guard = DATA_DIRS.lock().unwrap_or_else(|p| p.into_inner());
+    guard.get_or_insert_with(HashMap::new).insert(models_dir.to_path_buf(), data_dir.to_path_buf());
+}
+
+fn data_dir_for(models_dir: &Path) -> Option<PathBuf> {
+    let known = DATA_DIRS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(models_dir).cloned());
+    known.or_else(|| models_dir.parent().map(|p| p.join("data")))
+}
+
+/// The ledger for changes. Errors when it cannot be opened: an edit that cannot be recorded is refused.
+fn model_ledger(models_dir: &Path) -> Result<Ledger, String> {
+    let data_dir = data_dir_for(models_dir).ok_or_else(|| "the models directory has no parent directory".to_string())?;
+    crate::activity::ledger_for(&data_dir).map_err(|e| format!("the audit ledger is not available: {e}"))
+}
+
+/// The ledger for reading, or None when this models directory has no data directory next to it yet.
+fn model_ledger_if_known(models_dir: &Path) -> Option<Ledger> {
+    let data_dir = data_dir_for(models_dir)?;
+    if !data_dir.is_dir() {
+        return None;
+    }
+    match crate::activity::ledger_for(&data_dir) {
+        Ok(l) => Some(l),
+        Err(error) => {
+            tracing::error!(%error, "the audit ledger could not be opened; model history is not checked");
+            None
+        }
+    }
+}
+
+fn archive_root(models_dir: &Path) -> PathBuf {
+    models_dir.join("archive")
+}
+
+/// Where the files of a model deleted at ledger version `version` are kept.
+fn archive_dir(models_dir: &Path, model_id: &str, version: u32) -> PathBuf {
+    archive_root(models_dir).join(format!("{model_id}@v{version}"))
+}
+
+fn deleted_error(model_id: &str) -> String {
+    format!(
+        "Model `{model_id}` was deleted (archived). Its history is in the audit ledger and it can be restored; it cannot be used until then"
+    )
 }
 
 /// The fields every metadata file has had since the first trainer. Everything added later is read
@@ -170,6 +235,11 @@ fn validate_model_file(name: &str) -> Result<(), String> {
 
 fn read_metadata_raw(models_dir: &Path, model_id: &str) -> Result<(ModelMetadataFile, Value), String> {
     validate_model_id(model_id)?;
+    if let Some(head) = model_ledger_if_known(models_dir).and_then(|l| l.head(Kind::Model, model_id)) {
+        if head.is_tombstone() {
+            return Err(deleted_error(model_id));
+        }
+    }
     let path = metadata_path(models_dir, model_id);
     if !path.exists() {
         return Err(format!("Unknown model `{model_id}` (no metadata file)"));
@@ -181,11 +251,129 @@ fn read_metadata_raw(models_dir: &Path, model_id: &str) -> Result<(ModelMetadata
     Ok((meta, raw))
 }
 
+/// Everything that makes a model's files and the ledger agree. The caller holds the model-file lock.
+/// Returns true when the model is deleted (the ledger head is a tombstone).
+///
+/// * no history: the model predates the ledger and is registered as version 1 (actor "system");
+/// * a pending `<id>.json.apexnew` equal to the head is moved into place (an interrupted save/restore);
+/// * a metadata file that differs from the head is an external edit and becomes its own version;
+/// * a tombstoned model whose files are still in `models/` (a delete interrupted after the tombstone)
+///   gets its files moved to the archive.
+fn sync_model_locked(ledger: &Ledger, models_dir: &Path, model_id: &str) -> Result<bool, String> {
+    let path = metadata_path(models_dir, model_id);
+    let pending = ledger::pending_path(&path)?;
+    let present = path.is_file();
+    match ledger.head(Kind::Model, model_id) {
+        None => {
+            if present {
+                let bytes = fs::read(&path).map_err(|e| format!("Failed to read model metadata: {e}"))?;
+                ledger.put(
+                    Kind::Model,
+                    model_id,
+                    &bytes,
+                    "system",
+                    "Registered an existing model (trained before the audit ledger) as version 1",
+                )?;
+            }
+            Ok(false)
+        }
+        Some(head) if head.is_tombstone() => {
+            if !present {
+                return Ok(true);
+            }
+            let bytes = fs::read(&path).map_err(|e| format!("Failed to read model metadata: {e}"))?;
+            let hash = Ledger::sha256_hex(&bytes);
+            let last_live = ledger.history(Kind::Model, model_id).into_iter().rev().find(|r| !r.is_tombstone());
+            if last_live.and_then(|r| r.content_hash).as_deref() == Some(hash.as_str()) {
+                let files = model_file_set(models_dir, model_id)?;
+                move_files(&files, &archive_dir(models_dir, model_id, head.version))?;
+                Ok(true)
+            } else {
+                // Not the deleted model: someone put a new file under this id. Record it.
+                ledger::reconcile_file(ledger, Kind::Model, model_id, &path)?;
+                Ok(false)
+            }
+        }
+        Some(_) => {
+            if present || pending.is_file() {
+                ledger::reconcile_file(ledger, Kind::Model, model_id, &path)?;
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn sync_all_models(ledger: &Ledger, models_dir: &Path, hidden: &mut std::collections::HashSet<String>) {
+    let Ok(entries) = fs::read_dir(models_dir) else {
+        return;
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(id) = name.strip_suffix(".json").or_else(|| name.strip_suffix(".json.apexnew")) else {
+            continue;
+        };
+        if validate_model_id(id).is_ok() {
+            ids.insert(id.to_string());
+        }
+    }
+    for id in ids {
+        match sync_model_locked(ledger, models_dir, &id) {
+            Ok(true) => {
+                hidden.insert(id);
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, model_id = %id, "could not bring a model in step with the audit ledger"),
+        }
+    }
+}
+
+/// The files that belong to a model: metadata, artifact, training log and the copy of a custom
+/// estimator saved next to it.
+fn model_file_set(models_dir: &Path, model_id: &str) -> Result<Vec<PathBuf>, String> {
+    let metadata = metadata_path(models_dir, model_id);
+    let mut artifact = models_dir.join(format!("{model_id}.joblib"));
+    if let Ok(raw) = fs::read_to_string(&metadata) {
+        // A damaged metadata file must not stop the model from being deleted.
+        if let Ok(meta) = serde_json::from_str::<ModelMetadataFile>(&raw) {
+            validate_model_file(&meta.model_file)?;
+            artifact = models_dir.join(meta.model_file);
+        }
+    }
+    Ok(vec![metadata, artifact, log_path(models_dir, model_id), models_dir.join(format!("{model_id}_estimator.py"))])
+}
+
+/// Move the files that exist into `dest` (created on demand). Never overwrites and never deletes.
+fn move_files(files: &[PathBuf], dest: &Path) -> Result<usize, String> {
+    let mut moved = 0;
+    for file in files {
+        if !file.exists() {
+            continue;
+        }
+        let Some(name) = file.file_name() else { continue };
+        fs::create_dir_all(dest).map_err(|e| format!("Failed to create {}: {e}", dest.display()))?;
+        let target = dest.join(name);
+        if target.exists() {
+            return Err(format!("{} already exists; refusing to overwrite it", target.display()));
+        }
+        fs::rename(file, &target).map_err(|e| format!("Failed to move {}: {e}", file.display()))?;
+        moved += 1;
+    }
+    Ok(moved)
+}
+
 pub(crate) fn load_registered_models(models_dir: &Path) -> Result<Vec<MLModelDto>, String> {
     if !models_dir.exists() {
         return Ok(Vec::new());
     }
 
+    // Models from before the ledger are registered here as version 1; an interrupted save, delete or
+    // restore is finished; a hand edit of a metadata file becomes its own version.
+    let mut hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(ledger) = model_ledger_if_known(models_dir) {
+        let _guard = lock_model_files();
+        sync_all_models(&ledger, models_dir, &mut hidden);
+    }
     let mut models = Vec::new();
     let entries = fs::read_dir(models_dir)
         .map_err(|e| format!("Failed to read models directory {:?}: {e}", models_dir))?;
@@ -194,6 +382,9 @@ pub(crate) fn load_registered_models(models_dir: &Path) -> Result<Vec<MLModelDto
         let entry = entry.map_err(|e| format!("Failed to inspect model entry: {e}"))?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if path.file_stem().and_then(|s| s.to_str()).is_some_and(|stem| hidden.contains(stem)) {
             continue;
         }
 
@@ -326,6 +517,14 @@ pub(crate) fn build_detail(
         fee_pct: field(&raw, "fee_pct").unwrap_or(0.0),
         estimator_file: field(&raw, "estimator_file"),
         recipe: field::<RecipeDto>(&raw, "recipe"),
+        dataset_version: field(&raw, "dataset_version"),
+        dataset_csv_sha256: field(&raw, "dataset_csv_sha256"),
+        estimator_version: field(&raw, "estimator_file_version"),
+        recipe_version: field(&raw, "recipe_version"),
+        ledger_version: model_ledger_if_known(models_dir)
+            .and_then(|l| l.head(Kind::Model, model_id))
+            .filter(|h| !h.is_tombstone())
+            .map(|h| h.version),
     })
 }
 
@@ -371,23 +570,30 @@ pub const MAX_TAGS: usize = 12;
 pub const MAX_TAG_CHARS: usize = 30;
 
 /// Edit only `display_name`, `notes` and `tags` of a model's metadata. Every other field,
-/// including ones this build does not know about, is written back unchanged. The file is replaced
-/// atomically (temp file in the same directory, then rename).
+/// including ones this build does not know about, is written back unchanged. The edit is a NEW VERSION
+/// of the model in the audit ledger (the earlier one is kept); the metadata file is its mirror, replaced
+/// atomically after the ledger has the version. Saving an edit that changes nothing adds no version.
 pub(crate) fn update_model_metadata(
     models_dir: &Path,
     model_id: &str,
     display_name: Option<&str>,
     notes: Option<&str>,
     tags: Option<&[String]>,
-) -> Result<(), String> {
+    actor: &str,
+) -> Result<VersionRecord, String> {
     validate_model_id(model_id)?;
     let _guard = lock_model_files();
+    let ledger = model_ledger(models_dir)?;
+    if sync_model_locked(&ledger, models_dir, model_id)? {
+        return Err(deleted_error(model_id));
+    }
     let path = metadata_path(models_dir, model_id);
     let text = fs::read_to_string(&path).map_err(|_| format!("Unknown model `{model_id}` (no metadata file)"))?;
     let mut doc: Value = serde_json::from_str(&text).map_err(|e| format!("Failed to parse model metadata: {e}"))?;
     let obj = doc
         .as_object_mut()
         .ok_or_else(|| "model metadata is not a JSON object".to_string())?;
+    let mut changed: Vec<&str> = Vec::new();
 
     if let Some(name) = display_name {
         let name = name.trim();
@@ -395,12 +601,14 @@ pub(crate) fn update_model_metadata(
             return Err(format!("display name is too long (max {MAX_NAME_CHARS} characters)"));
         }
         obj.insert("display_name".into(), Value::String(name.to_string()));
+        changed.push("display name");
     }
     if let Some(notes) = notes {
         if notes.chars().count() > MAX_NOTES_CHARS {
             return Err(format!("notes are too long (max {MAX_NOTES_CHARS} characters)"));
         }
         obj.insert("notes".into(), Value::String(notes.to_string()));
+        changed.push("notes");
     }
     if let Some(tags) = tags {
         let mut clean: Vec<String> = Vec::new();
@@ -418,16 +626,12 @@ pub(crate) fn update_model_metadata(
             return Err(format!("too many tags ({}; max {MAX_TAGS})", clean.len()));
         }
         obj.insert("tags".into(), serde_json::json!(clean));
+        changed.push("tags");
     }
 
-    let tmp = models_dir.join(format!("{model_id}.json.tmp"));
     let body = serde_json::to_string_pretty(&doc).map_err(|e| format!("Failed to encode metadata: {e}"))?;
-    fs::write(&tmp, body).map_err(|e| format!("Failed to write metadata: {e}"))?;
-    if let Err(e) = fs::rename(&tmp, &path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("Failed to replace metadata: {e}"));
-    }
-    Ok(())
+    let summary = if changed.is_empty() { "Saved without changes".to_string() } else { format!("Edited {}", changed.join(", ")) };
+    ledger::save_working_copy(&ledger, Kind::Model, model_id, &path, body.as_bytes(), actor, &summary)
 }
 
 /// Rename a model and edit its notes and tags. Omitted fields are left alone.
@@ -454,7 +658,7 @@ pub(crate) fn update_ml_model_inner(
     tags: Option<&[String]>,
     actor: &str,
 ) -> Result<ModelDetailDto, String> {
-    let result = update_model_metadata(models_dir, model_id, display_name, notes, tags)
+    let result = update_model_metadata(models_dir, model_id, display_name, notes, tags, actor)
         .and_then(|_| build_detail(models_dir, model_id, usages_of(state, model_id)));
     match &result {
         Ok(detail) => {
@@ -546,6 +750,12 @@ pub(crate) fn prepare_training(
         "holdout_pct": holdout_pct,
         "random_state": request.random_state,
     });
+    // What the model is built from, as ledger versions, so a model traces to the exact code and data.
+    // Stored in the model's metadata by the trainer.
+    let mut provenance = serde_json::Map::new();
+    if request.dataset_version.is_some() && request.dataset.is_none() {
+        return Err("dataset_version needs a dataset".into());
+    }
     if request.algorithm == "custom" {
         let name = request
             .estimator_file
@@ -555,6 +765,10 @@ pub(crate) fn prepare_training(
         let path = ml_estimators::resolve_for_training(runtime_paths.work_root(), name)?;
         payload["estimator_file"] = serde_json::json!(name);
         payload["estimator_path"] = serde_json::json!(path.to_string_lossy());
+        let version = fs::read(&path)
+            .ok()
+            .and_then(|bytes| estimator_ledger_version(runtime_paths, name, &Ledger::sha256_hex(&bytes)));
+        provenance.insert("estimator_file_version".into(), serde_json::json!(version));
     }
 
     if request.algorithm == ml_estimators::RECIPE_ALGORITHM {
@@ -574,12 +788,19 @@ pub(crate) fn prepare_training(
         payload["hyperparams"] = serde_json::json!({});
         payload["recipe"] = serde_json::to_value(&recipe).map_err(|e| format!("Failed to encode the recipe: {e}"))?;
         payload["recipe_name"] = serde_json::json!(name);
+        provenance.insert("recipe_version".into(), serde_json::json!(recipe_ledger_version(runtime_paths, name)));
     }
 
     let data_path;
     if let Some(name) = &request.dataset {
         let dir = ml_datasets::datasets_dir(runtime_paths);
-        let info = ml_datasets::read_info(&dir, name)?;
+        // The latest version unless the request names one. The data file of a version is write-once, so
+        // the version and its hash say exactly which rows the model saw.
+        let info = ml_datasets::read_info_version(&dir, name, request.dataset_version)?;
+        provenance.insert("dataset_version".into(), serde_json::json!(info.version));
+        if !info.csv_sha256.is_empty() {
+            provenance.insert("dataset_csv_sha256".into(), serde_json::json!(info.csv_sha256));
+        }
         data_path = info.path.clone();
         validation::validate_path(&data_path)?;
         if !runtime_paths.resolve_user_relative_path(&data_path).exists() {
@@ -643,7 +864,31 @@ pub(crate) fn prepare_training(
         payload["feature_columns"] = serde_json::json!(request.feature_columns);
     }
 
+    payload["provenance"] = Value::Object(provenance);
     Ok(PreparedTraining { payload, data_path })
+}
+
+/// The ledger version of a custom estimator file whose content is `sha256`: the newest version of the
+/// file's object with that content. None when the ledger has no such version.
+fn estimator_ledger_version(runtime_paths: &python_runtime::RuntimePaths, name: &str, sha256: &str) -> Option<u32> {
+    let ledger = crate::activity::ledger_for(runtime_paths.data_dir()).ok()?;
+    let stem = name.strip_suffix(".py").unwrap_or(name);
+    [name.to_string(), format!("estimators/{name}"), stem.to_string()].iter().find_map(|id| {
+        ledger
+            .history(Kind::Estimator, id)
+            .into_iter()
+            .rev()
+            .find(|r| !r.is_tombstone() && r.content_hash.as_deref() == Some(sha256))
+            .map(|r| r.version)
+    })
+}
+
+/// The ledger version of a saved recipe: its current head.
+fn recipe_ledger_version(runtime_paths: &python_runtime::RuntimePaths, name: &str) -> Option<u32> {
+    let ledger = crate::activity::ledger_for(runtime_paths.data_dir()).ok()?;
+    [name.to_string(), format!("algorithms/{name}.json"), format!("{name}.json")]
+        .iter()
+        .find_map(|id| ledger.head(Kind::Recipe, id).filter(|h| !h.is_tombstone()).map(|h| h.version))
 }
 
 /// Train a new ML model by invoking the Python trainer.
@@ -689,9 +934,18 @@ pub(crate) async fn train_ml_model_inner(
                 .get("accuracy")
                 .map(|a| format!(", accuracy {:.1}%", a * 100.0))
                 .unwrap_or_default();
+            // Which version of the dataset (and which file, by hash) the model was trained on.
+            let data = read_metadata_raw(models_dir, &r.model_id)
+                .ok()
+                .and_then(|(_, raw)| {
+                    let version = raw.get("dataset_version").and_then(|v| v.as_u64())?;
+                    let sha = raw.get("dataset_csv_sha256").and_then(|v| v.as_str()).unwrap_or("");
+                    Some(format!(" version {version}{}", if sha.len() >= 12 { format!(" (csv sha256 {})", &sha[..12]) } else { String::new() }))
+                })
+                .unwrap_or_default();
             crate::activity::record(
                 state, actor, "model.train", "model", &r.model_id,
-                &format!("Trained {algorithm} on {source_label}{acc}"), true, None,
+                &format!("Trained {algorithm} on {source_label}{data}{acc}"), true, None,
             );
         }
         Err(error) => crate::activity::record(
@@ -700,6 +954,23 @@ pub(crate) async fn train_ml_model_inner(
         ),
     }
     result
+}
+
+/// Version 1 (action "create") of a freshly trained model: the metadata the trainer wrote.
+fn register_trained_model(models_dir: &Path, model_id: &str, actor: &str) -> Result<VersionRecord, String> {
+    validate_model_id(model_id)?;
+    let _guard = lock_model_files();
+    let bytes = fs::read(metadata_path(models_dir, model_id))
+        .map_err(|e| format!("Failed to read the new model's metadata: {e}"))?;
+    let doc: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let mut summary = format!("Trained {}", doc.get("algorithm").and_then(|v| v.as_str()).unwrap_or("a model"));
+    if let Some(name) = doc.get("dataset").and_then(|v| v.as_str()) {
+        summary.push_str(&format!(" on dataset {name}"));
+        if let Some(v) = doc.get("dataset_version").and_then(|v| v.as_u64()) {
+            summary.push_str(&format!(" version {v}"));
+        }
+    }
+    model_ledger(models_dir)?.put(Kind::Model, model_id, &bytes, actor, &summary)
 }
 
 async fn train_core(
@@ -791,6 +1062,13 @@ pub(crate) async fn train_core_with(
         .ok_or_else(|| "Python trainer did not return a JSON result".to_string())?;
     let result: TrainerCliResult = serde_json::from_str(json_line)
         .map_err(|e| format!("Failed to parse trainer output: {e}"))?;
+
+    // Version 1 of the model in the audit ledger. A failure is logged loudly and not fatal: the model
+    // exists on disk, and it is registered the first time it is listed or edited.
+    remember_data_dir(models_dir, runtime_paths.data_dir());
+    if let Err(error) = register_trained_model(models_dir, &result.model_id, actor) {
+        tracing::error!(%error, model_id = %result.model_id, "could not record the new model in the audit ledger");
+    }
 
     tracing::info!(
         model_id = %result.model_id,
@@ -1166,30 +1444,151 @@ pub async fn model_signal_history(
 
 // ── Delete ───────────────────────────────────────────────────────────
 
-/// Remove a model's metadata, artifact and training log. Returns whether anything was removed.
-pub(crate) fn delete_model_files(models_dir: &Path, model_id: &str) -> Result<bool, String> {
+/// Delete a model the audit way: append a tombstone version to the ledger, then MOVE its metadata,
+/// artifact, training log and estimator copy to `models/archive/<id>@v<n>/`. Nothing is removed. The
+/// model disappears from the list and cannot be scored; `restore_model` brings it back. Returns whether
+/// there was a live model.
+pub(crate) fn delete_model_files(models_dir: &Path, model_id: &str, actor: &str) -> Result<bool, String> {
     validate_model_id(model_id)?;
     let _guard = lock_model_files();
-    let metadata = metadata_path(models_dir, model_id);
-    let mut artifact = models_dir.join(format!("{model_id}.joblib"));
-    if let Ok(raw) = fs::read_to_string(&metadata) {
-        // A damaged metadata file must not stop the model from being deleted.
-        if let Ok(meta) = serde_json::from_str::<ModelMetadataFile>(&raw) {
-            validate_model_file(&meta.model_file)?;
-            artifact = models_dir.join(meta.model_file);
-        }
+    let ledger = model_ledger(models_dir)?;
+    // Registers a model from before the ledger, so its last state is in the history before the delete.
+    sync_model_locked(&ledger, models_dir, model_id)?;
+    if !ledger.head(Kind::Model, model_id).is_some_and(|h| !h.is_tombstone()) {
+        return Ok(false);
     }
-    let mut removed_any = false;
-    // A custom estimator's code is saved next to the model under a name derived from its id.
-    let estimator_copy = models_dir.join(format!("{model_id}_estimator.py"));
-    for path in [metadata, artifact, log_path(models_dir, model_id), estimator_copy] {
+    let files = model_file_set(models_dir, model_id)?;
+    let record = ledger.tombstone(
+        Kind::Model,
+        model_id,
+        actor,
+        "Deleted: files moved to models/archive, every version stays in the ledger",
+    )?;
+    move_files(&files, &archive_dir(models_dir, model_id, record.version)).map_err(|e| {
+        format!("{model_id} is marked deleted in the audit ledger but its files could not be archived ({e}); this is retried the next time models are listed")
+    })?;
+    Ok(true)
+}
+
+/// Bring a model back: the files return from `models/archive/<id>@v<n>/` and a new version (action
+/// "restore") is appended whose metadata equals version `version` (default: the last one before the
+/// delete). For a model that is not deleted, `version` is required and only the metadata is rolled back,
+/// again as a new version. Returns the new ledger record.
+pub(crate) fn restore_model_files(
+    models_dir: &Path,
+    model_id: &str,
+    version: Option<u32>,
+    actor: &str,
+) -> Result<VersionRecord, String> {
+    validate_model_id(model_id)?;
+    let _guard = lock_model_files();
+    let ledger = model_ledger(models_dir)?;
+    sync_model_locked(&ledger, models_dir, model_id)?;
+    let head = ledger
+        .head(Kind::Model, model_id)
+        .ok_or_else(|| format!("There is no model `{model_id}` in the audit ledger"))?;
+    let target = match version {
+        Some(v) => v,
+        None if head.is_tombstone() => ledger
+            .history(Kind::Model, model_id)
+            .into_iter()
+            .rev()
+            .find(|r| !r.is_tombstone())
+            .map(|r| r.version)
+            .ok_or_else(|| format!("Model `{model_id}` has no earlier version to restore"))?,
+        None => return Err("Say which version to restore".into()),
+    };
+    let bytes = ledger.content(Kind::Model, model_id, target)?;
+    let meta: ModelMetadataFile = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("Version {target} of `{model_id}` does not hold readable model metadata: {e}"))?;
+    validate_model_file(&meta.model_file)?;
+
+    let path = metadata_path(models_dir, model_id);
+    let mut to_move: Vec<PathBuf> = Vec::new();
+    let archive = archive_dir(models_dir, model_id, head.version);
+    if head.is_tombstone() {
+        if !archive.is_dir() {
+            return Err(format!("The archived files of `{model_id}` were not found at {}", archive.display()));
+        }
+        for name in [meta.model_file.clone(), format!("{model_id}.log"), format!("{model_id}_estimator.py")] {
+            let from = archive.join(&name);
+            if from.exists() {
+                if models_dir.join(&name).exists() {
+                    return Err(format!("{name} already exists in the models directory; refusing to overwrite it"));
+                }
+                to_move.push(from);
+            }
+        }
+        if !to_move.iter().any(|f| f.file_name().and_then(|n| n.to_str()) == Some(meta.model_file.as_str()))
+            && !models_dir.join(&meta.model_file).exists()
+        {
+            return Err(format!("The model file {} of `{model_id}` is not in the archive", meta.model_file));
+        }
         if path.exists() {
-            fs::remove_file(&path)
-                .map_err(|e| format!("Failed to delete {:?}: {e}", path))?;
-            removed_any = true;
+            return Err(format!("{} already exists; refusing to overwrite it", path.display()));
         }
     }
-    Ok(removed_any)
+
+    // Same order as a save: the new metadata beside its place first, then the ledger, then the rename.
+    let pending = ledger::pending_path(&path)?;
+    if pending.exists() {
+        let aside = pending.with_extension(format!("apexnew.orphan-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        fs::rename(&pending, &aside).map_err(|e| format!("Failed to set aside a leftover pending file: {e}"))?;
+    }
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending)
+            .map_err(|e| format!("Failed to write {}: {e}", pending.display()))?;
+        std::io::Write::write_all(&mut f, &bytes).and_then(|_| f.sync_all()).map_err(|e| {
+            let _ = fs::remove_file(&pending);
+            format!("Failed to write {}: {e}", pending.display())
+        })?;
+    }
+    let undo = |e: String| {
+        let _ = fs::remove_file(&pending);
+        e
+    };
+    for from in &to_move {
+        let Some(name) = from.file_name() else { continue };
+        fs::rename(from, models_dir.join(name)).map_err(|e| undo(format!("Failed to move {} back: {e}", from.display())))?;
+    }
+    let (record, _) = ledger.restore(Kind::Model, model_id, target, actor).map_err(undo)?;
+    fs::rename(&pending, &path).map_err(|e| {
+        format!("Restored as version {} in the audit ledger, but {} could not be written ({e}); it is completed the next time models are listed", record.version, path.display())
+    })?;
+    Ok(record)
+}
+
+/// Restore a deleted model (or roll a live one's metadata back to `version`) and record it. The ledger
+/// keeps every earlier version. Used by the ledger restore command.
+#[allow(dead_code)]
+pub(crate) fn restore_model(
+    state: &AppState,
+    models_dir: &Path,
+    model_id: &str,
+    version: Option<u32>,
+    actor: &str,
+) -> Result<ModelDetailDto, String> {
+    let result = restore_model_files(models_dir, model_id, version, actor)
+        .and_then(|record| build_detail(models_dir, model_id, usages_of(state, model_id)).map(|d| (record, d)));
+    match &result {
+        Ok((record, _)) => crate::activity::record(
+            state,
+            actor,
+            "model.restore",
+            "model",
+            model_id,
+            &format!("Restored model {model_id} as version {} (from version {})", record.version, record.restored_from.unwrap_or(0)),
+            true,
+            None,
+        ),
+        Err(error) => crate::activity::record(
+            state, actor, "model.restore", "model", model_id, &format!("Restoring {model_id} failed"), false, Some(error.clone()),
+        ),
+    }
+    result.map(|(_, detail)| detail)
 }
 
 pub(crate) fn delete_ml_model_inner(
@@ -1198,10 +1597,17 @@ pub(crate) fn delete_ml_model_inner(
     model_id: &str,
     actor: &str,
 ) -> Result<bool, String> {
-    let result = delete_model_files(models_dir, model_id);
+    let result = delete_model_files(models_dir, model_id, actor);
     match &result {
         Ok(true) => crate::activity::record(
-            state, actor, "model.delete", "model", model_id, &format!("Deleted model {model_id}"), true, None,
+            state,
+            actor,
+            "model.delete",
+            "model",
+            model_id,
+            &format!("Archived model {model_id} (files moved to models/archive; every version stays in the audit ledger)"),
+            true,
+            None,
         ),
         Ok(false) => {}
         Err(error) => crate::activity::record(
@@ -1228,11 +1634,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// An empty models directory with its `data` sibling (where the ledger lives), as in the app.
     fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("apex-ml-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+        let root = std::env::temp_dir().join(format!("apex-ml-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("data")).unwrap();
+        let d = root.join("models");
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Remove the whole temp root of a [`temp`] directory (the models directory and its `data` sibling).
+    fn cleanup(models_dir: &Path) {
+        let root = models_dir.parent().expect("a temp models directory has a parent");
+        // Never remove anything but a root made by `temp`.
+        assert!(root.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("apex-ml-")), "{}", root.display());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn hp(v: Value) -> HashMap<String, Value> {
@@ -1340,10 +1757,10 @@ mod tests {
             assert!(validate_model_id(bad).is_err(), "{bad}");
         }
         let dir = temp("ids");
-        assert!(update_model_metadata(&dir, "../x", Some("n"), None, None).is_err());
-        assert!(delete_model_files(&dir, "../x").is_err());
+        assert!(update_model_metadata(&dir, "../x", Some("n"), None, None, "user").is_err());
+        assert!(delete_model_files(&dir, "../x", "user").is_err());
         assert!(build_detail(&dir, "a/b", vec![]).is_err());
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     const OLD_METADATA: &str = r#"{
@@ -1384,7 +1801,7 @@ mod tests {
         assert_eq!(d.n_splits, 5);
         assert_eq!(d.artifact_bytes, Some(321));
         assert_eq!(d.log_tail, "");
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1395,7 +1812,7 @@ mod tests {
         let list = load_registered_models(&dir).unwrap();
         assert_eq!(list.len(), 1);
         assert!(!list[0].metrics.contains_key("f1"));
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1431,7 +1848,7 @@ mod tests {
         assert_eq!(d.library_versions["scikit_learn"], "1.9.1");
         assert_eq!(d.log_tail.chars().count(), 4000);
         assert!(log.ends_with(&d.log_tail));
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1443,7 +1860,7 @@ mod tests {
         doc["hyperparams"] = json!({"n_estimators": 50});
         fs::write(dir.join(format!("{id}.json")), doc.to_string()).unwrap();
 
-        update_model_metadata(&dir, &id, Some("  Nice name "), Some("notes here"), Some(&["x".into(), " y ".into(), "x".into(), "".into()])).unwrap();
+        update_model_metadata(&dir, &id, Some("  Nice name "), Some("notes here"), Some(&["x".into(), " y ".into(), "x".into(), "".into()]), "user").unwrap();
         let after: Value = serde_json::from_str(&fs::read_to_string(dir.join(format!("{id}.json"))).unwrap()).unwrap();
         assert_eq!(after["display_name"], "Nice name");
         assert_eq!(after["notes"], "notes here");
@@ -1455,12 +1872,12 @@ mod tests {
         assert!(!dir.join(format!("{id}.json.tmp")).exists(), "temp file left behind");
 
         // Omitted fields stay as they are.
-        update_model_metadata(&dir, &id, None, Some("only notes"), None).unwrap();
+        update_model_metadata(&dir, &id, None, Some("only notes"), None, "user").unwrap();
         let again: Value = serde_json::from_str(&fs::read_to_string(dir.join(format!("{id}.json"))).unwrap()).unwrap();
         assert_eq!(again["display_name"], "Nice name");
         assert_eq!(again["notes"], "only notes");
         assert_eq!(again["tags"], json!(["x", "y"]));
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1468,16 +1885,16 @@ mod tests {
         let dir = temp("limits");
         let id = write_old_model(&dir);
         let before = fs::read_to_string(dir.join(format!("{id}.json"))).unwrap();
-        assert!(update_model_metadata(&dir, &id, Some(&"n".repeat(81)), None, None).is_err());
-        assert!(update_model_metadata(&dir, &id, Some(&"n".repeat(80)), None, None).is_ok());
-        assert!(update_model_metadata(&dir, &id, None, Some(&"n".repeat(4001)), None).is_err());
+        assert!(update_model_metadata(&dir, &id, Some(&"n".repeat(81)), None, None, "user").is_err());
+        assert!(update_model_metadata(&dir, &id, Some(&"n".repeat(80)), None, None, "user").is_ok());
+        assert!(update_model_metadata(&dir, &id, None, Some(&"n".repeat(4001)), None, "user").is_err());
         let many: Vec<String> = (0..13).map(|i| format!("t{i}")).collect();
-        assert!(update_model_metadata(&dir, &id, None, None, Some(&many)).is_err());
-        assert!(update_model_metadata(&dir, &id, None, None, Some(&many[..12])).is_ok());
-        assert!(update_model_metadata(&dir, &id, None, None, Some(&["t".repeat(31)])).is_err());
-        assert!(update_model_metadata(&dir, "nope", Some("x"), None, None).is_err());
+        assert!(update_model_metadata(&dir, &id, None, None, Some(&many), "user").is_err());
+        assert!(update_model_metadata(&dir, &id, None, None, Some(&many[..12]), "user").is_ok());
+        assert!(update_model_metadata(&dir, &id, None, None, Some(&["t".repeat(31)]), "user").is_err());
+        assert!(update_model_metadata(&dir, "nope", Some("x"), None, None, "user").is_err());
         assert_ne!(before, fs::read_to_string(dir.join(format!("{id}.json"))).unwrap());
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1490,8 +1907,8 @@ mod tests {
             let name = format!("name-{i}");
             let notes = format!("notes-{i}");
             let (n2, o2) = (name.clone(), notes.clone());
-            let t1 = std::thread::spawn(move || update_model_metadata(&a, &ida, Some(&n2), None, None));
-            let t2 = std::thread::spawn(move || update_model_metadata(&b, &idb, None, Some(&o2), None));
+            let t1 = std::thread::spawn(move || update_model_metadata(&a, &ida, Some(&n2), None, None, "user"));
+            let t2 = std::thread::spawn(move || update_model_metadata(&b, &idb, None, Some(&o2), None, "user"));
             t1.join().unwrap().expect("name edit");
             t2.join().unwrap().expect("notes edit");
             let doc: Value =
@@ -1499,7 +1916,7 @@ mod tests {
             assert_eq!(doc["display_name"], name, "name lost on round {i}");
             assert_eq!(doc["notes"], notes, "notes lost on round {i}");
         }
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1508,13 +1925,13 @@ mod tests {
         let id = write_old_model(&dir);
         fs::write(dir.join(format!("{id}.log")), "log").unwrap();
         fs::write(dir.join("keep.txt"), "x").unwrap();
-        assert!(delete_model_files(&dir, &id).unwrap());
+        assert!(delete_model_files(&dir, &id, "user").unwrap());
         for ext in ["json", "joblib", "log"] {
             assert!(!dir.join(format!("{id}.{ext}")).exists(), "{ext}");
         }
         assert!(dir.join("keep.txt").exists());
-        assert!(!delete_model_files(&dir, &id).unwrap());
-        let _ = fs::remove_dir_all(&dir);
+        assert!(!delete_model_files(&dir, &id, "user").unwrap());
+        cleanup(&dir);
     }
 
     #[test]
@@ -1563,7 +1980,7 @@ mod tests {
         doc["timeframe"] = Value::String("1h".into());
         fs::write(&path, doc.to_string()).unwrap();
         assert_eq!(model_timeframe(&dir, &id).unwrap(), "1h");
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1668,7 +2085,9 @@ mod tests {
 
         let mut request: MLTrainingRequestDto = serde_json::from_str(r#"{"algorithm":"random_forest","dataset":"ds1"}"#).unwrap();
         let p = prepare_training(&request, &models, &paths, "copilot").unwrap();
-        assert_eq!(p.data_path, "data/datasets/ds1.csv");
+        assert_eq!(p.data_path, "data/datasets/ds1/v1.csv");
+        assert_eq!(p.payload["provenance"]["dataset_version"], 1);
+        assert_eq!(p.payload["provenance"]["dataset_csv_sha256"].as_str().unwrap().len(), 64);
         assert_eq!(p.payload["target_column"], "target");
         assert_eq!(p.payload["return_column"], "fwd_ret");
         assert_eq!(p.payload["feature_columns"], json!(["ret_1", "rsi_14"]));
@@ -1692,7 +2111,7 @@ mod tests {
         request.hyperparams.clear();
         request.n_splits = 1;
         assert!(prepare_training(&request, &models, &paths, "user").is_err());
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
     /// Real Python round trip: a dataset built by the Rust pipeline is trained by `ml.trainer`,
@@ -1788,7 +2207,7 @@ mod tests {
 
         // Lag features the model never saw are not requested; an unknown one is named.
         assert!(ml_features::latest_features(&bars, &["not_a_feature".to_string()], "AAA").unwrap_err().contains("not_a_feature"));
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
 
@@ -1818,12 +2237,17 @@ mod tests {
         ml_datasets::write_dataset(&ml_datasets::datasets_dir(paths), &csv, &info).unwrap();
     }
 
-    /// Rewrite fields of a dataset's sidecar the way a custom-feature build would have written them.
+    /// Change fields of a dataset's info the way a custom-feature build would have written them.
     fn edit_sidecar(paths: &python_runtime::RuntimePaths, name: &str, edit: impl FnOnce(&mut Value)) {
-        let path = ml_datasets::datasets_dir(paths).join(format!("{name}.dataset.json"));
-        let mut doc: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        // Datasets are write-once, so "editing" one is a new version with the same rows.
+        let dir = ml_datasets::datasets_dir(paths);
+        let info = ml_datasets::read_info(&dir, name).unwrap();
+        let csv = fs::read_to_string(dir.join(name).join(format!("v{}.csv", info.version))).unwrap();
+        let mut doc = serde_json::to_value(&info).unwrap();
         edit(&mut doc);
-        fs::write(&path, doc.to_string()).unwrap();
+        let mut edited: crate::dto::DatasetInfoDto = serde_json::from_value(doc).unwrap();
+        edited.path = ml_datasets::relative_csv_path(paths, name);
+        ml_datasets::write_dataset(&dir, &csv, &edited).unwrap();
     }
 
     /// A temp work root with the project's Python sources linked in, or None when there is no
@@ -1921,7 +2345,7 @@ mod tests {
         let p = prepare_training(&req, &models, &paths, "user").unwrap();
         assert_eq!(p.payload["estimator_file"], "mine.py");
         assert_eq!(p.payload["estimator_path"].as_str().unwrap(), root.join("estimators").join("mine.py").to_string_lossy());
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
     #[test]
@@ -1967,7 +2391,7 @@ mod tests {
         for key in ["trade_mode", "holdout", "custom_features", "context_symbols", "fee_pct", "estimator_file"] {
             assert!(wire.get(key).is_some(), "{key}");
         }
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1976,10 +2400,10 @@ mod tests {
         let id = write_old_model(&dir);
         fs::write(dir.join(format!("{id}_estimator.py")), "def make_estimator(p): pass\n").unwrap();
         fs::write(dir.join("other_estimator.py"), "keep").unwrap();
-        assert!(delete_model_files(&dir, &id).unwrap());
+        assert!(delete_model_files(&dir, &id, "user").unwrap());
         assert!(!dir.join(format!("{id}_estimator.py")).exists());
         assert!(dir.join("other_estimator.py").exists());
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -2000,7 +2424,7 @@ mod tests {
         let err = block_on(train_core_with(&request, &models, &paths, "user", std::time::Duration::from_millis(50))).unwrap_err();
         assert!(err.contains("longer than 50 ms") && err.contains("was stopped"), "{err}");
         assert!(fs::read_dir(&models).unwrap().next().is_none(), "a stopped run leaves no model behind");
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
     #[test]
@@ -2026,7 +2450,7 @@ mod tests {
         assert_eq!(d.hyperparams["criterion"], "entropy");
         assert_eq!(d.hyperparams["n_jobs"], 4, "n_jobs is clamped, never passed through");
         assert_eq!(d.hyperparams["random_state"], 11);
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
     #[test]
@@ -2067,7 +2491,7 @@ mod tests {
         let t = both.trading.unwrap();
         assert!(t.trades > plain.trading.unwrap().trades, "class 0 now shorts, so there are more trades");
         assert!(both.log_tail.contains("Hold-out"), "{}", both.log_tail);
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
     #[test]
@@ -2108,9 +2532,9 @@ mod tests {
         assert!(signal.probability.is_some());
 
         // Deleting the model deletes the copy too.
-        assert!(delete_model_files(&models, &r.model_id).unwrap());
+        assert!(delete_model_files(&models, &r.model_id, "user").unwrap());
         assert!(!copy.exists());
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
     #[test]
@@ -2122,7 +2546,7 @@ mod tests {
         let err = block_on(train_core(&request, &models, &paths, "user")).unwrap_err();
         assert!(err.contains("fit()"), "{err}");
         assert!(fs::read_dir(&models).unwrap().next().is_none());
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
     // ── Algorithm recipes ────────────────────────────────────────────
@@ -2165,7 +2589,7 @@ mod tests {
         doc["recipe"] = json!({"name": "mine", "model": {"kind": "bagging"}});
         fs::write(dir.join(format!("{id}.json")), doc.to_string()).unwrap();
         assert!(build_detail(&dir, &id, vec![]).unwrap().recipe.is_none());
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -2227,7 +2651,7 @@ mod tests {
         req.recipe = Some("mine".into());
         let err = prepare_training(&req, &models, &paths, "user").unwrap_err();
         assert!(err.contains("model.members") && err.contains("model.members[0].algorithm"), "{err}");
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
     /// A work root whose apex-python holds only the given stub modules (and the real virtualenv),
@@ -2326,7 +2750,7 @@ print(json.dumps({"model_id": "m_stub", "algorithm": "recipe", "metrics": {"accu
         assert!(ml_recipes::delete_inner(&state, &root, "kept", "user").unwrap());
         assert!(!ml_recipes::delete_inner(&state, &root, "kept", "user").unwrap());
         // (The activity entries are only written when a Tauri app handle exists, so they are not asserted here.)
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
     #[test]
@@ -2367,6 +2791,309 @@ print(json.dumps({"model_id": "m_stub", "algorithm": "recipe", "metrics": {"accu
         assert!(ml_recipes::remove_recipe(&root, "ens").unwrap());
         let d = build_detail(&models, &r.model_id, vec![]).unwrap();
         assert_eq!(d.recipe.unwrap().label, "Forest and linear");
-        let _ = fs::remove_dir_all(&root);
+        cleanup(&root);
+    }
+
+    // ── Models in the audit ledger ───────────────────────────────────
+
+    fn model_ledger_of(models_dir: &Path) -> Ledger {
+        model_ledger(models_dir).unwrap()
+    }
+
+    fn actions(history: &[VersionRecord]) -> Vec<(u32, &str)> {
+        history.iter().map(|r| (r.version, r.action.as_str())).collect()
+    }
+
+    #[test]
+    fn an_old_model_is_registered_as_version_1_when_listed_and_not_again() {
+        let dir = temp("lazy-model");
+        let id = write_old_model(&dir);
+        let ledger = model_ledger_of(&dir);
+        assert!(ledger.history(Kind::Model, &id).is_empty());
+        assert_eq!(load_registered_models(&dir).unwrap().len(), 1);
+        let history = ledger.history(Kind::Model, &id);
+        assert_eq!(history.len(), 1);
+        assert_eq!((history[0].action.as_str(), history[0].actor.as_str()), ("create", "system"));
+        assert_eq!(ledger.content(Kind::Model, &id, 1).unwrap(), OLD_METADATA.as_bytes(), "the original file, byte for byte");
+        load_registered_models(&dir).unwrap();
+        assert_eq!(ledger.history(Kind::Model, &id).len(), 1);
+        assert_eq!(build_detail(&dir, &id, vec![]).unwrap().ledger_version, Some(1));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn each_edit_is_a_new_version_with_the_new_content_and_nothing_is_overwritten() {
+        let dir = temp("model-versions");
+        let id = write_old_model(&dir);
+        let rec = update_model_metadata(&dir, &id, Some("First name"), None, None, "user").unwrap();
+        assert_eq!((rec.version, rec.action.as_str(), rec.actor.as_str()), (2, "update", "user"));
+        update_model_metadata(&dir, &id, None, Some("some notes"), Some(&["a".to_string()]), "copilot").unwrap();
+        // The same edit again changes nothing and adds no version.
+        let noop = update_model_metadata(&dir, &id, None, Some("some notes"), None, "user").unwrap();
+        assert_eq!(noop.version, 3);
+
+        let ledger = model_ledger_of(&dir);
+        let history = ledger.history(Kind::Model, &id);
+        assert_eq!(actions(&history), vec![(1, "create"), (2, "update"), (3, "update")]);
+        assert_eq!(history[2].actor, "copilot");
+        // Version 1 is still the file as it was; 2 and 3 hold the metadata at their time.
+        assert_eq!(ledger.content(Kind::Model, &id, 1).unwrap(), OLD_METADATA.as_bytes());
+        let v2: Value = serde_json::from_slice(&ledger.content(Kind::Model, &id, 2).unwrap()).unwrap();
+        assert_eq!(v2["display_name"], "First name");
+        assert!(v2["notes"].is_null(), "the old file had no notes field");
+        let v3: Value = serde_json::from_slice(&ledger.content(Kind::Model, &id, 3).unwrap()).unwrap();
+        assert_eq!((v3["display_name"].as_str(), v3["notes"].as_str(), v3["tags"].clone()), (Some("First name"), Some("some notes"), json!(["a"])));
+        // The working file is the mirror of the head.
+        let on_disk = fs::read(dir.join(format!("{id}.json"))).unwrap();
+        assert_eq!(on_disk, ledger.content(Kind::Model, &id, 3).unwrap());
+        assert_eq!(build_detail(&dir, &id, vec![]).unwrap().ledger_version, Some(3));
+        assert!(ledger.verify().ok);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_hand_edit_of_the_metadata_file_becomes_its_own_version_before_the_next_edit() {
+        let dir = temp("model-external");
+        let id = write_old_model(&dir);
+        update_model_metadata(&dir, &id, Some("mine"), None, None, "user").unwrap();
+        let path = dir.join(format!("{id}.json"));
+        let mut doc: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        doc["notes"] = json!("edited in a text editor");
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        update_model_metadata(&dir, &id, None, None, Some(&["t".to_string()]), "user").unwrap();
+        let history = model_ledger_of(&dir).history(Kind::Model, &id);
+        assert_eq!(actions(&history), vec![(1, "create"), (2, "update"), (3, "external"), (4, "update")]);
+        assert_eq!(history[2].actor, "external");
+        let v3: Value = serde_json::from_slice(&model_ledger_of(&dir).content(Kind::Model, &id, 3).unwrap()).unwrap();
+        assert_eq!(v3["notes"], "edited in a text editor", "the hand edit is kept in the history");
+        let v4: Value = serde_json::from_slice(&model_ledger_of(&dir).content(Kind::Model, &id, 4).unwrap()).unwrap();
+        assert_eq!(v4["notes"], "edited in a text editor", "and carried into the next version");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn an_interrupted_save_is_finished_when_models_are_listed() {
+        let dir = temp("model-pending");
+        let id = write_old_model(&dir);
+        load_registered_models(&dir).unwrap();
+        // A crash after the ledger append and before the rename: the new content is in the ledger and
+        // in `<id>.json.apexnew`, the working file still has the old content.
+        let mut doc: Value = serde_json::from_str(OLD_METADATA).unwrap();
+        doc["display_name"] = json!("after the crash");
+        let bytes = serde_json::to_vec_pretty(&doc).unwrap();
+        let ledger = model_ledger_of(&dir);
+        ledger.put(Kind::Model, &id, &bytes, "user", "Edited display name").unwrap();
+        fs::write(dir.join(format!("{id}.json.apexnew")), &bytes).unwrap();
+        let listed = load_registered_models(&dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(fs::read(dir.join(format!("{id}.json"))).unwrap(), bytes);
+        assert!(!dir.join(format!("{id}.json.apexnew")).exists());
+        assert_eq!(ledger.history(Kind::Model, &id).len(), 2, "no extra version for finishing the rename");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn delete_is_a_tombstone_and_the_files_are_archived_not_removed() {
+        let dir = temp("model-delete");
+        let id = write_old_model(&dir);
+        fs::write(dir.join(format!("{id}.log")), "the log").unwrap();
+        fs::write(dir.join(format!("{id}_estimator.py")), "def make_estimator(p): pass\n").unwrap();
+        fs::write(dir.join("keep.txt"), "x").unwrap();
+        update_model_metadata(&dir, &id, Some("named"), None, None, "user").unwrap();
+
+        assert!(delete_model_files(&dir, &id, "user").unwrap());
+        assert!(!delete_model_files(&dir, &id, "user").unwrap(), "already deleted");
+        // Gone from the models directory and from every reader...
+        for name in [format!("{id}.json"), format!("{id}.joblib"), format!("{id}.log"), format!("{id}_estimator.py")] {
+            assert!(!dir.join(&name).exists(), "{name}");
+        }
+        assert!(dir.join("keep.txt").exists());
+        assert!(load_registered_models(&dir).unwrap().is_empty());
+        let err = build_detail(&dir, &id, vec![]).unwrap_err();
+        assert!(err.contains("deleted"), "{err}");
+        assert!(load_scoring_model(&dir, &id).err().unwrap().contains("deleted"));
+        assert!(model_timeframe(&dir, &id).is_err());
+        // ...but every file is in the archive, named after the delete's ledger version.
+        let archive = dir.join("archive").join(format!("{id}@v3"));
+        for name in [format!("{id}.json"), format!("{id}.joblib"), format!("{id}.log"), format!("{id}_estimator.py")] {
+            assert!(archive.join(&name).is_file(), "{name} is archived");
+        }
+        assert_eq!(fs::read(archive.join(format!("{id}.joblib"))).unwrap().len(), 321, "the artifact is untouched");
+        // The ledger has the whole story and lists the model only when deleted ones are asked for.
+        let ledger = model_ledger_of(&dir);
+        assert_eq!(actions(&ledger.history(Kind::Model, &id)), vec![(1, "create"), (2, "update"), (3, "delete")]);
+        assert!(ledger.objects(Kind::Model, false).is_empty());
+        let all = ledger.objects(Kind::Model, true);
+        assert_eq!((all.len(), all[0].deleted, all[0].head_version), (1, true, 3));
+        assert!(update_model_metadata(&dir, &id, Some("x"), None, None, "user").unwrap_err().contains("deleted"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn restore_brings_the_files_back_as_a_new_version() {
+        let dir = temp("model-restore");
+        let id = write_old_model(&dir);
+        fs::write(dir.join(format!("{id}.log")), "the log").unwrap();
+        update_model_metadata(&dir, &id, Some("before delete"), None, None, "user").unwrap();
+        delete_model_files(&dir, &id, "user").unwrap();
+
+        let rec = restore_model_files(&dir, &id, None, "user").unwrap();
+        assert_eq!((rec.version, rec.action.as_str(), rec.restored_from), (4, "restore", Some(2)));
+        for ext in ["json", "joblib", "log"] {
+            assert!(dir.join(format!("{id}.{ext}")).is_file(), "{ext}");
+        }
+        let detail = build_detail(&dir, &id, vec![]).unwrap();
+        assert_eq!((detail.display_name.as_str(), detail.ledger_version), ("before delete", Some(4)));
+        assert_eq!(load_registered_models(&dir).unwrap().len(), 1);
+        let ledger = model_ledger_of(&dir);
+        assert_eq!(actions(&ledger.history(Kind::Model, &id)), vec![(1, "create"), (2, "update"), (3, "delete"), (4, "restore")]);
+        assert_eq!(fs::read(dir.join(format!("{id}.json"))).unwrap(), ledger.content(Kind::Model, &id, 4).unwrap());
+        // Restoring a live model without a version is refused; a named older version is a rollback that
+        // appends yet another version.
+        assert!(restore_model_files(&dir, &id, None, "user").is_err());
+        let back = restore_model_files(&dir, &id, Some(1), "user").unwrap();
+        assert_eq!((back.version, back.restored_from), (5, Some(1)));
+        assert_eq!(build_detail(&dir, &id, vec![]).unwrap().display_name, "");
+        assert!(ledger.content(Kind::Model, &id, 2).is_ok(), "the edit that was rolled back is still in the history");
+        // A second delete after a restore archives under its own version number: nothing collides.
+        delete_model_files(&dir, &id, "user").unwrap();
+        assert!(dir.join("archive").join(format!("{id}@v3")).is_dir() && dir.join("archive").join(format!("{id}@v6")).is_dir());
+        assert!(ledger.verify().ok);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn restore_refuses_when_the_archive_is_missing_or_a_file_is_in_the_way() {
+        let dir = temp("model-restore-refuse");
+        let id = write_old_model(&dir);
+        delete_model_files(&dir, &id, "user").unwrap();
+        // A new file under the same name appeared: restore must not overwrite it.
+        fs::write(dir.join(format!("{id}.joblib")), "someone else's").unwrap();
+        assert!(restore_model_files(&dir, &id, None, "user").unwrap_err().contains("refusing to overwrite"));
+        assert_eq!(fs::read_to_string(dir.join(format!("{id}.joblib"))).unwrap(), "someone else's");
+        assert_eq!(model_ledger_of(&dir).history(Kind::Model, &id).len(), 2, "nothing was recorded");
+        assert!(restore_model_files(&dir, "no_such_model", None, "user").is_err());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_delete_interrupted_after_the_tombstone_is_finished_when_models_are_listed() {
+        let dir = temp("model-half-delete");
+        let id = write_old_model(&dir);
+        load_registered_models(&dir).unwrap();
+        model_ledger_of(&dir).tombstone(Kind::Model, &id, "user", "half done").unwrap();
+        assert!(dir.join(format!("{id}.json")).exists());
+        assert!(load_registered_models(&dir).unwrap().is_empty());
+        assert!(!dir.join(format!("{id}.json")).exists());
+        assert!(dir.join("archive").join(format!("{id}@v2")).join(format!("{id}.joblib")).is_file());
+        assert_eq!(model_ledger_of(&dir).history(Kind::Model, &id).len(), 2, "no spurious external version");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn model_provenance_and_ledger_version_reach_the_detail_and_old_files_get_none() {
+        let dir = temp("model-prov");
+        let id = write_old_model(&dir);
+        let old = build_detail(&dir, &id, vec![]).unwrap();
+        assert!(old.dataset_version.is_none() && old.dataset_csv_sha256.is_none() && old.estimator_version.is_none() && old.recipe_version.is_none());
+        let mut doc: Value = serde_json::from_str(OLD_METADATA).unwrap();
+        doc["dataset_version"] = json!(4);
+        doc["dataset_csv_sha256"] = json!("ab".repeat(32));
+        doc["estimator_file_version"] = json!(2);
+        doc["recipe_version"] = json!(7);
+        fs::write(dir.join(format!("{id}.json")), doc.to_string()).unwrap();
+        let d = build_detail(&dir, &id, vec![]).unwrap();
+        assert_eq!((d.dataset_version, d.estimator_version, d.recipe_version), (Some(4), Some(2), Some(7)));
+        assert_eq!(d.dataset_csv_sha256.as_deref(), Some("ab".repeat(32).as_str()));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn training_can_name_a_dataset_version_and_defaults_to_the_latest() {
+        let root = temp("prepare-version");
+        let paths = python_runtime::RuntimePaths::for_test(&root);
+        let models = root.join("models");
+        build_dataset_files(&paths, "dsv", &["AAPL"], 120);
+        build_dataset_files(&paths, "dsv", &["AAPL"], 150);
+        let dir = ml_datasets::datasets_dir(&paths);
+        let (v1, v2) = (ml_datasets::read_info_version(&dir, "dsv", Some(1)).unwrap(), ml_datasets::read_info_version(&dir, "dsv", Some(2)).unwrap());
+        assert_ne!(v1.csv_sha256, v2.csv_sha256);
+
+        let mut req: MLTrainingRequestDto = serde_json::from_str(r#"{"algorithm":"random_forest","dataset":"dsv"}"#).unwrap();
+        let latest = prepare_training(&req, &models, &paths, "user").unwrap();
+        assert_eq!(latest.payload["provenance"]["dataset_version"], 2);
+        assert_eq!(latest.payload["provenance"]["dataset_csv_sha256"], json!(v2.csv_sha256));
+        assert_eq!(latest.data_path, "data/datasets/dsv/v2.csv");
+        req.dataset_version = Some(1);
+        let first = prepare_training(&req, &models, &paths, "user").unwrap();
+        assert_eq!(first.payload["provenance"]["dataset_version"], 1);
+        assert_eq!(first.payload["provenance"]["dataset_csv_sha256"], json!(v1.csv_sha256));
+        assert_eq!(first.data_path, "data/datasets/dsv/v1.csv");
+        req.dataset_version = Some(9);
+        assert!(prepare_training(&req, &models, &paths, "user").unwrap_err().contains("version 9"));
+        req.dataset = None;
+        req.dataset_version = Some(1);
+        assert!(prepare_training(&req, &models, &paths, "user").unwrap_err().contains("needs a dataset"));
+        // A deleted dataset cannot be trained on, by name or by version.
+        req.dataset = Some("dsv".into());
+        ml_datasets::delete_in(&dir, "dsv").unwrap();
+        assert!(prepare_training(&req, &models, &paths, "user").unwrap_err().contains("unknown dataset"));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn a_model_records_the_dataset_version_it_saw_and_a_later_rebuild_does_not_change_it() {
+        let Some((root, paths, models)) = python_root("prov-e2e") else { return };
+        build_dataset_files(&paths, "pv", &["AAA", "BBB"], 300);
+        build_dataset_files(&paths, "pv", &["AAA", "BBB"], 360);
+        let dir = ml_datasets::datasets_dir(&paths);
+        let v2 = ml_datasets::read_info(&dir, "pv").unwrap();
+        assert_eq!(v2.version, 2);
+        let request = |extra: Value| -> MLTrainingRequestDto {
+            let mut req = json!({"algorithm": "random_forest", "dataset": "pv", "n_splits": 3, "hyperparams": {"n_estimators": 8, "max_depth": 3}});
+            req.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(req).unwrap()
+        };
+        let latest = block_on(train_core(&request(json!({})), &models, &paths, "user")).unwrap();
+        let detail = build_detail(&models, &latest.model_id, vec![]).unwrap();
+        assert_eq!((detail.dataset_version, detail.dataset_csv_sha256.as_deref()), (Some(2), Some(v2.csv_sha256.as_str())));
+        assert!(detail.log_tail.contains("Dataset pv version 2") && detail.log_tail.contains(&v2.csv_sha256), "{}", detail.log_tail);
+        // Version 1 of the model object exists, created by the user, with the provenance inside.
+        let ledger = model_ledger_of(&models);
+        let h = ledger.history(Kind::Model, &latest.model_id);
+        assert_eq!((h.len(), h[0].action.as_str(), h[0].actor.as_str()), (1, "create", "user"));
+        let stored: Value = serde_json::from_slice(&ledger.content(Kind::Model, &latest.model_id, 1).unwrap()).unwrap();
+        assert_eq!(stored["dataset_version"], 2);
+        assert!(stored["artifact_sha256"].as_str().unwrap().len() == 64);
+
+        // Rebuild the dataset (version 3): the old model still names version 2 and its hash.
+        build_dataset_files(&paths, "pv", &["AAA", "BBB"], 330);
+        assert_eq!(ml_datasets::read_info(&dir, "pv").unwrap().version, 3);
+        let again = build_detail(&models, &latest.model_id, vec![]).unwrap();
+        assert_eq!((again.dataset_version, again.dataset_csv_sha256.as_deref()), (Some(2), Some(v2.csv_sha256.as_str())));
+        assert_eq!(ml_datasets::hash_file(&dir.join("pv").join("v2.csv")).unwrap().0, v2.csv_sha256);
+
+        // A model trained on an explicit older version says so.
+        let first = block_on(train_core(&request(json!({"dataset_version": 1})), &models, &paths, "user")).unwrap();
+        assert_eq!(build_detail(&models, &first.model_id, vec![]).unwrap().dataset_version, Some(1));
+
+        // The trainer refuses a file that no longer matches the recorded hash.
+        let v1_path = dir.join("pv").join("v1.csv");
+        let mut perms = fs::metadata(&v1_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&v1_path, perms).unwrap();
+        let mut tampered = fs::read_to_string(&v1_path).unwrap();
+        tampered.push_str("2030-01-01T00:00:00Z,AAA,0.1,50,0.1,0.0,0\n");
+        fs::write(&v1_path, tampered).unwrap();
+        let err = block_on(train_core(&request(json!({"dataset_version": 1})), &models, &paths, "user")).unwrap_err();
+        assert!(err.contains("does not match the audit ledger"), "{err}");
+
+        // Deleting the model archives it and it can no longer be scored.
+        assert!(delete_model_files(&models, &latest.model_id, "user").unwrap());
+        assert!(load_scoring_model(&models, &latest.model_id).err().unwrap().contains("deleted"));
+        restore_model_files(&models, &latest.model_id, None, "user").unwrap();
+        assert!(load_scoring_model(&models, &latest.model_id).is_ok());
+        cleanup(&root);
     }
 }

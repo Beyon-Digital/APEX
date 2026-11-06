@@ -4,16 +4,26 @@
 //! Safety: rules may only target live brokers when `[automations]
 //! allow_live_trading = true`; otherwise everything routes to `paper`. Shorting is opt-in per
 //! rule (`allow_short`) and, on a live broker, also needs `[automations] allow_live_shorting`.
+//!
+//! Audit: `automations.json` is the working copy. Every change to a rule's definition (create,
+//! enable/disable, allow_short, delete, restore) appends a version of that rule to the audit ledger
+//! (kind `automation`, object id = rule id). A delete is a tombstone, never an erase. The versioned
+//! content leaves out the run counters (`orders_today`, `last_run_at`, `last_result`), which change on
+//! every run and are recorded by the order event stream instead. Every order a rule places names the
+//! rule's version and content hash, and its model, as its source.
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 
-use apex_core::application::automation::{AutomationEngine, AutomationRule};
+use apex_core::application::automation::{
+    with_actor, AutomationEngine, AutomationRule, RuleChange, RuleVersionHook,
+};
 use apex_core::domain::models::{NewOrderRequest, OrderSide, OrderType, Position, Symbol};
 
 use crate::commands::signal_policy::{self, Plan};
 use crate::commands::{ml::ModelRegistry, python_runtime::RuntimePaths};
+use crate::ledger::{Kind, Ledger};
 use crate::state::AppState;
 use crate::validation;
 
@@ -125,9 +135,21 @@ pub(crate) fn check_broker_can_short(state: &AppState, broker_id: &str) -> Resul
 }
 
 /// Validate + register a rule. Shared by the IPC command and copilot tools.
+///
+/// The audit trail names the Copilot as the author (its tool is the only other caller); the IPC
+/// command uses [`create_automation_as`] with the user.
 pub(crate) fn create_automation_inner(
     dto: CreateAutomationDto,
     state: &AppState,
+) -> Result<AutomationDto, String> {
+    create_automation_as(dto, state, "copilot")
+}
+
+/// [`create_automation_inner`] naming who created the rule in the audit trail.
+pub(crate) fn create_automation_as(
+    dto: CreateAutomationDto,
+    state: &AppState,
+    actor: &str,
 ) -> Result<AutomationDto, String> {
     if dto.kind != "model_signal" {
         return Err(format!(
@@ -147,17 +169,19 @@ pub(crate) fn create_automation_inner(
         check_broker_can_short(state, &dto.broker_id)?;
     }
 
-    let rule = state.automations.add_rule(
-        dto.name,
-        apex_core::application::automation::AutomationKind::ModelSignal,
-        dto.symbol.to_uppercase(),
-        dto.model_id,
-        dto.interval_secs,
-        dto.quantity,
-        dto.threshold,
-        dto.broker_id,
-        dto.allow_short,
-    );
+    let rule = with_actor(actor, || {
+        state.automations.add_rule(
+            dto.name,
+            apex_core::application::automation::AutomationKind::ModelSignal,
+            dto.symbol.to_uppercase(),
+            dto.model_id,
+            dto.interval_secs,
+            dto.quantity,
+            dto.threshold,
+            dto.broker_id,
+            dto.allow_short,
+        )
+    });
     Ok(AutomationDto::from(&rule))
 }
 
@@ -167,7 +191,7 @@ pub async fn create_automation(
     state: State<'_, AppState>,
 ) -> Result<AutomationDto, String> {
     let name = request.name.clone();
-    let result = create_automation_inner(request, &state);
+    let result = create_automation_as(request, &state, "user");
     match &result {
         Ok(created) => crate::activity::record(
             &state,
@@ -221,7 +245,7 @@ pub async fn list_automations(state: State<'_, AppState>) -> Result<Vec<Automati
 pub async fn delete_automation(id: String, state: State<'_, AppState>) -> Result<bool, String> {
     validation::validate_string_length(&id, "automation id")?;
     let label = automation_label(&state, &id);
-    let removed = state.automations.remove_rule(&id);
+    let removed = with_actor("user", || state.automations.remove_rule(&id));
     // Deleting a rule that was already gone changed nothing, so it is not logged.
     if removed {
         crate::activity::record(&state, "user", "automation.delete", "automation", &id, &format!("Deleted automation {label}"), true, None);
@@ -237,7 +261,7 @@ pub async fn set_automation_enabled(
 ) -> Result<bool, String> {
     validation::validate_string_length(&id, "automation id")?;
     let label = automation_label(&state, &id);
-    let changed = state.automations.set_enabled(&id, enabled);
+    let changed = with_actor("user", || state.automations.set_enabled(&id, enabled));
     if changed {
         let verb = if enabled { "Enabled" } else { "Disabled" };
         crate::activity::record(&state, "user", "automation.toggle", "automation", &id, &format!("{verb} automation {label}"), true, None);
@@ -275,7 +299,7 @@ pub async fn set_automation_short(
             return Err(error);
         }
     }
-    if !state.automations.set_allow_short(&id, allow) {
+    if !with_actor("user", || state.automations.set_allow_short(&id, allow)) {
         return Err(format!("Unknown automation {id}"));
     }
     let verb = if allow { "Allowed" } else { "Disallowed" };
@@ -540,8 +564,10 @@ async fn run_rule_inner(
 
     let order = rule_order_request(rule, intent, quantity);
 
+    // The rule's current ledger version and hash, and its model, travel with the order.
+    let source = crate::order_audit::automation_source(None, &rule.id, &rule.model_id);
     match state
-        .guarded_submit(order, &rule.broker_id, crate::state::LiveAuth::Unattended)
+        .guarded_submit_with(order, &rule.broker_id, crate::state::LiveAuth::Unattended, Some(source))
         .await
     {
         Ok(id) => {
@@ -631,9 +657,158 @@ pub fn spawn_automation_loop(app: &AppHandle) {
     });
 }
 
-/// Eagerly construct the engine so rules load at startup.
+/// Eagerly construct the engine so rules load at startup. When the audit ledger is open, rules that
+/// have no history yet are registered as version 1 and every later change is versioned.
 pub fn new_engine(data_dir: &std::path::Path) -> Arc<AutomationEngine> {
-    Arc::new(AutomationEngine::new(data_dir.join("automations.json")))
+    new_engine_with(data_dir, crate::ledger::global().cloned())
+}
+
+pub(crate) fn new_engine_with(data_dir: &std::path::Path, ledger: Option<Ledger>) -> Arc<AutomationEngine> {
+    let engine = Arc::new(AutomationEngine::new(data_dir.join("automations.json")));
+    match ledger {
+        Some(ledger) => {
+            let recorded = register_existing_rules(&engine, &ledger);
+            if recorded > 0 {
+                tracing::info!(recorded, "automation rules recorded in the audit ledger");
+            }
+            engine.set_version_hook(Arc::new(LedgerRuleHook { ledger }));
+        }
+        None => tracing::error!("the audit ledger is not open; automation changes will not be versioned"),
+    }
+    engine
+}
+
+/// Appends a version of the rule to the audit ledger for every change to its definition.
+pub struct LedgerRuleHook {
+    ledger: Ledger,
+}
+
+impl LedgerRuleHook {
+    #[allow(dead_code)] // used by tests; the app builds the hook in `new_engine_with`
+    pub fn new(ledger: Ledger) -> Self {
+        Self { ledger }
+    }
+}
+
+fn change_summary(change: &RuleChange<'_>) -> String {
+    let rule = change.rule;
+    match change.action {
+        "create" => format!("Created automation {}: model {} on {} ({})", rule.name, rule.model_id, rule.symbol, rule.broker_id),
+        "enable" => format!("Enabled automation {}", rule.name),
+        "disable" => format!("Disabled automation {}", rule.name),
+        "allow_short" => format!("Set shorting {} for automation {}", if rule.allow_short { "on" } else { "off" }, rule.name),
+        "delete" => format!("Deleted automation {}", rule.name),
+        "restore" => format!("Restored automation {}", rule.name),
+        other => format!("Changed automation {} ({other})", rule.name),
+    }
+}
+
+impl RuleVersionHook for LedgerRuleHook {
+    fn on_change(&self, change: &RuleChange<'_>) -> Result<(), String> {
+        let id = change.rule.id.as_str();
+        let content = change.rule.audit_content();
+        let summary = change_summary(change);
+        if change.deleted {
+            // A rule that never reached the ledger still gets its history before the delete marker.
+            if self.ledger.head(Kind::Automation, id).is_none() {
+                self.ledger.put(Kind::Automation, id, content.as_bytes(), "system", "Recorded before deletion")?;
+            }
+            return self.ledger.tombstone(Kind::Automation, id, &change.actor, &summary).map(|_| ());
+        }
+        self.ledger.put(Kind::Automation, id, content.as_bytes(), &change.actor, &summary).map(|_| ())
+    }
+}
+
+/// Bring the ledger in step with `automations.json` at startup. A rule with no history becomes
+/// version 1 (actor "system"). A rule whose definition differs from its ledger head, or that exists
+/// again after a delete marker, was changed outside APEX: that is recorded as a new version with
+/// actor "external" and action "external" (never lost, never silently overwritten). A rule that is
+/// in the ledger but missing from the file is not touched: an unreadable file must not be able to
+/// mark every rule deleted. Returns how many versions were appended.
+pub fn register_existing_rules(engine: &AutomationEngine, ledger: &Ledger) -> usize {
+    let mut appended = 0;
+    for rule in engine.list() {
+        let content = rule.audit_content();
+        let hash = Ledger::sha256_hex(content.as_bytes());
+        let result = match ledger.head(Kind::Automation, &rule.id) {
+            None => ledger
+                .put(Kind::Automation, &rule.id, content.as_bytes(), "system", "Registered an existing automation")
+                .map(|_| true),
+            Some(head) if !head.is_tombstone() && head.content_hash.as_deref() == Some(hash.as_str()) => Ok(false),
+            Some(_) => ledger
+                .put_as(
+                    Kind::Automation,
+                    &rule.id,
+                    content.as_bytes(),
+                    "external",
+                    "external",
+                    "Rule file differs from the last recorded version",
+                )
+                .map(|_| true),
+        };
+        match result {
+            Ok(true) => appended += 1,
+            Ok(false) => {}
+            Err(error) => tracing::error!(rule = %rule.id, %error, "could not record an automation in the audit ledger"),
+        }
+    }
+    appended
+}
+
+/// Put a rule back to an older version. The ledger gets a new version (action "restore") whose
+/// content equals the old one, and the rule is rewritten from it. The rule keeps its current run
+/// counters; a deleted rule comes back with fresh ones. For the history panel's restore button.
+#[allow(dead_code)] // called by the history panel's restore command
+pub fn restore_automation_with(
+    engine: &AutomationEngine,
+    ledger: &Ledger,
+    id: &str,
+    version: u32,
+    actor: &str,
+) -> Result<AutomationRule, String> {
+    let (_, bytes) = ledger.restore(Kind::Automation, id, version, actor)?;
+    let restored: AutomationRule = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("version {version} of automation {id} could not be read: {e}"))?;
+    if restored.id != id {
+        return Err(format!("version {version} of automation {id} belongs to a different rule"));
+    }
+    Ok(with_actor(actor, || engine.apply_restored(restored)))
+}
+
+/// [`restore_automation_with`] on the running app's engine and ledger, logged in the activity log.
+#[allow(dead_code)] // called by the history panel's restore command
+pub fn restore_automation(state: &AppState, id: &str, version: u32, actor: &str) -> Result<AutomationDto, String> {
+    validation::validate_string_length(id, "automation id")?;
+    let ledger = crate::ledger::global().ok_or_else(|| "The audit ledger is not open.".to_string())?;
+    let label = automation_label(state, id);
+    match restore_automation_with(&state.automations, ledger, id, version, actor) {
+        Ok(rule) => {
+            crate::activity::record(
+                state,
+                actor,
+                "automation.restore",
+                "automation",
+                id,
+                &format!("Restored automation {label} to version {version}"),
+                true,
+                None,
+            );
+            Ok(AutomationDto::from(&rule))
+        }
+        Err(error) => {
+            crate::activity::record(
+                state,
+                actor,
+                "automation.restore",
+                "automation",
+                id,
+                &format!("Could not restore automation {label} to version {version}"),
+                false,
+                Some(error.clone()),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -948,5 +1123,201 @@ mod tests {
         assert!(rule_order_request(&r, Intent::Buy, 1.0).broker_params.is_none());
         assert!(rule_order_request(&r, Intent::Sell, 1.0).broker_params.is_none());
         assert!(rule_order_request(&rule("paper", true), Intent::Short, 1.0).broker_params.is_none());
+    }
+
+    // ── audit versions of the rules ──
+
+    fn audited_engine() -> (Arc<AutomationEngine>, Ledger, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("apex-auto-ledger-{}", uuid::Uuid::new_v4()));
+        let ledger = Ledger::open(&dir.join("ledger")).unwrap();
+        let engine = new_engine_with(&dir, Some(ledger.clone()));
+        (engine, ledger, dir)
+    }
+
+    fn add(engine: &AutomationEngine, actor: &str) -> AutomationRule {
+        with_actor(actor, || {
+            engine.add_rule(
+                "r".into(),
+                apex_core::application::automation::AutomationKind::ModelSignal,
+                "AAPL".into(),
+                "m".into(),
+                60,
+                1.0,
+                0.5,
+                "paper".into(),
+                false,
+            )
+        })
+    }
+
+    fn versions(ledger: &Ledger, id: &str) -> Vec<(u32, String, String)> {
+        ledger
+            .history(Kind::Automation, id)
+            .into_iter()
+            .map(|v| (v.version, v.action, v.actor))
+            .collect()
+    }
+
+    #[test]
+    fn every_change_to_a_rule_is_a_new_version_of_the_same_object() {
+        let (engine, ledger, dir) = audited_engine();
+        let rule = add(&engine, "user");
+        with_actor("user", || engine.set_enabled(&rule.id, false));
+        with_actor("user", || engine.set_enabled(&rule.id, false)); // already off: nothing changed
+        with_actor("copilot", || engine.set_allow_short(&rule.id, true));
+        with_actor("user", || engine.set_enabled(&rule.id, true));
+        with_actor("user", || engine.remove_rule(&rule.id));
+
+        assert_eq!(
+            versions(&ledger, &rule.id),
+            [
+                (1, "create".to_string(), "user".to_string()),
+                (2, "update".to_string(), "user".to_string()),
+                (3, "update".to_string(), "copilot".to_string()),
+                (4, "update".to_string(), "user".to_string()),
+                (5, "delete".to_string(), "user".to_string()),
+            ]
+        );
+        // The delete is a marker: every earlier version is still readable.
+        let first: serde_json::Value = serde_json::from_slice(&ledger.content(Kind::Automation, &rule.id, 1).unwrap()).unwrap();
+        assert_eq!(first["enabled"], true);
+        let second: serde_json::Value = serde_json::from_slice(&ledger.content(Kind::Automation, &rule.id, 2).unwrap()).unwrap();
+        assert_eq!(second["enabled"], false);
+        assert!(ledger.head(Kind::Automation, &rule.id).unwrap().is_tombstone());
+        assert!(ledger.verify().ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_counters_never_create_a_version() {
+        let (engine, ledger, dir) = audited_engine();
+        let rule = add(&engine, "user");
+        let before = ledger.head(Kind::Automation, &rule.id).unwrap();
+        engine.record_order(&rule.id);
+        engine.record_order(&rule.id);
+        engine.record_run(&rule.id, "placed BUY".into());
+        engine.record_run(&rule.id, "no-op".into());
+        let after = ledger.head(Kind::Automation, &rule.id).unwrap();
+        assert_eq!(before.version, after.version);
+        assert_eq!(ledger.history(Kind::Automation, &rule.id).len(), 1);
+        // The stored content has none of the volatile fields.
+        let stored: serde_json::Value = serde_json::from_slice(&ledger.content(Kind::Automation, &rule.id, 1).unwrap()).unwrap();
+        for volatile in ["orders_today", "orders_day", "last_run_at", "last_result"] {
+            assert!(stored.get(volatile).is_none(), "{volatile} must not be versioned");
+        }
+        assert_eq!(stored["model_id"], "m");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_change_without_a_named_actor_is_visibly_unattributed() {
+        let (engine, ledger, dir) = audited_engine();
+        let rule = engine.add_rule(
+            "r".into(),
+            apex_core::application::automation::AutomationKind::ModelSignal,
+            "AAPL".into(),
+            "m".into(),
+            60,
+            1.0,
+            0.5,
+            "paper".into(),
+            false,
+        );
+        assert_eq!(versions(&ledger, &rule.id)[0].2, "unattributed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restoring_appends_a_new_version_keeps_the_counters_and_brings_back_a_deleted_rule() {
+        let (engine, ledger, dir) = audited_engine();
+        let rule = add(&engine, "user");
+        engine.record_order(&rule.id);
+        with_actor("user", || engine.set_enabled(&rule.id, false));
+
+        // Back to version 1 (enabled): counters are the current ones.
+        let restored = restore_automation_with(&engine, &ledger, &rule.id, 1, "user").unwrap();
+        assert!(restored.enabled);
+        assert_eq!(restored.orders_today, 1);
+        assert!(engine.get(&rule.id).unwrap().enabled);
+        let history = versions(&ledger, &rule.id);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2], (3, "restore".to_string(), "user".to_string()));
+        assert_eq!(ledger.history(Kind::Automation, &rule.id)[2].restored_from, Some(1));
+
+        // A deleted rule comes back, with fresh counters, as the next version of the same object.
+        with_actor("user", || engine.remove_rule(&rule.id));
+        assert!(engine.get(&rule.id).is_none());
+        let back = restore_automation_with(&engine, &ledger, &rule.id, 2, "user").unwrap();
+        assert!(!back.enabled);
+        assert_eq!(back.orders_today, 0);
+        assert!(engine.get(&rule.id).is_some());
+        let history = ledger.history(Kind::Automation, &rule.id);
+        assert_eq!(history.len(), 5);
+        assert_eq!(history[4].action, "restore");
+        assert_eq!(history[3].action, "delete");
+        // Nothing was overwritten: version 1 still has its original content.
+        let first: serde_json::Value = serde_json::from_slice(&ledger.content(Kind::Automation, &rule.id, 1).unwrap()).unwrap();
+        assert_eq!(first["enabled"], true);
+
+        assert!(restore_automation_with(&engine, &ledger, &rule.id, 99, "user").is_err());
+        assert!(ledger.verify().ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_rules_are_registered_as_version_one_and_outside_edits_are_recorded_as_external() {
+        let dir = std::env::temp_dir().join(format!("apex-auto-register-{}", uuid::Uuid::new_v4()));
+        // A rule persisted before the ledger existed.
+        let before = new_engine_with(&dir, None);
+        let rule = add(&before, "user");
+        drop(before);
+
+        let ledger = Ledger::open(&dir.join("ledger")).unwrap();
+        let engine = new_engine_with(&dir, Some(ledger.clone()));
+        assert_eq!(versions(&ledger, &rule.id), [(1, "create".to_string(), "system".to_string())]);
+
+        // A second start with nothing changed adds nothing.
+        drop(engine);
+        let _ = new_engine_with(&dir, Some(ledger.clone()));
+        assert_eq!(ledger.history(Kind::Automation, &rule.id).len(), 1);
+
+        // Someone edits automations.json by hand.
+        let path = dir.join("automations.json");
+        let text = std::fs::read_to_string(&path).unwrap().replace("\"quantity\": 1.0", "\"quantity\": 500.0");
+        assert!(text.contains("500.0"));
+        std::fs::write(&path, text).unwrap();
+        let _ = new_engine_with(&dir, Some(ledger.clone()));
+        let history = versions(&ledger, &rule.id);
+        assert_eq!(history[1], (2, "external".to_string(), "external".to_string()));
+        let old: serde_json::Value = serde_json::from_slice(&ledger.content(Kind::Automation, &rule.id, 1).unwrap()).unwrap();
+        assert_eq!(old["quantity"], 1.0, "the earlier version keeps its content");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleting_a_rule_that_never_reached_the_ledger_still_leaves_its_history() {
+        let (engine, ledger, dir) = audited_engine();
+        // Simulate a rule created while the ledger could not record it.
+        let rule = {
+            let bare = AutomationEngine::new(dir.join("other.json"));
+            bare.add_rule(
+                "x".into(),
+                apex_core::application::automation::AutomationKind::ModelSignal,
+                "AAPL".into(),
+                "m".into(),
+                60,
+                1.0,
+                0.5,
+                "paper".into(),
+                false,
+            )
+        };
+        let hook = LedgerRuleHook::new(ledger.clone());
+        hook.on_change(&RuleChange { action: "delete", rule: &rule, deleted: true, actor: "user".into() }).unwrap();
+        let history = versions(&ledger, &rule.id);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].1, "delete");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

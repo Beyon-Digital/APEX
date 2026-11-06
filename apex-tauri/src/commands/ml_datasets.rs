@@ -1,8 +1,18 @@
 //! Dataset builder: turns stored bars into a labelled CSV the trainer can read.
 //!
-//! Layout under `<data_dir>/datasets/`:
-//! * `<name>.csv`: columns `time,symbol,<catalog features...>,<custom features...>,fwd_ret,target`
-//! * `<name>.dataset.json`: the [`DatasetInfoDto`] describing it
+//! A dataset name is a versioned object in the audit ledger (kind `dataset`, object id = name).
+//! Every build is a NEW VERSION under the same name and never overwrites an earlier one; that would
+//! be an audit violation. Layout under `<data_dir>/datasets/`:
+//! * `<name>/v<n>.csv`: columns `time,symbol,<catalog features...>,<custom features...>,fwd_ret,target`
+//! * `<name>/v<n>.dataset.json`: the [`DatasetInfoDto`] describing it (also the ledger content)
+//!
+//! Both files are created once (`create_new`) and made read-only; `n` is the ledger version the build
+//! gets. The ledger record holds the sidecar JSON, which carries `csv_sha256`, so one version covers
+//! both files while the (large) CSV itself stays a write-once file. Deleting a dataset appends a
+//! tombstone version: the files stay on disk, the name disappears from the list.
+//!
+//! Datasets built before versioning live at `<name>.csv` + `<name>.dataset.json`. They are registered
+//! lazily as version 1 the first time they are listed, read or deleted. Their files stay where they are.
 //!
 //! Features come from [`super::ml_features`], the same code inference uses. Rows whose features
 //! are still warming up, and the last `horizon_bars` rows of each symbol (whose forward return is
@@ -16,11 +26,14 @@ use crate::dto::{
     BuildDatasetRequestDto, DatasetInfoDto, DatasetPreviewDto, ExpressionCheckDto, ExpressionSampleDto, LabelSpecDto,
     SymbolDataDto,
 };
+use crate::ledger::{Kind, Ledger};
 use crate::state::AppState;
 use apex_core::domain::models::OHLCV;
 use chrono::{DateTime, NaiveDate, Utc};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use tauri::State;
 
@@ -46,7 +59,8 @@ pub fn datasets_dir(paths: &RuntimePaths) -> PathBuf {
     paths.data_dir().join("datasets")
 }
 
-/// Path of the CSV relative to the work root, the form the trainer resolves.
+/// Where a dataset built before versioning keeps its CSV, relative to the work root. New builds
+/// go to `<name>/v<n>.csv` (see [`write_dataset`], which rewrites `DatasetInfoDto::path`).
 pub fn relative_csv_path(paths: &RuntimePaths, name: &str) -> String {
     let file = datasets_dir(paths).join(format!("{name}.csv"));
     file.strip_prefix(paths.work_root())
@@ -54,17 +68,95 @@ pub fn relative_csv_path(paths: &RuntimePaths, name: &str) -> String {
         .unwrap_or_else(|_| format!("data/datasets/{name}.csv"))
 }
 
-fn csv_path(dir: &Path, name: &str) -> PathBuf {
+/// Old layout.
+fn legacy_csv_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.csv"))
 }
 
-fn sidecar_path(dir: &Path, name: &str) -> PathBuf {
+/// Old layout.
+fn legacy_sidecar_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.dataset.json"))
+}
+
+fn versioned_csv_path(dir: &Path, name: &str, version: u32) -> PathBuf {
+    dir.join(name).join(format!("v{version}.csv"))
+}
+
+fn versioned_sidecar_path(dir: &Path, name: &str, version: u32) -> PathBuf {
+    dir.join(name).join(format!("v{version}.dataset.json"))
+}
+
+/// The CSV of one dataset version, for either layout.
+pub(crate) fn csv_of(dir: &Path, info: &DatasetInfoDto) -> PathBuf {
+    let versioned = versioned_csv_path(dir, &info.name, info.version);
+    if info.version > 0 && versioned.exists() {
+        versioned
+    } else {
+        legacy_csv_path(dir, &info.name)
+    }
+}
+
+/// Relative path (to the work root) of a new version's CSV, built from the path the caller gave for
+/// the old layout (`<prefix><name>.csv`).
+fn versioned_rel_path(given: &str, name: &str, version: u32) -> String {
+    let prefix = given
+        .strip_suffix(&format!("{name}.csv"))
+        .filter(|p| p.is_empty() || p.ends_with('/'))
+        .unwrap_or("data/datasets/");
+    format!("{prefix}{name}/v{version}.csv")
+}
+
+/// SHA-256 and size of a file, streamed (datasets can be tens of MB).
+pub(crate) fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((hasher.finalize().iter().map(|b| format!("{b:02x}")).collect(), total))
+}
+
+/// The ledger of the data directory a datasets directory (`<data_dir>/datasets`) belongs to.
+fn ledger_for_dir(dir: &Path) -> Result<Ledger, String> {
+    let data_dir = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| "the datasets directory has no parent data directory".to_string())?;
+    crate::activity::ledger_for(data_dir)
+}
+
+/// Serializes version numbering + file creation + the ledger append, so two builds under one name
+/// cannot pick the same number.
+static DATASET_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn lock_writes() -> std::sync::MutexGuard<'static, ()> {
+    DATASET_WRITES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Create a file that must not exist yet, flush it, and make it read-only.
+fn write_once(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("could not create {}: {e}", path.display()))?;
+    file.write_all(bytes).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    file.sync_all().map_err(|e| format!("could not flush {}: {e}", path.display()))?;
+    drop(file);
+    let mut perms = fs::metadata(path).map_err(|e| e.to_string())?.permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(path, perms).map_err(|e| format!("could not make {} read-only: {e}", path.display()))
 }
 
 pub const MAX_FEE_PCT: f64 = 10.0;
 
-/// Parse a `YYYY-MM-DD` date (empty or missing = None).
 fn parse_date(label: &str, v: &Option<String>) -> Result<Option<NaiveDate>, String> {
     match v.as_deref().map(str::trim) {
         None | Some("") => Ok(None),
@@ -426,52 +518,167 @@ pub fn assemble_with(
         custom_features: req.custom_features.clone(),
         context_symbols: req.context_symbols.clone(),
         fee_pct: req.fee_pct,
+        // Set by `write_dataset`, which knows the version and hashes the file it writes.
+        version: 0,
+        csv_sha256: String::new(),
+        csv_bytes: 0,
     };
     Ok((csv, info))
 }
 
-/// Write the CSV and sidecar (temp file then rename, so a reader never sees half a file).
-pub fn write_dataset(dir: &Path, csv: &str, info: &DatasetInfoDto) -> Result<(), String> {
+/// Write a dataset as the NEXT VERSION of `info.name`: `<name>/v<n>.csv` and `<name>/v<n>.dataset.json`
+/// (both created once and made read-only), then one ledger record carrying the sidecar. Nothing that
+/// exists is ever overwritten. Returns the info as stored (version, csv hash and size, path filled in).
+///
+/// `info.path` should be the old-layout path (`.../<name>.csv`); it is rewritten to the versioned file.
+/// Files left behind by an interrupted earlier build of the same number (no ledger record) are renamed
+/// aside, never deleted.
+pub fn write_dataset(dir: &Path, csv: &str, info: &DatasetInfoDto) -> Result<DatasetInfoDto, String> {
     validate_dataset_name(&info.name)?;
+    let name = info.name.as_str();
+    let ledger = ledger_for_dir(dir)?;
+    let _guard = lock_writes();
     fs::create_dir_all(dir).map_err(|e| format!("could not create datasets directory: {e}"))?;
-    let csv_final = csv_path(dir, &info.name);
-    let side_final = sidecar_path(dir, &info.name);
-    let csv_tmp = dir.join(format!("{}.csv.tmp", info.name));
-    let side_tmp = dir.join(format!("{}.dataset.json.tmp", info.name));
-    fs::write(&csv_tmp, csv).map_err(|e| format!("could not write dataset: {e}"))?;
-    let json = serde_json::to_string_pretty(info).map_err(|e| format!("could not encode dataset info: {e}"))?;
-    fs::write(&side_tmp, json).map_err(|e| format!("could not write dataset info: {e}"))?;
-    fs::rename(&csv_tmp, &csv_final).map_err(|e| format!("could not finalise dataset: {e}"))?;
-    fs::rename(&side_tmp, &side_final).map_err(|e| format!("could not finalise dataset info: {e}"))?;
-    Ok(())
-}
+    // A dataset from before versioning becomes version 1 first, so this build is version 2.
+    migrate_legacy(&ledger, dir, name)?;
+    let head = ledger.head(Kind::Dataset, name);
+    let version = head.as_ref().map(|h| h.version + 1).unwrap_or(1);
 
-pub fn read_info(dir: &Path, name: &str) -> Result<DatasetInfoDto, String> {
-    validate_dataset_name(name)?;
-    let raw = fs::read_to_string(sidecar_path(dir, name)).map_err(|_| format!("unknown dataset `{name}`"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("dataset `{name}` has unreadable info: {e}"))
-}
-
-pub fn list_datasets_in(dir: &Path) -> Vec<DatasetInfoDto> {
-    let mut out: Vec<DatasetInfoDto> = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let file = entry.file_name().to_string_lossy().to_string();
-        let Some(name) = file.strip_suffix(".dataset.json") else {
-            continue;
-        };
-        if validate_dataset_name(name).is_err() {
-            continue;
+    fs::create_dir_all(dir.join(name)).map_err(|e| format!("could not create the dataset directory: {e}"))?;
+    let csv_final = versioned_csv_path(dir, name, version);
+    let side_final = versioned_sidecar_path(dir, name, version);
+    for leftover in [&csv_final, &side_final] {
+        if leftover.exists() {
+            let aside = leftover.with_file_name(format!(
+                "{}.orphan-{}",
+                leftover.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+                Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ));
+            fs::rename(leftover, &aside).map_err(|e| format!("could not set aside a leftover {}: {e}", leftover.display()))?;
         }
-        match read_info(dir, name) {
+    }
+
+    let mut stored = info.clone();
+    stored.version = version;
+    stored.csv_sha256 = Ledger::sha256_hex(csv.as_bytes());
+    stored.csv_bytes = csv.len() as u64;
+    stored.path = versioned_rel_path(&info.path, name, version);
+    let json = serde_json::to_string_pretty(&stored).map_err(|e| format!("could not encode dataset info: {e}"))?;
+
+    write_once(&csv_final, csv.as_bytes())?;
+    write_once(&side_final, json.as_bytes())?;
+    let actor = if info.source.is_empty() { "user" } else { info.source.as_str() };
+    let summary = format!(
+        "Built version {version}: {} rows, {} on {}, csv sha256 {}",
+        stored.rows,
+        stored.symbols.join(", "),
+        stored.timeframe,
+        &stored.csv_sha256[..12]
+    );
+    let record = ledger.put(Kind::Dataset, name, json.as_bytes(), actor, &summary)?;
+    if record.version != version {
+        return Err(format!("the audit ledger numbered this build {} instead of {version}; the files were kept", record.version));
+    }
+    Ok(stored)
+}
+
+/// Register a dataset from before versioning as version 1 (files stay where they are). The ledger
+/// content is the old sidecar plus `version`, `csv_sha256` and `csv_bytes`. Caller holds the write lock.
+fn migrate_legacy(ledger: &Ledger, dir: &Path, name: &str) -> Result<bool, String> {
+    if !ledger.history(Kind::Dataset, name).is_empty() {
+        return Ok(false);
+    }
+    let Ok(raw) = fs::read_to_string(legacy_sidecar_path(dir, name)) else {
+        return Ok(false);
+    };
+    let mut info: DatasetInfoDto =
+        serde_json::from_str(&raw).map_err(|e| format!("dataset `{name}` has unreadable info: {e}"))?;
+    info.name = name.to_string();
+    info.version = 1;
+    match hash_file(&legacy_csv_path(dir, name)) {
+        Ok((hash, size)) => {
+            info.csv_sha256 = hash;
+            info.csv_bytes = size;
+        }
+        Err(error) => tracing::warn!(%error, dataset = name, "dataset file is missing or unreadable while registering it in the audit ledger"),
+    }
+    let json = serde_json::to_string_pretty(&info).map_err(|e| format!("could not encode dataset info: {e}"))?;
+    ledger.put(
+        Kind::Dataset,
+        name,
+        json.as_bytes(),
+        "system",
+        "Registered a dataset built before versioning as version 1 (files left in place)",
+    )?;
+    Ok(true)
+}
+
+fn parse_info(name: &str, bytes: &[u8]) -> Result<DatasetInfoDto, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("dataset `{name}` has unreadable info: {e}"))
+}
+
+/// One version of a dataset, or the latest when `version` is None. A deleted dataset is unknown.
+pub fn read_info_version(dir: &Path, name: &str, version: Option<u32>) -> Result<DatasetInfoDto, String> {
+    validate_dataset_name(name)?;
+    let ledger = ledger_for_dir(dir)?;
+    {
+        let _guard = lock_writes();
+        migrate_legacy(&ledger, dir, name)?;
+    }
+    let head = ledger
+        .head(Kind::Dataset, name)
+        .filter(|h| !h.is_tombstone())
+        .ok_or_else(|| format!("unknown dataset `{name}`"))?;
+    let wanted = version.unwrap_or(head.version);
+    let bytes = ledger
+        .content(Kind::Dataset, name, wanted)
+        .map_err(|e| format!("dataset `{name}` has no usable version {wanted}: {e}"))?;
+    parse_info(name, &bytes)
+}
+
+/// The latest version of a dataset.
+pub fn read_info(dir: &Path, name: &str) -> Result<DatasetInfoDto, String> {
+    read_info_version(dir, name, None)
+}
+
+/// The latest version of every dataset that has not been deleted. Datasets from before versioning are
+/// registered on the way.
+pub fn list_datasets_checked(dir: &Path) -> Result<Vec<DatasetInfoDto>, String> {
+    let ledger = ledger_for_dir(dir)?;
+    if let Ok(entries) = fs::read_dir(dir) {
+        let _guard = lock_writes();
+        for entry in entries.flatten() {
+            let file = entry.file_name().to_string_lossy().to_string();
+            let Some(name) = file.strip_suffix(".dataset.json") else {
+                continue;
+            };
+            if validate_dataset_name(name).is_err() {
+                continue;
+            }
+            if let Err(error) = migrate_legacy(&ledger, dir, name) {
+                tracing::warn!(%error, dataset = name, "skipping unreadable dataset");
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for object in ledger.objects(Kind::Dataset, false) {
+        match ledger
+            .content(Kind::Dataset, &object.object_id, object.head_version)
+            .and_then(|bytes| parse_info(&object.object_id, &bytes))
+        {
             Ok(info) => out.push(info),
             Err(error) => tracing::warn!(%error, "skipping unreadable dataset"),
         }
     }
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.name.cmp(&b.name)));
-    out
+    Ok(out)
+}
+
+pub fn list_datasets_in(dir: &Path) -> Vec<DatasetInfoDto> {
+    list_datasets_checked(dir).unwrap_or_else(|error| {
+        tracing::error!(%error, "could not list datasets");
+        Vec::new()
+    })
 }
 
 fn cell(text: &str) -> serde_json::Value {
@@ -486,31 +693,41 @@ fn cell(text: &str) -> serde_json::Value {
     serde_json::Value::String(text.to_string())
 }
 
+/// Preview of the latest version.
 pub fn preview_in(dir: &Path, name: &str) -> Result<DatasetPreviewDto, String> {
     let info = read_info(dir, name)?;
-    let text = fs::read_to_string(csv_path(dir, name)).map_err(|e| format!("could not read dataset file: {e}"))?;
-    let mut lines = text.lines();
-    let columns: Vec<String> = lines
-        .next()
-        .map(|h| h.split(',').map(String::from).collect())
-        .unwrap_or_default();
-    let sample = lines
-        .take(PREVIEW_ROWS)
-        .map(|l| l.split(',').map(cell).collect())
-        .collect();
+    let file = fs::File::open(csv_of(dir, &info)).map_err(|e| format!("could not read dataset file: {e}"))?;
+    let mut lines = std::io::BufReader::new(file).lines();
+    let columns: Vec<String> = match lines.next() {
+        Some(h) => h.map_err(|e| format!("could not read dataset file: {e}"))?.split(',').map(String::from).collect(),
+        None => Vec::new(),
+    };
+    let mut sample = Vec::new();
+    for line in lines.take(PREVIEW_ROWS) {
+        let line = line.map_err(|e| format!("could not read dataset file: {e}"))?;
+        sample.push(line.split(',').map(cell).collect());
+    }
     Ok(DatasetPreviewDto { info, columns, sample })
 }
 
-pub fn delete_in(dir: &Path, name: &str) -> Result<bool, String> {
+/// Delete = append a tombstone version. Every file and every earlier version stays; the name just
+/// disappears from the list. Returns whether there was a live dataset.
+pub fn delete_in_as(dir: &Path, name: &str, actor: &str) -> Result<bool, String> {
     validate_dataset_name(name)?;
-    let mut removed = false;
-    for path in [csv_path(dir, name), sidecar_path(dir, name)] {
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| format!("could not delete {}: {e}", path.display()))?;
-            removed = true;
+    let ledger = ledger_for_dir(dir)?;
+    let _guard = lock_writes();
+    migrate_legacy(&ledger, dir, name)?;
+    match ledger.head(Kind::Dataset, name) {
+        Some(head) if !head.is_tombstone() => {
+            ledger.tombstone(Kind::Dataset, name, actor, &format!("Deleted dataset (version {} was the latest); files kept", head.version))?;
+            Ok(true)
         }
+        _ => Ok(false),
     }
-    Ok(removed)
+}
+
+pub fn delete_in(dir: &Path, name: &str) -> Result<bool, String> {
+    delete_in_as(dir, name, "user")
 }
 
 // ── Orchestration with activity logging ──────────────────────────────
@@ -531,7 +748,7 @@ pub(crate) async fn build_dataset_inner(
             "dataset.build",
             "dataset",
             &info.name,
-            &format!("Built dataset {} ({} rows, {} symbols)", info.name, info.rows, info.symbols.len()),
+            &format!("Built dataset {} version {} ({} rows, {} symbols)", info.name, info.version, info.rows, info.symbols.len()),
             true,
             None,
         ),
@@ -606,8 +823,7 @@ async fn build_dataset_core(
     }
     let rel = relative_csv_path(paths, &req.name);
     let (csv, info) = assemble_with(&req, &series, &context, actor, &rel, Utc::now())?;
-    write_dataset(&datasets_dir(paths), &csv, &info)?;
-    Ok(info)
+    write_dataset(&datasets_dir(paths), &csv, &info)
 }
 
 pub(crate) fn delete_dataset_inner(
@@ -616,10 +832,11 @@ pub(crate) fn delete_dataset_inner(
     name: &str,
     actor: &str,
 ) -> Result<bool, String> {
-    let result = delete_in(&datasets_dir(paths), name);
+    let result = delete_in_as(&datasets_dir(paths), name, actor);
     match &result {
         Ok(true) => crate::activity::record(
-            state, actor, "dataset.delete", "dataset", name, &format!("Deleted dataset {name}"), true, None,
+            state, actor, "dataset.delete", "dataset", name,
+            &format!("Deleted dataset {name} (all versions and files are kept in the audit ledger)"), true, None,
         ),
         Ok(false) => {}
         Err(error) => crate::activity::record(
@@ -647,7 +864,7 @@ pub async fn build_dataset(
 
 #[tauri::command]
 pub async fn list_datasets(paths: State<'_, RuntimePaths>) -> Result<Vec<DatasetInfoDto>, String> {
-    Ok(list_datasets_in(&datasets_dir(&paths)))
+    list_datasets_checked(&datasets_dir(&paths))
 }
 
 #[tauri::command]
@@ -885,10 +1102,19 @@ mod tests {
         }
     }
 
+    /// `<root>/data/datasets`, the layout of the app: the ledger lives in `<root>/data/ledger`.
     fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("apex-datasets-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        d
+        let root = std::env::temp_dir().join(format!("apex-datasets-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        root.join("data").join("datasets")
+    }
+
+    /// Remove the whole temp root of a [`temp`] directory.
+    fn cleanup(dir: &Path) {
+        let root = dir.parent().and_then(|p| p.parent()).expect("a temp datasets directory has two parents");
+        // Never remove anything but a root made by `temp`.
+        assert!(root.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("apex-datasets-")), "{}", root.display());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -903,12 +1129,11 @@ mod tests {
 
     #[test]
     fn names_that_escape_the_directory_are_refused_everywhere() {
-        let dir = temp("escape");
-        fs::create_dir_all(&dir).unwrap();
-        let outside = dir.join("outside.csv");
-        fs::write(&outside, "x").unwrap();
-        let inner = dir.join("datasets");
+        let inner = temp("escape");
+        let dir = inner.clone();
         fs::create_dir_all(&inner).unwrap();
+        let outside = inner.parent().unwrap().join("outside.csv");
+        fs::write(&outside, "x").unwrap();
         assert!(delete_in(&inner, "../outside").is_err());
         assert!(preview_in(&inner, "../outside").is_err());
         assert!(read_info(&inner, "..").is_err());
@@ -918,7 +1143,7 @@ mod tests {
             .1;
         info.name = "../escape".into();
         assert!(write_dataset(&inner, "x", &info).is_err());
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1019,7 +1244,7 @@ mod tests {
         assert!(delete_in(&dir, "my_set").unwrap());
         assert!(!delete_in(&dir, "my_set").unwrap());
         assert!(list_datasets_in(&dir).is_empty());
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1448,11 +1673,11 @@ mod tests {
             "class_counts": {"0": 1, "1": 2}, "created_at": "2025-01-01T00:00:00Z", "first_time": null,
             "last_time": null, "source": "user"
         });
-        fs::write(sidecar_path(&dir, "old"), old.to_string()).unwrap();
+        fs::write(legacy_sidecar_path(&dir, "old"), old.to_string()).unwrap();
         let o = read_info(&dir, "old").unwrap();
         assert!(o.custom_features.is_empty() && o.context_symbols.is_empty() && o.fee_pct == 0.0);
         assert!(o.label.up_threshold_pct.is_none());
-        let _ = fs::remove_dir_all(&dir);
+        cleanup(&dir);
     }
 
     #[test]
@@ -1635,5 +1860,167 @@ mod tests {
         assert!((140..=160).contains(&h), "650 hourly bars at 6.5 per day is 100 sessions, got {h}");
         assert_eq!(history_window(&Tf::D1, 5000).num_days(), 7300, "capped at 20 years");
         assert!(history_window(&Tf::M1, 1).num_days() >= 1);
+    }
+
+    // ── Versioned datasets in the audit ledger ───────────────────────
+
+    fn build(dir: &Path, name: &str, bars: usize) -> DatasetInfoDto {
+        let r = normalize_request(&req(name)).unwrap();
+        let (csv, info) =
+            assemble(&r, &[("AAPL".into(), synthetic_bars(bars))], "user", &format!("data/datasets/{name}.csv"), Utc::now()).unwrap();
+        write_dataset(dir, &csv, &info).unwrap()
+    }
+
+    fn the_ledger(dir: &Path) -> Ledger {
+        ledger_for_dir(dir).unwrap()
+    }
+
+    #[test]
+    fn two_builds_under_one_name_are_v1_and_v2_and_the_first_is_untouched() {
+        let dir = temp("versions");
+        let v1 = build(&dir, "spy", 100);
+        let v1_csv = dir.join("spy").join("v1.csv");
+        let v1_bytes = fs::read(&v1_csv).unwrap();
+        let v1_hash = Ledger::sha256_hex(&v1_bytes);
+        assert_eq!((v1.version, v1.csv_sha256.as_str(), v1.csv_bytes), (1, v1_hash.as_str(), v1_bytes.len() as u64));
+        assert_eq!(v1.path, "data/datasets/spy/v1.csv");
+
+        let v2 = build(&dir, "spy", 140);
+        assert_eq!(v2.version, 2);
+        assert_eq!(v2.path, "data/datasets/spy/v2.csv");
+        assert_ne!(v2.csv_sha256, v1_hash);
+        // v1 is exactly what it was: bytes, hash, read-only.
+        assert_eq!(fs::read(&v1_csv).unwrap(), v1_bytes);
+        assert_eq!(hash_file(&v1_csv).unwrap().0, v1_hash);
+        assert!(fs::metadata(&v1_csv).unwrap().permissions().readonly());
+        assert!(fs::metadata(dir.join("spy").join("v2.csv")).unwrap().permissions().readonly());
+        assert!(dir.join("spy").join("v1.dataset.json").is_file() && dir.join("spy").join("v2.dataset.json").is_file());
+
+        // One ledger object, two versions, each holding its own sidecar with its own hash.
+        let ledger = the_ledger(&dir);
+        let history = ledger.history(Kind::Dataset, "spy");
+        assert_eq!(history.iter().map(|r| (r.version, r.action.as_str())).collect::<Vec<_>>(), vec![(1, "create"), (2, "update")]);
+        let stored: DatasetInfoDto = serde_json::from_slice(&ledger.content(Kind::Dataset, "spy", 1).unwrap()).unwrap();
+        assert_eq!((stored.version, stored.csv_sha256), (1, v1_hash.clone()));
+
+        // The list shows the latest; older versions are still readable by number.
+        let listed = list_datasets_in(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].version, listed[0].rows), (2, v2.rows));
+        assert_eq!(read_info_version(&dir, "spy", Some(1)).unwrap().csv_sha256, v1_hash);
+        assert!(read_info_version(&dir, "spy", Some(9)).is_err());
+        assert_eq!(preview_in(&dir, "spy").unwrap().info.version, 2);
+        assert!(ledger.verify().ok);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_delete_is_a_tombstone_the_files_stay_and_a_rebuild_continues_the_same_object() {
+        let dir = temp("tombstone");
+        build(&dir, "gone", 100);
+        assert!(delete_in(&dir, "gone").unwrap());
+        assert!(!delete_in(&dir, "gone").unwrap(), "already deleted");
+        assert!(list_datasets_in(&dir).is_empty());
+        assert!(read_info(&dir, "gone").unwrap_err().contains("unknown dataset"));
+        assert!(preview_in(&dir, "gone").is_err());
+        assert!(dir.join("gone").join("v1.csv").is_file(), "the data is not removed");
+        let ledger = the_ledger(&dir);
+        let history = ledger.history(Kind::Dataset, "gone");
+        assert_eq!(history.last().unwrap().action, "delete");
+        assert!(ledger.objects(Kind::Dataset, true).iter().any(|o| o.object_id == "gone" && o.deleted));
+        assert!(ledger.content(Kind::Dataset, "gone", 1).is_ok(), "history stays readable");
+
+        let again = build(&dir, "gone", 120);
+        assert_eq!(again.version, 3, "the version number continues after the tombstone");
+        assert!(dir.join("gone").join("v3.csv").is_file() && dir.join("gone").join("v1.csv").is_file());
+        assert_eq!(list_datasets_in(&dir)[0].version, 3);
+        assert_eq!(ledger.history(Kind::Dataset, "gone").len(), 3);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_dataset_from_before_versioning_becomes_version_1_in_place_when_listed() {
+        let dir = temp("legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let r = normalize_request(&req("old")).unwrap();
+        let (csv, info) = assemble(&r, &[("AAPL".into(), synthetic_bars(100))], "user", "data/datasets/old.csv", Utc::now()).unwrap();
+        fs::write(legacy_csv_path(&dir, "old"), &csv).unwrap();
+        let side = serde_json::to_string_pretty(&info).unwrap();
+        fs::write(legacy_sidecar_path(&dir, "old"), &side).unwrap();
+
+        let listed = list_datasets_in(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].version, 1);
+        assert_eq!(listed[0].csv_sha256, Ledger::sha256_hex(csv.as_bytes()));
+        assert_eq!(listed[0].path, "data/datasets/old.csv", "the file stays where it is");
+        assert_eq!(fs::read_to_string(legacy_csv_path(&dir, "old")).unwrap(), csv, "files are not rewritten");
+        assert_eq!(fs::read_to_string(legacy_sidecar_path(&dir, "old")).unwrap(), side);
+        let ledger = the_ledger(&dir);
+        let history = ledger.history(Kind::Dataset, "old");
+        assert_eq!(history.len(), 1);
+        assert_eq!((history[0].action.as_str(), history[0].actor.as_str()), ("create", "system"));
+        // Listing again adds nothing.
+        list_datasets_in(&dir);
+        assert_eq!(ledger.history(Kind::Dataset, "old").len(), 1);
+        // The preview reads the old location.
+        assert_eq!(preview_in(&dir, "old").unwrap().sample.len(), PREVIEW_ROWS);
+
+        // A rebuild is version 2 in the new layout; the old file is still there, unchanged.
+        let v2 = build(&dir, "old", 130);
+        assert_eq!(v2.version, 2);
+        assert!(dir.join("old").join("v2.csv").is_file());
+        assert_eq!(fs::read_to_string(legacy_csv_path(&dir, "old")).unwrap(), csv);
+        assert_eq!(read_info_version(&dir, "old", Some(1)).unwrap().path, "data/datasets/old.csv");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_legacy_dataset_can_be_deleted_without_listing_first() {
+        let dir = temp("legacy-delete");
+        fs::create_dir_all(&dir).unwrap();
+        let r = normalize_request(&req("old")).unwrap();
+        let (csv, info) = assemble(&r, &[("AAPL".into(), synthetic_bars(100))], "user", "data/datasets/old.csv", Utc::now()).unwrap();
+        fs::write(legacy_csv_path(&dir, "old"), &csv).unwrap();
+        fs::write(legacy_sidecar_path(&dir, "old"), serde_json::to_string(&info).unwrap()).unwrap();
+        assert!(delete_in(&dir, "old").unwrap());
+        assert!(list_datasets_in(&dir).is_empty(), "a deleted legacy dataset is not re-registered by listing");
+        assert!(legacy_csv_path(&dir, "old").is_file());
+        let history = the_ledger(&dir).history(Kind::Dataset, "old");
+        assert_eq!(history.iter().map(|r| r.action.as_str()).collect::<Vec<_>>(), vec!["create", "delete"]);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn leftovers_of_an_interrupted_build_are_set_aside_never_overwritten() {
+        let dir = temp("orphan");
+        fs::create_dir_all(dir.join("half")).unwrap();
+        fs::write(dir.join("half").join("v1.csv"), "left by a crash").unwrap();
+        let info = build(&dir, "half", 100);
+        assert_eq!(info.version, 1);
+        let aside: Vec<_> = fs::read_dir(dir.join("half"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("v1.csv.orphan-"))
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(fs::read_to_string(aside[0].path()).unwrap(), "left by a crash");
+        assert_eq!(hash_file(&dir.join("half").join("v1.csv")).unwrap().0, info.csv_sha256);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn concurrent_builds_of_one_name_get_distinct_versions() {
+        let dir = temp("race");
+        let handles: Vec<_> = (0..6)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || build(&dir, "race", 90 + i * 7).version)
+            })
+            .collect();
+        let mut versions: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        versions.sort();
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert!(the_ledger(&dir).verify().ok);
+        cleanup(&dir);
     }
 }

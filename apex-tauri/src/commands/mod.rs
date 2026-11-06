@@ -12,6 +12,7 @@ pub mod copilot_web;
 pub mod data;
 pub mod graph;
 pub mod health;
+pub mod ledger_cmds;
 pub mod live;
 pub mod market;
 pub mod ml;
@@ -33,5 +34,6 @@ pub mod settings;
 pub mod signal_policy;
 pub mod strategy;
 pub mod vault;
+pub mod versioned_files;
 
 pub mod strategy_worker;

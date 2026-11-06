@@ -118,6 +118,12 @@ pub fn live_involved(name: &str, args: &Value, automation_broker: &dyn Fn(&str) 
             let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
             live(automation_broker(id).as_deref())
         }
+        // Restoring an automation can bring a rule back on its saved broker. This looks at the rule
+        // as it is now; `requires_approval` also looks at the version being restored.
+        "ledger_restore" if args.get("kind").and_then(|v| v.as_str()) == Some("automation") => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            live(automation_broker(id).as_deref())
+        }
         _ => false,
     }
 }
@@ -141,6 +147,8 @@ pub fn requires_approval(mode: ChatMode, name: &str, args: &Value, state: &AppSt
                     .map(|rule| rule.broker_id.clone())
             };
             live_involved(name, args, &broker_of)
+                // A restored automation may trade live again, judged by the version that comes back.
+                || (name == "ledger_restore" && super::ledger_cmds::restore_needs_live_approval(state, args))
                 // Stopping a live session closes its position at market.
                 || (name == "stop_strategy" && copilot_tools::needs_approval(name, args, state, paths))
                 // Training with a custom estimator runs arbitrary Python, so even Agent mode asks

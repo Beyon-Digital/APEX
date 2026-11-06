@@ -23,12 +23,15 @@ use apex_core::application::graph_engine::GraphEngine;
 use apex_core::application::market_data_aggregator::MarketDataAggregator;
 use apex_core::application::metrics::Metrics;
 use apex_core::application::news_engine::{FeedType, NewsEngine, NewsFeed};
-use apex_core::application::order_trade_manager::{cancel_orphaned_paper_orders, OrderTradeManager};
+use apex_core::application::order_trade_manager::{cancel_orphaned_paper_orders_audited, OrderTradeManager};
 use apex_core::application::risk_engine::{RiskConfig, RiskEngine};
 use apex_core::application::scanner::MarketScanner;
 use apex_core::bus::message_bus::{BusMessage, MessageBus, Topic};
 use apex_core::ports::market_data::MarketDataPort;
 use apex_core::ports::storage::StoragePort;
+
+use crate::order_audit::{AuditContext, OrderSource};
+use apex_core::ports::audit::OrderAuditEvent;
 
 /// How a live order was authorised.
 pub enum LiveAuth<'a> {
@@ -130,14 +133,105 @@ async fn build_storage_or_fallback(
     }
 }
 
+/// Open the immutable audit ledger under `<runtime data dir>/ledger`, install it process-wide and
+/// verify it in the background. A problem is logged and recorded as an activity entry; it never
+/// stops the app.
+///
+/// The ledger lives under the RUNTIME data directory (`RuntimePaths::data_dir`), never under the
+/// `general.data_dir` setting: model, dataset and training-provenance code, the activity log and the
+/// ledger commands all find the ledger there, so a configured data dir must not split the audit
+/// trail into two ledgers (one of them never verified or shown). The setting still moves the
+/// database; it does not move the audit trail.
+fn open_audit_ledger(runtime_paths: &RuntimePaths, configured_data_dir: &std::path::Path) {
+    let data_dir = runtime_paths.data_dir();
+    if configured_data_dir != data_dir {
+        tracing::warn!(
+            configured = %configured_data_dir.display(),
+            ledger = %data_dir.join("ledger").display(),
+            "general.data_dir differs from the runtime data directory; the audit ledger stays in the runtime data directory"
+        );
+    }
+    let ledger = match crate::activity::ledger_for(data_dir) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            tracing::error!(%error, "could not open the audit ledger; changes will not be versioned");
+            return;
+        }
+    };
+    if let Err(error) = crate::ledger::install(ledger.clone()) {
+        tracing::warn!(%error, "audit ledger was already installed");
+    }
+    // Not in unit tests: they start many AppStates on temp folders and write files right away, and a
+    // background pass would record those files as outside edits in the middle of the test.
+    #[cfg(not(test))]
+    let startup_paths = runtime_paths.clone();
+    #[cfg(test)]
+    let _ = runtime_paths;
+    tokio::task::spawn_blocking(move || {
+        // Once, before the first verify: finish interrupted saves and record edits made while APEX was
+        // not running as `external` versions. Problems are logged and never stop the app.
+        #[cfg(not(test))]
+        {
+            let started = crate::commands::ledger_cmds::startup_reconcile(&ledger, &startup_paths);
+            for error in &started.errors {
+                tracing::warn!(%error, "startup audit reconcile");
+            }
+            let f = &started.files;
+            tracing::info!(adopted = f.adopted, external_edits = f.external_edits, removed = f.removed, completed_pending = f.completed_pending, datasets = started.datasets, models = started.models, "startup audit reconcile done");
+            if started.recorded_changes() {
+                let entry = crate::activity::ActivityDto {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    actor: "system".into(),
+                    action: "ledger.reconcile".into(),
+                    kind: "system".into(),
+                    target_id: "ledger".into(),
+                    summary: format!(
+                        "Recorded changes made outside APEX as new versions: {} new file(s), {} edited, {} removed",
+                        f.adopted, f.external_edits, f.removed
+                    ),
+                    ok: true,
+                    details: None,
+                };
+                if let Err(error) = crate::activity::append_to(&ledger, &entry) {
+                    tracing::error!(%error, "could not record the startup reconcile");
+                }
+            }
+        }
+        let report = ledger.verify();
+        if report.ok {
+            tracing::info!(records = report.checked_records, events = report.checked_events, blobs = report.checked_blobs, "audit ledger verified");
+            return;
+        }
+        let first = report.problems.first().map(|p| format!("{} at {}: {}", p.kind, p.location, p.detail)).unwrap_or_default();
+        tracing::error!(problems = report.problems.len(), %first, "audit ledger verification FAILED");
+        let entry = crate::activity::ActivityDto {
+            id: uuid::Uuid::new_v4().to_string(),
+            ts: chrono::Utc::now().to_rfc3339(),
+            actor: "system".into(),
+            action: "ledger.verify_failed".into(),
+            kind: "system".into(),
+            target_id: "ledger".into(),
+            summary: format!("Audit ledger verification found {} problem(s)", report.problems.len()),
+            ok: false,
+            details: Some(first),
+        };
+        if let Err(error) = crate::activity::append_to(&ledger, &entry) {
+            tracing::error!(%error, "could not record the ledger verification failure");
+        }
+    });
+}
+
 impl AppState {
     /// Initialize all application services.
     pub async fn init(runtime_paths: RuntimePaths) -> Result<Self> {
         let bus = Arc::new(MessageBus::new());
         let config = AppConfig::load(&runtime_paths)?;
         let resolved_data_dir = config.resolved_data_dir(&runtime_paths)?;
+        open_audit_ledger(&runtime_paths, &resolved_data_dir);
         let storage = build_storage_or_fallback(&runtime_paths, &config).await?;
-        let cancelled = cancel_orphaned_paper_orders(storage.storage.as_ref()).await?;
+        let startup_sink = crate::order_audit::LedgerOrderSink::global();
+        let cancelled = cancel_orphaned_paper_orders_audited(storage.storage.as_ref(), Some(&startup_sink)).await?;
         if cancelled > 0 { tracing::info!(cancelled, "Cancelled paper orders from the previous session"); }
 
         tracing::info!(
@@ -159,6 +253,9 @@ impl AppState {
         let mut aggregator_inner = MarketDataAggregator::new(bus.clone());
         aggregator_inner.set_storage(storage.storage.clone());
         let otm_inner = OrderTradeManager::new(risk.clone(), bus.clone());
+        // Every order state becomes an event in the hash-chained "orders" stream of the audit
+        // ledger. A live order is refused when its first event cannot be written.
+        otm_inner.set_audit_sink(Arc::new(crate::order_audit::LedgerOrderSink::global()));
         let mut brokers = HashMap::new();
 
         let yahoo_adapter = Arc::new(YahooFinanceAdapter::new());
@@ -494,30 +591,90 @@ impl AppState {
     }
 
     /// Submit an order, applying the live-trading safeguards to non-paper brokers.
-    /// Paper orders pass straight through.
+    /// Paper orders pass straight through. The audit trail names who produced the order from
+    /// its tag; callers that know better use [`guarded_submit_with`](Self::guarded_submit_with).
     pub async fn guarded_submit(
         &self,
         order: apex_core::domain::models::NewOrderRequest,
         broker_id: &str,
         auth: LiveAuth<'_>,
     ) -> std::result::Result<apex_core::domain::models::OrderId, String> {
+        self.guarded_submit_with(order, broker_id, auth, None).await
+    }
+
+    /// Who is placing an order, for the audit trail: the caller's `source`, else what the order's
+    /// tag says (Copilot, automation or strategy orders), else "manual" for a confirmed UI order,
+    /// else an unattended order of unknown origin.
+    fn order_audit_context(
+        &self,
+        order: &apex_core::domain::models::NewOrderRequest,
+        broker_id: &str,
+        auth: &LiveAuth<'_>,
+        source: Option<OrderSource>,
+    ) -> AuditContext {
+        let source = source
+            .or_else(|| {
+                let turn = self.copilot_turn.lock().ok().and_then(|t| t.clone());
+                crate::order_audit::source_from_tag(
+                    crate::ledger::global(),
+                    order.tag.as_deref(),
+                    turn.as_deref(),
+                    |id| self.automations.get(id).map(|r| r.model_id),
+                )
+            })
+            .or_else(|| match auth {
+                LiveAuth::Manual(_) => Some(crate::order_audit::manual_source()),
+                LiveAuth::Unattended => Some(OrderSource::new("unattended", "")),
+            });
+        let actor = source.as_ref().map(crate::order_audit::actor_for).unwrap_or("unattributed");
+        let mut ctx = AuditContext::new(actor, source);
+        if let (LiveAuth::Manual(confirmation), true) = (auth, broker_id != "paper") {
+            ctx = ctx.confirmed(confirmation.is_some());
+        }
+        ctx
+    }
+
+    /// [`guarded_submit`](Self::guarded_submit) with the order's origin stated: pass an
+    /// [`OrderSource`] (see `crate::order_audit`: `copilot_source`, `strategy_source`,
+    /// `automation_source`, ...) so the trade traces to the exact turn, strategy or rule version.
+    pub async fn guarded_submit_with(
+        &self,
+        order: apex_core::domain::models::NewOrderRequest,
+        broker_id: &str,
+        auth: LiveAuth<'_>,
+        source: Option<OrderSource>,
+    ) -> std::result::Result<apex_core::domain::models::OrderId, String> {
+        let ctx = self.order_audit_context(&order, broker_id, &auth, source);
         if broker_id == "paper" {
-            return self.otm.submit_order(order, broker_id).await.map_err(|e| e.to_string());
+            return self.otm.submit_order_with(order, broker_id, ctx).await.map_err(|e| e.to_string());
         }
-        self.live_guard.check_order(&order)?;
-        if let LiveAuth::Manual(confirmation) = auth {
-            let id = confirmation.ok_or_else(|| {
-                "Order was not confirmed. Review and confirm it first.".to_string()
-            })?;
-            self.live_guard.consume_confirmation(id, broker_id, &order)?;
-        }
-        let slot = self.live_guard.reserve()?;
-        match self.otm.submit_order(order, broker_id).await {
+        // The live guard's refusals (not armed, over the cap, unconfirmed, daily limit) come before
+        // the order manager sees the order, so they are recorded here: an attempted live trade
+        // that was blocked still shows in the trail, with who tried it.
+        let checked = (|| -> std::result::Result<_, String> {
+            self.live_guard.check_order(&order)?;
+            if let LiveAuth::Manual(confirmation) = auth {
+                let id = confirmation.ok_or_else(|| {
+                    "Order was not confirmed. Review and confirm it first.".to_string()
+                })?;
+                self.live_guard.consume_confirmation(id, broker_id, &order)?;
+            }
+            self.live_guard.reserve()
+        })();
+        let slot = match checked {
+            Ok(slot) => slot,
+            Err(reason) => {
+                self.otm.audit_refused_order(&order, broker_id, &ctx, "live_guard", &reason);
+                return Err(reason);
+            }
+        };
+        match self.otm.submit_order_with(order, broker_id, ctx).await {
             Ok(id) => {
                 // The order was past the checks when the user pulled the plug (kill
                 // switch, disarm, or a risk halt). It is now at the broker, so cancel it.
                 if !self.live_guard.is_armed() || self.risk.is_halted() {
-                    let _ = self.otm.cancel_order(&id, broker_id).await;
+                    let guard = AuditContext::new("system", Some(OrderSource::new("live_guard", "disarmed_during_placement")));
+                    let _ = self.otm.cancel_order_with(&id, broker_id, guard).await;
                     return Err(
                         "Live trading was disarmed while this order was being placed; it was cancelled."
                             .to_string(),
@@ -540,13 +697,56 @@ impl AppState {
         broker_id: &str,
         params: &apex_core::domain::models::ModifyParams,
     ) -> std::result::Result<(), String> {
+        self.guarded_modify_with(order_id, broker_id, params, None).await
+    }
+
+    /// [`guarded_modify`](Self::guarded_modify) with the origin of the change stated.
+    pub async fn guarded_modify_with(
+        &self,
+        order_id: &apex_core::domain::models::OrderId,
+        broker_id: &str,
+        params: &apex_core::domain::models::ModifyParams,
+        source: Option<OrderSource>,
+    ) -> std::result::Result<(), String> {
         if broker_id != "paper" {
             self.live_guard.check_modify(params.quantity)?;
         }
+        let actor = source.as_ref().map(crate::order_audit::actor_for).unwrap_or("unattributed");
+        let ctx = AuditContext::new(actor, source);
         self.otm
-            .modify_order(order_id, broker_id, params)
+            .modify_order_with(order_id, broker_id, params, ctx)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Arm or disarm live trading and put it in the audit trail (`live_armed` / `live_disarmed`).
+    /// Arming is refused when the event cannot be written: nothing may trade live unrecorded.
+    /// Disarming always happens; its event is best effort. No event when nothing changes.
+    pub fn set_live_armed_audited(&self, armed: bool, actor: &str, reason: &str) -> std::result::Result<(), String> {
+        let was_armed = self.live_guard.is_armed();
+        if armed == was_armed {
+            return Ok(());
+        }
+        let event = OrderAuditEvent {
+            order_id: String::new(),
+            broker_id: String::new(),
+            event: if armed { "live_armed" } else { "live_disarmed" }.into(),
+            actor: actor.into(),
+            source: None,
+            data: serde_json::json!({ "reason": reason }),
+        };
+        if armed {
+            self.otm
+                .record_audit_event(event)
+                .map_err(|e| format!("Live trading was not armed: the audit log could not record it ({e})."))?;
+            self.live_guard.set_armed(true);
+        } else {
+            self.live_guard.set_armed(false);
+            if let Err(error) = self.otm.record_audit_event(event) {
+                tracing::error!(%error, "could not record live trading being disarmed");
+            }
+        }
+        Ok(())
     }
 
     /// Emergency stop: disarm live trading, halt the risk engine, pause
@@ -555,8 +755,28 @@ impl AppState {
     /// cancelled whether they would open, add to or close a long or a short (closing a short is
     /// a buy), and open positions of either side are left for the user to close.
     pub async fn kill_switch(&self) -> (Vec<String>, Vec<String>) {
+        self.kill_switch_as("unattributed").await
+    }
+
+    /// [`kill_switch`](Self::kill_switch) naming who pulled it ("user", "copilot", ...). The audit
+    /// trail gets a `kill_switch` event when it starts and another with the outcome, and every
+    /// cancel it makes carries the source `kill_switch`.
+    pub async fn kill_switch_as(&self, actor: &str) -> (Vec<String>, Vec<String>) {
         use apex_core::domain::models::OrderStatus;
-        self.live_guard.set_armed(false);
+        let ctx = AuditContext::new(actor, Some(crate::order_audit::kill_switch_source()));
+        let kill_event = |data: serde_json::Value| OrderAuditEvent {
+            order_id: String::new(),
+            broker_id: String::new(),
+            event: "kill_switch".into(),
+            actor: ctx.actor.clone(),
+            source: ctx.source.clone(),
+            data,
+        };
+        let was_armed = self.live_guard.is_armed();
+        if let Err(error) = self.otm.record_audit_event(kill_event(serde_json::json!({"phase": "start", "was_armed": was_armed}))) {
+            tracing::error!(%error, "could not record the kill switch start; stopping anyway");
+        }
+        let _ = self.set_live_armed_audited(false, actor, "kill_switch");
         self.risk.halt();
         // Algos must not keep trading after an emergency stop.
         self.automations_paused
@@ -578,7 +798,7 @@ impl AppState {
         let mut handled = std::collections::HashSet::new();
         for order in working {
             handled.insert((order.broker_id.clone(), order.id.0.clone()));
-            match self.otm.cancel_order(&order.id, &order.broker_id).await {
+            match self.otm.cancel_order_with(&order.id, &order.broker_id, ctx.clone()).await {
                 Ok(()) => cancelled.push(order.id.0.clone()),
                 Err(error) => failed.push(format!("{}: {error}", order.id.0)),
             }
@@ -589,10 +809,15 @@ impl AppState {
             if !handled.insert((order.broker_id.clone(), order.id.0.clone())) {
                 continue;
             }
-            match self.otm.cancel_order(&order.id, &order.broker_id).await {
+            match self.otm.cancel_order_with(&order.id, &order.broker_id, ctx.clone()).await {
                 Ok(()) => cancelled.push(order.id.0.clone()),
                 Err(error) => failed.push(format!("{}: {error}", order.id.0)),
             }
+        }
+        if let Err(error) = self.otm.record_audit_event(kill_event(
+            serde_json::json!({"phase": "done", "cancelled": cancelled, "failed": failed}),
+        )) {
+            tracing::error!(%error, "could not record the kill switch outcome");
         }
         (cancelled, failed)
     }
@@ -684,7 +909,7 @@ impl AppState {
     /// the vault, and it must not come back armed after the next unlock.
     pub async fn lock_vault(&self) {
         let _serialized = self.broker_change_lock.lock().await;
-        self.live_guard.set_armed(false);
+        let _ = self.set_live_armed_audited(false, "system", "vault_locked");
         crate::commands::strategy_worker::stop_live_sessions();
         self.vault.lock();
         for broker_id in CONFIGURABLE_BROKERS {
@@ -947,6 +1172,31 @@ mod storage_fallback_tests {
         config.storage.sqlite_path = blocker.join("apex.db").to_string_lossy().into_owned();
 
         assert!(build_storage_or_fallback(&paths, &config).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_configured_data_dir_does_not_split_the_audit_ledger() {
+        let root = temp_root("ledger-split");
+        let paths = RuntimePaths::for_test(&root);
+        // Write the default config, then point general.data_dir somewhere else.
+        let default = AppConfig::load(&paths).unwrap();
+        let raw = std::fs::read_to_string(paths.config_file()).unwrap();
+        let other = root.join("elsewhere");
+        let edited = raw.replacen(
+            &format!("data_dir = \"{}\"", default.general.data_dir),
+            &format!("data_dir = \"{}\"", other.display()),
+            1,
+        );
+        assert_ne!(raw, edited, "the test must actually change general.data_dir");
+        std::fs::write(paths.config_file(), edited).unwrap();
+        assert_eq!(AppConfig::load(&paths).unwrap().resolved_data_dir(&paths).unwrap(), other);
+
+        let _state = AppState::init(paths.clone()).await.expect("AppState::init");
+
+        // Models, datasets, provenance and the ledger commands all open the ledger at the runtime data dir.
+        assert!(paths.data_dir().join("ledger").is_dir(), "the ledger is at the runtime data directory");
+        assert!(!other.join("ledger").exists(), "no second ledger at the configured directory");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

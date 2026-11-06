@@ -1,4 +1,6 @@
 use super::python_runtime;
+use super::versioned_files::{self, Provenance};
+use crate::ledger::{Kind, Ledger};
 use crate::state::AppState;
 use crate::validation;
 use apex_adapters::market_data::yahoo_finance::YahooFinanceAdapter;
@@ -57,6 +59,11 @@ pub struct StrategyExecutionResultDto {
     pub exit_code: Option<i32>,
     pub started_at: String,
     pub finished_at: String,
+    /// The ledger version of the strategy file this run used (absent if it could not be resolved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +91,11 @@ pub struct StrategyBacktestResultDto {
     pub trades: Vec<BacktestTrade>,
     pub equity_curve: Vec<EquityPoint>,
     pub notes: Vec<String>,
+    /// The ledger version and content hash of the strategy file that was backtested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_hash: Option<String>,
 }
 
 pub(crate) fn strategy_root(
@@ -143,16 +155,63 @@ fn collect_strategy_files(
     Ok(())
 }
 
-fn ensure_default_strategy(root: &Path) -> Result<(), String> {
+fn ensure_default_strategy(root: &Path, ledger: Option<&Ledger>) -> Result<(), String> {
     let mut files = Vec::new();
     collect_strategy_files(root, root, &mut files)?;
 
     if files.is_empty() {
-        fs::write(root.join("my_strategy.py"), DEFAULT_STRATEGY_TEMPLATE)
-            .map_err(|e| format!("Failed to create starter strategy: {e}"))?;
+        let target = root.join("my_strategy.py");
+        match ledger {
+            Some(ledger) => {
+                versioned_files::save(ledger, Kind::Strategy, "strategies/my_strategy.py", &target, DEFAULT_STRATEGY_TEMPLATE.as_bytes(), "system")?;
+            }
+            // No ledger: the file is still created (listing must work); the next reconcile records it.
+            None => fs::write(&target, DEFAULT_STRATEGY_TEMPLATE).map_err(|e| format!("Failed to create starter strategy: {e}"))?,
+        }
     }
 
     Ok(())
+}
+
+/// The ledger object id of a strategy file: the path the UI knows it by (`strategies/sub/mom.py`).
+pub(crate) fn strategy_id(runtime_paths: &python_runtime::RuntimePaths, full_path: &Path) -> String {
+    make_strategy_path(runtime_paths.strategies_dir(), full_path)
+}
+
+/// Save a strategy file as `actor` through the audit ledger (a new version; identical content is a
+/// no-op). The Copilot's `save_strategy` tool writes through this.
+#[allow(dead_code)]
+pub(crate) fn save_strategy_as(
+    runtime_paths: &python_runtime::RuntimePaths,
+    path: &str,
+    content: String,
+    actor: &str,
+) -> Result<StrategyFileDto, String> {
+    save_strategy_file_inner(versioned_files::ledger()?, path, content, runtime_paths, actor)
+}
+
+/// Restore an older version of a strategy as a new version and rewrite the file.
+#[allow(dead_code)]
+pub(crate) fn restore_strategy(
+    ledger: &Ledger,
+    runtime_paths: &python_runtime::RuntimePaths,
+    id: &str,
+    version: u32,
+    actor: &str,
+) -> Result<crate::ledger::VersionRecord, String> {
+    let full_path = normalize_strategy_path(id, runtime_paths)?;
+    let id = strategy_id(runtime_paths, &full_path);
+    versioned_files::restore(ledger, Kind::Strategy, &id, &full_path, version, actor)
+}
+
+/// The strategy's current ledger version and content hash, after recording any unsaved external edit.
+pub(crate) fn strategy_provenance(
+    ledger: &Ledger,
+    runtime_paths: &python_runtime::RuntimePaths,
+    path: &str,
+) -> Result<Option<Provenance>, String> {
+    let full_path = normalize_strategy_path(path, runtime_paths)?;
+    versioned_files::resolve_head(ledger, Kind::Strategy, &strategy_id(runtime_paths, &full_path), &full_path)
 }
 
 pub(crate) fn normalize_strategy_path(
@@ -178,7 +237,52 @@ pub(crate) fn normalize_strategy_path(
         return Err("Strategy files must end in .py".into());
     }
 
-    Ok(strategy_root(runtime_paths)?.join(trimmed))
+    let root = strategy_root(runtime_paths)?;
+    Ok(match_disk_names(&root, rel))
+}
+
+/// `rel` under `root`, spelled the way the entries on disk are spelled. macOS (APFS) and Windows
+/// treat `Foo.py` and `foo.py` as one file, but the ledger id is the path as spelled, so a save
+/// under another spelling would put one file's history in two objects (and the next reconcile
+/// would record the app's own save as an "external" edit). A component that does not exist yet
+/// keeps the spelling given. The same holds for Unicode forms that the filesystem treats alike.
+fn match_disk_names(root: &Path, rel: &Path) -> PathBuf {
+    let mut current = root.to_path_buf();
+    let mut exists = true;
+    for component in rel.components() {
+        let name = component.as_os_str();
+        if exists {
+            if let Some(found) = on_disk_name(&current, name) {
+                current.push(found);
+                continue;
+            }
+            exists = false;
+        }
+        current.push(name);
+    }
+    current
+}
+
+/// The entry of `dir` that is the same file as `dir/name` (exact spelling first), if there is one.
+fn on_disk_name(dir: &Path, name: &OsStr) -> Option<std::ffi::OsString> {
+    let entries: Vec<std::ffi::OsString> = fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+    if entries.iter().any(|e| e == name) {
+        return Some(name.to_os_string());
+    }
+    let wanted = fs::metadata(dir.join(name)).ok()?; // the filesystem says it is there under this spelling
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        entries.into_iter().find(|e| {
+            fs::metadata(dir.join(e)).map(|m| m.dev() == wanted.dev() && m.ino() == wanted.ino()).unwrap_or(false)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = wanted;
+        let lower = name.to_string_lossy().to_lowercase();
+        entries.into_iter().find(|e| e.to_string_lossy().to_lowercase() == lower)
+    }
 }
 
 fn parse_timeframe(value: &str) -> Result<Timeframe, String> {
@@ -280,7 +384,9 @@ pub(crate) fn list_strategy_files_inner(
     runtime_paths: &python_runtime::RuntimePaths,
 ) -> Result<Vec<StrategyFileDto>, String> {
     let root = strategy_root(runtime_paths)?;
-    ensure_default_strategy(&root)?;
+    // An edit made outside the app becomes a version the next time the user looks.
+    versioned_files::reconcile_for_listing(runtime_paths, Kind::Strategy);
+    ensure_default_strategy(&root, versioned_files::try_ledger())?;
 
     let mut files = Vec::new();
     collect_strategy_files(&root, &root, &mut files)?;
@@ -295,15 +401,17 @@ pub async fn create_strategy_file(
     runtime_paths: State<'_, python_runtime::RuntimePaths>,
     state: State<'_, AppState>,
 ) -> Result<StrategyFileDto, String> {
-    let result = create_strategy_file_inner(&path, content, runtime_paths.inner());
+    let result = versioned_files::ledger().and_then(|ledger| create_strategy_file_inner(ledger, &path, content, runtime_paths.inner(), "user"));
     record_file_change(state.inner(), "strategy.create", "Created", "create", &path, &result.as_ref().map(|f| f.path.clone()).map_err(|e| e.clone()));
     result
 }
 
 fn create_strategy_file_inner(
+    ledger: &Ledger,
     path: &str,
     content: Option<String>,
     runtime_paths: &python_runtime::RuntimePaths,
+    actor: &str,
 ) -> Result<StrategyFileDto, String> {
     let path = path.to_string();
     let root = strategy_root(runtime_paths)?;
@@ -319,7 +427,7 @@ fn create_strategy_file_inner(
     }
 
     let strategy_content = content.unwrap_or_else(|| DEFAULT_STRATEGY_TEMPLATE.to_string());
-    fs::write(&full_path, &strategy_content)
+    versioned_files::save(ledger, Kind::Strategy, &strategy_id(runtime_paths, &full_path), &full_path, strategy_content.as_bytes(), actor)
         .map_err(|e| format!("Failed to create strategy file {:?}: {e}", full_path))?;
 
     Ok(StrategyFileDto {
@@ -336,15 +444,17 @@ pub async fn save_strategy_file(
     runtime_paths: State<'_, python_runtime::RuntimePaths>,
     state: State<'_, AppState>,
 ) -> Result<StrategyFileDto, String> {
-    let result = save_strategy_file_inner(&path, content, runtime_paths.inner());
+    let result = versioned_files::ledger().and_then(|ledger| save_strategy_file_inner(ledger, &path, content, runtime_paths.inner(), "user"));
     record_file_change(state.inner(), "strategy.save", "Saved", "save", &path, &result.as_ref().map(|f| f.path.clone()).map_err(|e| e.clone()));
     result
 }
 
-fn save_strategy_file_inner(
+pub(crate) fn save_strategy_file_inner(
+    ledger: &Ledger,
     path: &str,
     content: String,
     runtime_paths: &python_runtime::RuntimePaths,
+    actor: &str,
 ) -> Result<StrategyFileDto, String> {
     let root = strategy_root(runtime_paths)?;
     let full_path = normalize_strategy_path(&path, runtime_paths)?;
@@ -354,7 +464,7 @@ fn save_strategy_file_inner(
             .map_err(|e| format!("Failed to create strategy subdirectory {:?}: {e}", parent))?;
     }
 
-    fs::write(&full_path, &content)
+    versioned_files::save(ledger, Kind::Strategy, &strategy_id(runtime_paths, &full_path), &full_path, content.as_bytes(), actor)
         .map_err(|e| format!("Failed to save strategy file {:?}: {e}", full_path))?;
 
     Ok(StrategyFileDto {
@@ -370,7 +480,7 @@ pub async fn delete_strategy_file(
     runtime_paths: State<'_, python_runtime::RuntimePaths>,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    let result = delete_strategy_file_inner(&path, runtime_paths.inner());
+    let result = versioned_files::ledger().and_then(|ledger| delete_strategy_file_inner(ledger, &path, runtime_paths.inner(), "user"));
     // Deleting a file that was already gone changed nothing, so it is not logged.
     if !matches!(result, Ok(false)) {
         record_file_change(
@@ -385,19 +495,21 @@ pub async fn delete_strategy_file(
     result
 }
 
+/// A delete is a tombstone in the ledger (the history stays and the file can be restored or
+/// re-created under the same id), then the working file is removed.
 fn delete_strategy_file_inner(
+    ledger: &Ledger,
     path: &str,
     runtime_paths: &python_runtime::RuntimePaths,
+    actor: &str,
 ) -> Result<bool, String> {
     let full_path = normalize_strategy_path(path, runtime_paths)?;
 
-    if !full_path.exists() {
-        return Ok(false);
+    if full_path.is_dir() {
+        return Err(format!("Failed to delete strategy file {:?}: it is a directory", full_path));
     }
-
-    fs::remove_file(&full_path)
-        .map_err(|e| format!("Failed to delete strategy file {:?}: {e}", full_path))?;
-    Ok(true)
+    versioned_files::delete(ledger, Kind::Strategy, &strategy_id(runtime_paths, &full_path), &full_path, actor)
+        .map_err(|e| format!("Failed to delete strategy file {:?}: {e}", full_path))
 }
 
 #[command]
@@ -425,9 +537,13 @@ pub async fn run_strategy_file(
     }
 
     let started_at = Utc::now();
+    let started_text = started_at.to_rfc3339();
+    let session_path = path.clone();
     let result =
         super::strategy_worker::run(&app, path, params_value, state.inner(), runtime_paths, "user").await;
     let finished_at = Utc::now();
+    // The version the session ran (recorded by the worker when it started).
+    let provenance = super::strategy_worker::session_provenance(&session_path, &started_text);
     let (success, output, error) = match result {
         Ok(lines) => (true, lines, None),
         Err(error) => (false, Vec::new(), Some(error)),
@@ -439,6 +555,8 @@ pub async fn run_strategy_file(
         exit_code: Some(if success { 0 } else { 1 }),
         started_at: started_at.to_rfc3339(),
         finished_at: finished_at.to_rfc3339(),
+        strategy_version: provenance.as_ref().map(|p| p.version),
+        strategy_hash: provenance.map(|p| p.hash),
     })
 }
 
@@ -453,7 +571,10 @@ pub async fn run_strategy_backtest(
     let result = run_backtest_inner(request, state.inner(), runtime_paths.inner()).await;
     // A backtest changes nothing, so it is logged without telling panels to reload.
     let (summary, details) = match &result {
-        Ok(r) => (backtest_summary(&target, &symbol, &r.metrics, r.trades.len()), None),
+        Ok(r) => (
+            backtest_summary(&target, &symbol, &r.metrics, r.trades.len()),
+            r.strategy_version.zip(r.strategy_hash.as_ref()).map(|(version, hash)| Provenance { version, hash: hash.clone() }.details("strategy")),
+        ),
         Err(error) => (format!("Backtest of {target} on {symbol} failed"), Some(error.clone())),
     };
     crate::activity::record_info(state.inner(), "user", "strategy.backtest", "strategy", &target, &summary, result.is_ok(), details);
@@ -502,6 +623,16 @@ pub(crate) async fn run_backtest_inner(
         return Err(format!("Strategy file not found: {}", request.path));
     }
 
+    // Pin the exact version being tested (an unsaved external edit becomes a version first). A backtest
+    // trades nothing, so a missing ledger only leaves the version out of the result.
+    let provenance = match versioned_files::ledger().and_then(|ledger| strategy_provenance(ledger, runtime_paths, &request.path)) {
+        Ok(p) => p,
+        Err(error) => {
+            tracing::warn!(path = %request.path, %error, "could not resolve the strategy version for a backtest");
+            None
+        }
+    };
+
     let timeframe = parse_timeframe(&request.timeframe)?;
     let from = parse_date_input(&request.from, false)?;
     let to = parse_date_input(&request.to, true)?;
@@ -530,6 +661,9 @@ pub(crate) async fn run_backtest_inner(
     let symbol_text = request.symbol.trim().to_uppercase();
     let symbol = Symbol(symbol_text.clone());
     let mut notes = vec!["Executed the authored Python on_bar callbacks; long/flat signals only. Signals fill at the current bar close with configured costs.".to_string()];
+    if let Some(p) = &provenance {
+        notes.push(format!("Strategy version {} (sha256 {}).", p.version, p.hash));
+    }
     let (bars, data_source_note) =
         load_backtest_bars(state, &symbol, timeframe.clone(), from, to).await?;
     let bars_analyzed = bars.len();
@@ -610,5 +744,125 @@ pub(crate) async fn run_backtest_inner(
         trades: backtest.trades,
         equity_curve: backtest.equity_curve,
         notes,
+        strategy_version: provenance.as_ref().map(|p| p.version),
+        strategy_hash: provenance.map(|p| p.hash),
     })
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::commands::versioned_files::testutil::{open, tmp, versions};
+    use std::fs;
+
+    #[test]
+    fn create_save_delete_and_recreate_go_through_the_ledger() {
+        let root = tmp("strat-crud");
+        let paths = python_runtime::RuntimePaths::for_test(&root.0);
+        let l = open(&root);
+        let id = "strategies/sub/mom.py";
+
+        let created = create_strategy_file_inner(&l, "sub/mom.py", Some("a = 1\n".into()), &paths, "user").unwrap();
+        assert_eq!((created.path.as_str(), created.content.as_str()), (id, "a = 1\n"));
+        assert!(create_strategy_file_inner(&l, "sub/mom.py", None, &paths, "user").unwrap_err().contains("already exists"));
+
+        save_strategy_file_inner(&l, id, "a = 2\n".into(), &paths, "copilot").unwrap();
+        save_strategy_file_inner(&l, id, "a = 2\n".into(), &paths, "user").unwrap();
+        assert_eq!(fs::read_to_string(root.0.join("strategies/sub/mom.py")).unwrap(), "a = 2\n");
+        assert_eq!(versions(&l, Kind::Strategy, id), [(1, "create".into(), "user".into()), (2, "update".into(), "copilot".into())]);
+
+        assert!(delete_strategy_file_inner(&l, id, &paths, "user").unwrap());
+        assert!(!delete_strategy_file_inner(&l, id, &paths, "user").unwrap());
+        assert!(!root.0.join("strategies/sub/mom.py").exists());
+        assert_eq!(l.history(Kind::Strategy, id).len(), 3);
+
+        let again = create_strategy_file_inner(&l, "sub/mom.py", Some("a = 3\n".into()), &paths, "user").unwrap();
+        assert_eq!(again.content, "a = 3\n");
+        assert_eq!(l.head(Kind::Strategy, id).unwrap().version, 4, "the same object continues");
+        assert_eq!(l.content(Kind::Strategy, id, 2).unwrap(), b"a = 2\n");
+
+        let restored = restore_strategy(&l, &paths, id, 1, "user").unwrap();
+        assert_eq!((restored.version, restored.restored_from), (5, Some(1)));
+        assert_eq!(fs::read_to_string(root.0.join("strategies/sub/mom.py")).unwrap(), "a = 1\n");
+        // The id may be given the way the UI sends it or without the folder prefix.
+        assert_eq!(restore_strategy(&l, &paths, "sub/mom.py", 2, "user").unwrap().version, 6);
+    }
+
+    /// Whether the temp filesystem treats `A` and `a` as one file (macOS APFS by default, Windows).
+    fn case_insensitive(dir: &Path) -> bool {
+        let probe = dir.join("CaseProbe.tmp");
+        fs::write(&probe, b"x").unwrap();
+        let same = dir.join("caseprobe.tmp").exists();
+        let _ = fs::remove_file(&probe);
+        same
+    }
+
+    #[test]
+    fn a_save_under_another_letter_case_continues_the_same_object() {
+        let root = tmp("strat-case");
+        let paths = python_runtime::RuntimePaths::for_test(&root.0);
+        let l = open(&root);
+        fs::create_dir_all(root.0.join("strategies")).unwrap();
+        if !case_insensitive(&root.0.join("strategies")) {
+            eprintln!("skipping: this filesystem is case sensitive, so foo.py and Foo.py are different files");
+            return;
+        }
+        save_strategy_file_inner(&l, "Sub/Foo.py", "v1".into(), &paths, "user").unwrap();
+        let again = save_strategy_file_inner(&l, "sub/foo.py", "v2".into(), &paths, "user").unwrap();
+        assert_eq!(again.path, "strategies/Sub/Foo.py", "the on-disk spelling is the id");
+        assert_eq!(versions(&l, Kind::Strategy, "strategies/Sub/Foo.py").len(), 2);
+        assert!(l.head(Kind::Strategy, "strategies/sub/foo.py").is_none(), "no second object");
+        assert_eq!(strategy_provenance(&l, &paths, "SUB/FOO.py").unwrap().map(|p| p.version), Some(2));
+        assert_eq!(strategy_provenance(&l, &paths, "sub/foo.py").unwrap().map(|p| p.version), Some(2));
+        // Nothing for the next reconcile to record as an outside edit.
+        let summary = versioned_files::reconcile_all(&l, &paths);
+        assert_eq!((summary.adopted, summary.external_edits, summary.removed), (0, 0, 0), "{summary:?}");
+        assert_eq!(l.objects(Kind::Strategy, true).len(), 1);
+    }
+
+    #[test]
+    fn a_new_file_keeps_the_spelling_it_was_given() {
+        let root = tmp("strat-case-new");
+        let paths = python_runtime::RuntimePaths::for_test(&root.0);
+        let l = open(&root);
+        let dto = save_strategy_file_inner(&l, "NewDir/MixedCase.py", "x".into(), &paths, "user").unwrap();
+        assert_eq!(dto.path, "strategies/NewDir/MixedCase.py");
+    }
+
+    #[test]
+    fn path_escapes_are_rejected_as_before_and_record_nothing() {
+        let root = tmp("strat-escape");
+        let paths = python_runtime::RuntimePaths::for_test(&root.0);
+        let l = open(&root);
+        for bad in ["../evil.py", "strategies/../../evil.py", "/tmp/evil.py", "a/../../evil.py", "notes.txt", "", "strategies/"] {
+            assert!(create_strategy_file_inner(&l, bad, None, &paths, "user").is_err(), "create {bad:?}");
+            assert!(save_strategy_file_inner(&l, bad, "x".into(), &paths, "user").is_err(), "save {bad:?}");
+            assert!(delete_strategy_file_inner(&l, bad, &paths, "user").is_err(), "delete {bad:?}");
+            assert!(restore_strategy(&l, &paths, bad, 1, "user").is_err(), "restore {bad:?}");
+        }
+        assert!(l.objects(Kind::Strategy, true).is_empty());
+        assert!(!root.0.join("evil.py").exists() && !std::env::temp_dir().join("evil.py").exists());
+    }
+
+    #[test]
+    fn provenance_and_result_fields_carry_the_version_and_hash() {
+        let root = tmp("strat-prov");
+        let paths = python_runtime::RuntimePaths::for_test(&root.0);
+        let l = open(&root);
+        save_strategy_file_inner(&l, "mom.py", "v1".into(), &paths, "user").unwrap();
+        let p = strategy_provenance(&l, &paths, "mom.py").unwrap().unwrap();
+        assert_eq!((p.version, p.hash.clone()), (1, crate::ledger::Ledger::sha256_hex(b"v1")));
+        assert_eq!(strategy_provenance(&l, &paths, "strategies/mom.py").unwrap(), Some(p.clone()));
+        assert!(strategy_provenance(&l, &paths, "../x.py").is_err());
+        assert_eq!(strategy_provenance(&l, &paths, "other.py").unwrap(), None);
+
+        let dto = StrategyExecutionResultDto {
+            success: true, output: vec![], error: None, exit_code: Some(0), started_at: String::new(), finished_at: String::new(),
+            strategy_version: Some(p.version), strategy_hash: Some(p.hash.clone()),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!((json["strategy_version"].as_u64(), json["strategy_hash"].as_str()), (Some(1), Some(p.hash.as_str())));
+        let bare = StrategyExecutionResultDto { strategy_version: None, strategy_hash: None, ..dto };
+        assert!(serde_json::to_value(&bare).unwrap().get("strategy_version").is_none(), "absent when unknown");
+    }
 }

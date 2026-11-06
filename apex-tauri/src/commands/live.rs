@@ -32,13 +32,13 @@ pub async fn set_live_armed(
             return Err("Unlock the vault before arming live trading.".into());
         }
     }
-    state.live_guard.set_armed(armed);
+    state.set_live_armed_audited(armed, "user", "ui")?;
     Ok(status(&state))
 }
 
 /// Emergency stop: disarm, halt trading and cancel all working live orders.
 #[tauri::command]
 pub async fn kill_switch(state: State<'_, AppState>) -> Result<KillSwitchResultDto, String> {
-    let (cancelled, failed) = state.kill_switch().await;
+    let (cancelled, failed) = state.kill_switch_as("user").await;
     Ok(KillSwitchResultDto { cancelled, failed })
 }

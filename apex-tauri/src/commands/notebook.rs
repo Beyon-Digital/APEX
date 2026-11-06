@@ -7,6 +7,8 @@ use tauri::State;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::commands::versioned_files;
+use crate::ledger::{Kind, Ledger, VersionRecord};
 use crate::commands::python_runtime::{
     build_python_path, enrich_python_error, resolve_python_executable, RuntimePaths,
 };
@@ -22,6 +24,8 @@ pub async fn list_notebooks(
     runtime_paths: State<'_, RuntimePaths>,
 ) -> Result<Vec<NotebookSummaryDto>, String> {
     let root = notebooks_root(&runtime_paths)?;
+    // An edit made outside the app becomes a version the next time the user looks.
+    versioned_files::reconcile_for_listing(&runtime_paths, Kind::Notebook);
     let mut entries = Vec::new();
 
     for entry in fs::read_dir(&root).map_err(|error| {
@@ -111,7 +115,7 @@ pub async fn create_notebook(
         updated_at: Utc::now().to_rfc3339(),
     };
 
-    save_notebook_to_path(&notebook_path, &notebook, runtime_paths.work_root())?;
+    save_notebook_to_path(versioned_files::ledger()?, &notebook_path, &notebook, runtime_paths.work_root(), "user")?;
     read_notebook(&notebook_path, runtime_paths.work_root())
 }
 
@@ -121,7 +125,7 @@ pub async fn save_notebook(
     runtime_paths: State<'_, RuntimePaths>,
 ) -> Result<NotebookDocumentDto, String> {
     let notebook_path = resolve_notebook_path(&runtime_paths, &notebook.path)?;
-    save_notebook_to_path(&notebook_path, &notebook, runtime_paths.work_root())?;
+    save_notebook_to_path(versioned_files::ledger()?, &notebook_path, &notebook, runtime_paths.work_root(), "user")?;
     read_notebook(&notebook_path, runtime_paths.work_root())
 }
 
@@ -278,10 +282,20 @@ fn read_notebook(path: &Path, work_root: &Path) -> Result<NotebookDocumentDto, S
     Ok(notebook)
 }
 
+/// The ledger object id of a notebook: its path relative to the work root (`notebooks/x.apexnb.json`).
+fn notebook_id(path: &Path, work_root: &Path) -> String {
+    path.strip_prefix(work_root).unwrap_or(path).to_string_lossy().replace('\\', "/")
+}
+
+/// Save a notebook as the next version of its path in the audit ledger and mirror it to the file.
+/// `updated_at` is stamped on every save, so a save that changes nothing else keeps the old stamp
+/// and adds no version.
 fn save_notebook_to_path(
+    ledger: &Ledger,
     path: &Path,
     notebook: &NotebookDocumentDto,
     work_root: &Path,
+    actor: &str,
 ) -> Result<(), String> {
     let mut normalized = notebook.clone();
     normalized.title = if normalized.title.trim().is_empty() {
@@ -296,10 +310,28 @@ fn save_notebook_to_path(
         .to_string();
     normalized.updated_at = Utc::now().to_rfc3339();
 
+    if let Ok(raw) = fs::read_to_string(path) {
+        if let Ok(old) = serde_json::from_str::<NotebookDocumentDto>(&raw) {
+            let mut same = normalized.clone();
+            same.updated_at = old.updated_at.clone();
+            if serde_json::to_value(&same).ok() == serde_json::to_value(&old).ok() {
+                normalized.updated_at = old.updated_at;
+            }
+        }
+    }
+
     let json = serde_json::to_string_pretty(&normalized)
         .map_err(|error| format!("Failed to serialize notebook {}: {error}", path.display()))?;
-    fs::write(path, json)
+    versioned_files::save(ledger, Kind::Notebook, &notebook_id(path, work_root), path, json.as_bytes(), actor)
+        .map(|_| ())
         .map_err(|error| format!("Failed to save notebook {}: {error}", path.display()))
+}
+
+/// Restore an older version of a notebook as a new version and rewrite the file.
+#[allow(dead_code)]
+pub(crate) fn restore_notebook(ledger: &Ledger, runtime_paths: &RuntimePaths, id: &str, version: u32, actor: &str) -> Result<VersionRecord, String> {
+    let path = resolve_notebook_path(runtime_paths, id)?;
+    versioned_files::restore(ledger, Kind::Notebook, &notebook_id(&path, runtime_paths.work_root()), &path, version, actor)
 }
 
 fn is_notebook_path(path: &Path) -> bool {
@@ -371,12 +403,38 @@ mod tests {
             cells: vec![],
             updated_at: Utc::now().to_rfc3339(),
         };
-        save_notebook_to_path(&file, &doc, paths.work_root()).unwrap();
+        save_notebook_to_path(versioned_files::ledger().unwrap(), &file, &doc, paths.work_root(), "user").unwrap();
 
         let listed = read_notebook(&file, paths.work_root()).unwrap().path;
         assert_eq!(listed, "notebooks/research.apexnb.json");
         let again = resolve_notebook_path(&paths, &listed).unwrap();
         assert!(read_notebook(&again, paths.work_root()).is_ok());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn notebook_saves_are_versions_and_an_unchanged_save_is_a_noop() {
+        use crate::commands::versioned_files::testutil::{open, tmp, versions};
+        let root = tmp("nb");
+        let paths = RuntimePaths::for_test(&root.0);
+        let l = open(&root);
+        let file = resolve_notebook_path(&paths, "ideas/a.apexnb.json").unwrap();
+        let id = "notebooks/ideas/a.apexnb.json";
+        let cell = |text: &str| NotebookCellDto { id: "c1".into(), kind: "code".into(), content: text.into(), output: None };
+        let doc = |text: &str| NotebookDocumentDto { title: "a".into(), path: String::new(), cells: vec![cell(text)], updated_at: Utc::now().to_rfc3339() };
+
+        save_notebook_to_path(&l, &file, &doc("print(1)"), paths.work_root(), "user").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        save_notebook_to_path(&l, &file, &doc("print(1)"), paths.work_root(), "user").unwrap();
+        assert_eq!(l.history(Kind::Notebook, id).len(), 1, "only the timestamp differed");
+        save_notebook_to_path(&l, &file, &doc("print(2)"), paths.work_root(), "user").unwrap();
+        assert_eq!(versions(&l, Kind::Notebook, id).len(), 2);
+        assert_eq!(read_notebook(&file, paths.work_root()).unwrap().cells[0].content, "print(2)");
+        assert_eq!(read_notebook(&file, paths.work_root()).unwrap().path, id);
+
+        let restored = restore_notebook(&l, &paths, id, 1, "user").unwrap();
+        assert_eq!((restored.version, restored.restored_from), (3, Some(1)));
+        assert_eq!(read_notebook(&file, paths.work_root()).unwrap().cells[0].content, "print(1)");
+        assert!(restore_notebook(&l, &paths, "../x.apexnb.json", 1, "user").is_err());
     }
 }

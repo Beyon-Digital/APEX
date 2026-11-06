@@ -9,7 +9,9 @@
 //!   for the contract. A file is arbitrary local code, exactly like a strategy file.
 
 use super::python_runtime::{self, RuntimePaths};
+use super::versioned_files;
 use crate::dto::{AlgorithmDto, EstimatorFileDto, ParamDefDto};
+use crate::ledger::{Kind, Ledger, VersionRecord};
 use crate::state::AppState;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -479,8 +481,8 @@ pub(crate) fn list_files(work_root: &Path) -> Vec<EstimatorFileDto> {
     out
 }
 
-/// Write an estimator file atomically (temp file in the same directory, then rename).
-pub(crate) fn write_file(work_root: &Path, name: &str, content: &str) -> Result<EstimatorFileDto, String> {
+/// The rules every estimator file must satisfy before it is saved.
+fn check_content(name: &str, content: &str) -> Result<(), String> {
     validate_estimator_name(name)?;
     if content.len() > MAX_ESTIMATOR_BYTES {
         return Err(format!(
@@ -495,7 +497,11 @@ pub(crate) fn write_file(work_root: &Path, name: &str, content: &str) -> Result<
     if !defines_make_estimator(content) {
         return Err("The file must define make_estimator(params) at the top level, returning a scikit-learn style classifier with fit and predict".into());
     }
-    let _guard = ESTIMATOR_FILES.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(())
+}
+
+/// The estimators folder (created) and the target file inside it; refuses to go through a link.
+fn prepare_target(work_root: &Path, name: &str) -> Result<(PathBuf, PathBuf), String> {
     let dir = estimators_dir(work_root);
     if is_symlink(&dir) {
         return Err("The estimators folder is a symbolic link; refusing to write through it".into());
@@ -505,6 +511,32 @@ pub(crate) fn write_file(work_root: &Path, name: &str, content: &str) -> Result<
     if is_symlink(&target) {
         return Err(format!("{name} is a symbolic link; refusing to write through it"));
     }
+    Ok((dir, target))
+}
+
+/// Save an estimator file as the next version of `name` in the audit ledger and mirror it to the
+/// estimators folder (temp file, ledger, atomic rename). Identical content is a no-op. If the ledger
+/// write fails the file keeps its previous content. `actor` is "user" or "copilot".
+pub(crate) fn write_file_audited(
+    ledger: &Ledger,
+    work_root: &Path,
+    name: &str,
+    content: &str,
+    actor: &str,
+) -> Result<(EstimatorFileDto, VersionRecord), String> {
+    check_content(name, content)?;
+    let _guard = ESTIMATOR_FILES.lock().unwrap_or_else(|p| p.into_inner());
+    let (_, target) = prepare_target(work_root, name)?;
+    let record = versioned_files::save(ledger, Kind::Estimator, name, &target, content.as_bytes(), actor)?;
+    Ok((describe(&target, name, content.to_string()), record))
+}
+
+/// Raw atomic write with no ledger. Tests only: the app has no unaudited write path.
+#[cfg(test)]
+pub(crate) fn write_file(work_root: &Path, name: &str, content: &str) -> Result<EstimatorFileDto, String> {
+    check_content(name, content)?;
+    let _guard = ESTIMATOR_FILES.lock().unwrap_or_else(|p| p.into_inner());
+    let (dir, target) = prepare_target(work_root, name)?;
     let tmp = dir.join(format!(".{name}.tmp"));
     fs::write(&tmp, content).map_err(|e| format!("Failed to write {name}: {e}"))?;
     if let Err(e) = fs::rename(&tmp, &target) {
@@ -514,7 +546,27 @@ pub(crate) fn write_file(work_root: &Path, name: &str, content: &str) -> Result<
     Ok(describe(&target, name, content.to_string()))
 }
 
-/// Delete an estimator file. Returns whether it existed. Models trained with it keep their own copy.
+/// Delete an estimator file as a tombstone in the audit ledger (its history stays, and saving the
+/// same name again continues the same object). Returns whether a file was removed. Models trained
+/// with it keep their own copy.
+pub(crate) fn remove_file_audited(ledger: &Ledger, work_root: &Path, name: &str, actor: &str) -> Result<bool, String> {
+    validate_estimator_name(name)?;
+    let _guard = ESTIMATOR_FILES.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = estimators_dir(work_root);
+    if is_symlink(&dir) {
+        return Err("The estimators folder is a symbolic link; refusing to delete through it".into());
+    }
+    let target = dir.join(name);
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_dir() => Err(format!("{name} is not a file")),
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!("{name} is a symbolic link; refusing to delete it")),
+        // A missing file still goes through the ledger so a removal made outside the app is recorded.
+        _ => versioned_files::delete(ledger, Kind::Estimator, name, &target, actor),
+    }
+}
+
+/// Raw delete with no ledger. Tests only.
+#[cfg(test)]
 pub(crate) fn remove_file(work_root: &Path, name: &str) -> Result<bool, String> {
     validate_estimator_name(name)?;
     let _guard = ESTIMATOR_FILES.lock().unwrap_or_else(|p| p.into_inner());
@@ -528,6 +580,38 @@ pub(crate) fn remove_file(work_root: &Path, name: &str) -> Result<bool, String> 
         Ok(meta) if meta.is_dir() => Err(format!("{name} is not a file")),
         Ok(_) => fs::remove_file(&target).map(|_| true).map_err(|e| format!("Failed to delete {name}: {e}")),
     }
+}
+
+/// Restore an older version of an estimator as a new version and rewrite the file.
+/// Fails for a version that was a delete marker or is not stored in the ledger.
+#[allow(dead_code)]
+pub(crate) fn restore_estimator(ledger: &Ledger, work_root: &Path, name: &str, version: u32, actor: &str) -> Result<VersionRecord, String> {
+    validate_estimator_name(name)?;
+    let _guard = ESTIMATOR_FILES.lock().unwrap_or_else(|p| p.into_inner());
+    let (_, target) = prepare_target(work_root, name)?;
+    versioned_files::restore(ledger, Kind::Estimator, name, &target, version, actor)
+}
+
+/// The ledger's current version and content hash (sha256 of the file) of an estimator, for the
+/// training activity entry. `None` when the estimator is unknown to the ledger or deleted.
+/// This reads the ledger only; use [`estimator_head_synced`] right before training so an edit made
+/// outside the app is recorded as a version first.
+#[allow(dead_code)]
+pub fn estimator_head(ledger: &Ledger, name: &str) -> Option<(u32, String)> {
+    let head = ledger.head(Kind::Estimator, name)?;
+    if head.is_tombstone() {
+        return None;
+    }
+    Some((head.version, head.content_hash?))
+}
+
+/// Like [`estimator_head`], after recording any unsaved external edit of the file as a version.
+#[allow(dead_code)]
+pub fn estimator_head_synced(ledger: &Ledger, work_root: &Path, name: &str) -> Option<(u32, String)> {
+    validate_estimator_name(name).ok()?;
+    let target = estimators_dir(work_root).join(name);
+    let head = versioned_files::resolve_head(ledger, Kind::Estimator, name, &target).ok()??;
+    Some((head.version, head.hash))
 }
 
 /// The absolute path of an existing estimator file, for the trainer.
@@ -577,18 +661,21 @@ pub(crate) fn save_inner(
     content: &str,
     actor: &str,
 ) -> Result<EstimatorFileDto, String> {
-    let result = write_file(work_root, name, content);
+    let result = versioned_files::ledger().and_then(|ledger| write_file_audited(ledger, work_root, name, content, actor));
     match &result {
-        Ok(_) => crate::activity::record(state, actor, "estimator.save", "system", name, &format!("Saved estimator {name}"), true, None),
+        Ok((_, record)) => crate::activity::record(
+            state, actor, "estimator.save", "system", name, &format!("Saved estimator {name}"), true,
+            Some(format!("estimator_version={} estimator_hash={}", record.version, record.content_hash.as_deref().unwrap_or(""))),
+        ),
         Err(error) => crate::activity::record(
             state, actor, "estimator.save", "system", name, &format!("Saving estimator {name} failed"), false, Some(error.clone()),
         ),
     }
-    result
+    result.map(|(dto, _)| dto)
 }
 
 pub(crate) fn delete_inner(state: &AppState, work_root: &Path, name: &str, actor: &str) -> Result<bool, String> {
-    let result = remove_file(work_root, name);
+    let result = versioned_files::ledger().and_then(|ledger| remove_file_audited(ledger, work_root, name, actor));
     match &result {
         Ok(true) => crate::activity::record(state, actor, "estimator.delete", "system", name, &format!("Deleted estimator {name}"), true, None),
         Ok(false) => {}
@@ -601,6 +688,8 @@ pub(crate) fn delete_inner(state: &AppState, work_root: &Path, name: &str, actor
 
 #[tauri::command]
 pub async fn list_estimator_files(runtime_paths: State<'_, RuntimePaths>) -> Result<Vec<EstimatorFileDto>, String> {
+    // An edit made outside the app becomes a version the next time the user looks.
+    versioned_files::reconcile_for_listing(runtime_paths.inner(), Kind::Estimator);
     Ok(list_files(runtime_paths.work_root()))
 }
 
@@ -831,5 +920,70 @@ mod tests {
         let wire = serde_json::to_value(&parsed).unwrap();
         assert_eq!(wire[0]["params"][0]["type"], "int", "the field is called `type` on the wire");
         assert!(wire[0]["params"][1].get("min").is_none());
+    }
+
+    mod audited {
+        use super::*;
+        use crate::commands::versioned_files::testutil::{open, tmp, versions};
+
+        #[test]
+        fn saves_are_versions_deletes_are_tombstones_and_the_head_is_reported() {
+            let root = tmp("est");
+            let l = open(&root);
+            let work = root.0.as_path();
+            let (dto, v1) = write_file_audited(&l, work, "mine.py", GOOD, "user").unwrap();
+            assert_eq!((dto.path.as_str(), v1.version, v1.action.as_str()), ("estimators/mine.py", 1, "create"));
+            let edited = format!("# v2\n{GOOD}");
+            let (_, v2) = write_file_audited(&l, work, "mine.py", &edited, "copilot").unwrap();
+            assert_eq!((v2.version, v2.actor.as_str(), v2.summary.as_str()), (2, "copilot", "Saved mine.py (+1 lines)"));
+            let (_, same) = write_file_audited(&l, work, "mine.py", &edited, "user").unwrap();
+            assert_eq!(same, v2, "identical content adds no version");
+            assert_eq!(fs::read_to_string(work.join("estimators/mine.py")).unwrap(), edited);
+
+            let (version, hash) = estimator_head(&l, "mine.py").unwrap();
+            assert_eq!((version, hash.as_str()), (2, crate::ledger::Ledger::sha256_hex(edited.as_bytes()).as_str()));
+            // An unsaved edit made in an editor is pinned as a version before training.
+            std::thread::sleep(Duration::from_millis(30));
+            fs::write(work.join("estimators/mine.py"), format!("# editor\n{GOOD}")).unwrap();
+            assert_eq!(estimator_head_synced(&l, work, "mine.py").unwrap().0, 3);
+
+            assert!(remove_file_audited(&l, work, "mine.py", "user").unwrap());
+            assert!(!remove_file_audited(&l, work, "mine.py", "user").unwrap());
+            assert!(estimator_head(&l, "mine.py").is_none(), "a deleted estimator has no head");
+            assert_eq!(l.history(Kind::Estimator, "mine.py").len(), 4);
+            let (_, back) = write_file_audited(&l, work, "mine.py", GOOD, "user").unwrap();
+            assert_eq!(back.version, 5, "re-creating continues the same object");
+            let restored = restore_estimator(&l, work, "mine.py", 2, "user").unwrap();
+            assert_eq!((restored.version, restored.action.as_str()), (6, "restore"));
+            assert_eq!(fs::read_to_string(work.join("estimators/mine.py")).unwrap(), edited);
+            assert_eq!(versions(&l, Kind::Estimator, "mine.py").len(), 6);
+        }
+
+        #[test]
+        fn bad_names_and_content_are_rejected_before_the_ledger_is_touched() {
+            let root = tmp("est-bad");
+            let l = open(&root);
+            for bad in ["../x.py", "a/b.py", "Bad Name.py", "x.txt", ""] {
+                assert!(write_file_audited(&l, &root.0, bad, GOOD, "user").is_err(), "{bad:?}");
+                assert!(remove_file_audited(&l, &root.0, bad, "user").is_err(), "{bad:?}");
+                assert!(restore_estimator(&l, &root.0, bad, 1, "user").is_err(), "{bad:?}");
+            }
+            assert!(write_file_audited(&l, &root.0, "x.py", "garbage", "user").unwrap_err().contains("make_estimator"));
+            assert!(l.objects(Kind::Estimator, true).is_empty());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_linked_file_is_not_written_through_or_deleted() {
+            let root = tmp("est-link");
+            let l = open(&root);
+            fs::create_dir_all(root.0.join("estimators")).unwrap();
+            fs::write(root.0.join("secret.py"), "def make_estimator(p): pass\n").unwrap();
+            std::os::unix::fs::symlink(root.0.join("secret.py"), root.0.join("estimators/linked.py")).unwrap();
+            assert!(write_file_audited(&l, &root.0, "linked.py", GOOD, "user").is_err());
+            assert!(remove_file_audited(&l, &root.0, "linked.py", "user").is_err());
+            assert!(root.0.join("estimators/linked.py").exists());
+            assert!(l.objects(Kind::Estimator, true).is_empty(), "the target of a link is never read into the ledger");
+        }
     }
 }
