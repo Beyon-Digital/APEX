@@ -122,7 +122,10 @@ pub fn live_involved(name: &str, args: &Value, automation_broker: &dyn Fn(&str) 
     }
 }
 
-/// Whether the call must pause for the user's approval under `mode`.
+/// Whether the call must pause for the user's approval under `mode`. Review pauses for every
+/// write-class call (a custom-estimator run is one, whatever was approved before). Agent pauses
+/// for live-broker calls (including `create_automation` with `allow_short` on a non-paper
+/// broker), live stops and custom-estimator runs whose file content is not yet approved.
 pub fn requires_approval(mode: ChatMode, name: &str, args: &Value, state: &AppState, paths: &RuntimePaths) -> bool {
     match mode {
         // Writes are refused in Ask mode before this is consulted.
@@ -140,6 +143,9 @@ pub fn requires_approval(mode: ChatMode, name: &str, args: &Value, state: &AppSt
             live_involved(name, args, &broker_of)
                 // Stopping a live session closes its position at market.
                 || (name == "stop_strategy" && copilot_tools::needs_approval(name, args, state, paths))
+                // Training with a custom estimator runs arbitrary Python, so even Agent mode asks
+                // unless the user already approved that file's exact content.
+                || copilot_tools::custom_training_needs_approval(name, args, state, paths)
         }
     }
 }
@@ -242,5 +248,88 @@ mod tests {
         assert!(ChatMode::Review.prompt_note().contains("approval"));
         let agent = ChatMode::Agent.prompt_note();
         assert!(agent.contains("live") && agent.contains("approval"));
+    }
+
+    #[test]
+    fn a_short_automation_on_a_live_broker_is_a_live_action() {
+        let short = |broker: Option<&str>| {
+            let mut args = json!({"name": "m", "symbol": "TCS.NS", "model_id": "m1", "allow_short": true});
+            if let Some(b) = broker {
+                args["broker_id"] = json!(b);
+            }
+            args
+        };
+        assert!(live_involved("create_automation", &short(Some("zerodha")), &none));
+        assert!(live_involved("create_automation", &short(Some("binance")), &none));
+        assert!(!live_involved("create_automation", &short(Some("paper")), &none));
+        assert!(!live_involved("create_automation", &short(None), &none));
+    }
+
+    #[test]
+    fn the_new_data_and_estimator_tools_are_classified_and_ask_hides_the_writes() {
+        let reads = ["check_expression", "list_symbol_data", "list_algorithms", "list_estimator_files"];
+        let writes = ["fetch_symbol_history", "save_estimator_file", "delete_estimator_file"];
+        for t in reads {
+            assert!(!is_write_tool(t), "{t} only reads");
+        }
+        for t in writes {
+            assert!(is_write_tool(t), "{t} changes state");
+        }
+        let all = Value::Array(copilot_tools::extra_tool_schemas());
+        let names = |v: &Value| -> Vec<String> {
+            v.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str().map(String::from)).collect()
+        };
+        let ask = names(&tools_for_mode(all.clone(), ChatMode::Ask));
+        for t in reads {
+            assert!(ask.contains(&t.to_string()), "{t} stays in Ask");
+        }
+        for t in writes {
+            assert!(!ask.contains(&t.to_string()), "{t} hidden in Ask");
+            assert!(names(&all).contains(&t.to_string()), "{t} exists");
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_training_needs_approval_in_review_and_agent_until_trusted_and_is_refused_in_ask() {
+        let (state, paths) = copilot_tools::test_support::state("mode-custom").await;
+        copilot_tools::test_support::write_estimator(&paths, "mine.py", copilot_tools::test_support::ESTIMATOR);
+        let custom = json!({"algorithm": "custom", "dataset": "d", "estimator_file": "mine.py"});
+        let plain = json!({"algorithm": "random_forest", "dataset": "d"});
+        let gated = |mode, args: &Value| requires_approval(mode, "train_ml_model", args, &state, &paths);
+
+        assert!(refused_in_ask("train_ml_model", &custom, &state, &paths), "Ask refuses custom training");
+        assert!(refused_in_ask("train_ml_model", &plain, &state, &paths), "Ask refuses all training");
+        assert!(gated(ChatMode::Review, &custom));
+        assert!(gated(ChatMode::Agent, &custom), "Agent mode still asks before running new Python");
+        assert!(!gated(ChatMode::Agent, &plain), "ordinary paper research runs freely in Agent mode");
+        assert!(gated(ChatMode::Review, &plain));
+
+        // Written by the Copilot: still unapproved.
+        copilot_tools::note_estimator_authored(&state, "mine.py", copilot_tools::test_support::ESTIMATOR);
+        assert!(gated(ChatMode::Agent, &custom));
+        // Approved once: Agent runs it without asking again, Review keeps its blanket rule.
+        copilot_tools::trust_estimator(&state, &custom, &paths);
+        assert!(!gated(ChatMode::Agent, &custom));
+        assert!(gated(ChatMode::Review, &custom));
+        // Still refused in Ask whatever was approved.
+        assert!(refused_in_ask("train_ml_model", &custom, &state, &paths));
+        // An edit puts the gate back.
+        copilot_tools::test_support::write_estimator(&paths, "mine.py", "def make_estimator(params):\n    return 3\n");
+        assert!(gated(ChatMode::Agent, &custom));
+    }
+
+    #[tokio::test]
+    async fn a_short_automation_needs_approval_in_every_non_ask_mode_on_a_live_broker() {
+        let (state, paths) = copilot_tools::test_support::state("mode-short").await;
+        let live = json!({"name": "m", "symbol": "TCS.NS", "model_id": "m1", "allow_short": true, "broker_id": "zerodha"});
+        let paper = json!({"name": "m", "symbol": "TCS.NS", "model_id": "m1", "allow_short": true});
+        for mode in [ChatMode::Review, ChatMode::Agent] {
+            assert!(requires_approval(mode, "create_automation", &live, &state, &paths), "{mode:?} live short");
+        }
+        // Paper: Review asks as for every write; Agent runs paper actions on its own.
+        assert!(requires_approval(ChatMode::Review, "create_automation", &paper, &state, &paths));
+        assert!(!requires_approval(ChatMode::Agent, "create_automation", &paper, &state, &paths));
+        assert!(refused_in_ask("create_automation", &live, &state, &paths));
+        assert!(refused_in_ask("create_automation", &paper, &state, &paths));
     }
 }

@@ -590,7 +590,11 @@ impl BrokerRuntimeEntry {
         Ok(())
     }
 
-    pub(crate) fn to_dto(&self, broker_id: &str) -> crate::dto::BrokerConnectionDto {
+    pub(crate) fn to_dto(
+        &self,
+        broker_id: &str,
+        allow_live_shorting: bool,
+    ) -> crate::dto::BrokerConnectionDto {
         let (status, message) = self.status_and_message();
 
         crate::dto::BrokerConnectionDto {
@@ -604,6 +608,7 @@ impl BrokerRuntimeEntry {
             market_data_available: self.market_data_available,
             token_field_label: self.token_label.unwrap_or("").to_string(),
             message,
+            can_short: crate::commands::signal_policy::broker_can_short(broker_id, allow_live_shorting),
         }
     }
 }

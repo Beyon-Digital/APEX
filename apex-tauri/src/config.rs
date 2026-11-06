@@ -245,6 +245,11 @@ pub struct AutomationsConfig {
     /// paper adapter; live broker ids are rejected.
     #[serde(default)]
     pub allow_live_trading: bool,
+    /// When false (the default), automations may short only on the paper broker. A live rule
+    /// with shorting enabled is refused at run time. Live shorting also needs
+    /// `allow_live_trading`, armed live trading, and a broker that supports it.
+    #[serde(default)]
+    pub allow_live_shorting: bool,
     /// Cap on orders a single rule may place per UTC day.
     #[serde(default = "default_max_orders_per_day")]
     pub max_orders_per_day: u32,
@@ -255,6 +260,7 @@ impl Default for AutomationsConfig {
         Self {
             enabled: true,
             allow_live_trading: false,
+            allow_live_shorting: false,
             max_orders_per_day: default_max_orders_per_day(),
         }
     }

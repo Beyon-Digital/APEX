@@ -36,6 +36,10 @@ pub struct AutomationRule {
     /// Minimum class probability required to place the order (0–1).
     pub threshold: f64,
     pub broker_id: String,
+    /// Opt-in to short selling: when true the rule may open a short instead of staying flat on
+    /// a bearish signal. Rules saved before shorting existed load as false.
+    #[serde(default)]
+    pub allow_short: bool,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub last_run_at: Option<DateTime<Utc>>,
@@ -180,6 +184,7 @@ impl AutomationEngine {
         quantity: f64,
         threshold: f64,
         broker_id: String,
+        allow_short: bool,
     ) -> AutomationRule {
         let rule = AutomationRule {
             id: Uuid::new_v4().to_string(),
@@ -191,6 +196,7 @@ impl AutomationEngine {
             quantity,
             threshold: threshold.clamp(0.0, 1.0),
             broker_id,
+            allow_short,
             enabled: true,
             created_at: Utc::now(),
             last_run_at: None,
@@ -219,6 +225,20 @@ impl AutomationEngine {
         match rules.get_mut(id) {
             Some(r) => {
                 r.enabled = enabled;
+                drop(rules);
+                self.save();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Allow or forbid short selling for a rule. False when the rule does not exist.
+    pub fn set_allow_short(&self, id: &str, allow: bool) -> bool {
+        let mut rules = self.rules.write().unwrap();
+        match rules.get_mut(id) {
+            Some(r) => {
+                r.allow_short = allow;
                 drop(rules);
                 self.save();
                 true
@@ -298,6 +318,7 @@ mod tests {
             5.0,
             0.6,
             "paper".into(),
+            false,
         );
         assert_eq!(e.list().len(), 1);
         assert!(path.exists());
@@ -318,6 +339,7 @@ mod tests {
             1.0,
             0.5,
             "paper".into(),
+            false,
         );
         assert!(r.is_due(Utc::now()));
         e.record_run(&r.id, "ok".into());
@@ -341,6 +363,7 @@ mod tests {
             2.0,
             0.5,
             "paper".into(),
+            false,
         );
         let e2 = AutomationEngine::new(path.clone());
         assert_eq!(e2.list().len(), 1);
@@ -360,6 +383,7 @@ mod tests {
             1.0,
             0.5,
             "paper".into(),
+            false,
         );
         assert!(e.can_place_today(&r.id, 2));
         e.record_order(&r.id);
@@ -369,6 +393,50 @@ mod tests {
         let e2 = AutomationEngine::new(path.clone());
         assert!(!e2.can_place_today(&r.id, 2));
         assert!(e2.can_place_today(&r.id, 3));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rules_saved_before_shorting_load_as_not_allowed_to_short() {
+        let dir = std::env::temp_dir().join(format!("apex-auto-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("automations.json");
+        // A rule exactly as an older build wrote it: no `allow_short` key.
+        std::fs::write(
+            &path,
+            r#"[{"id":"old","name":"legacy","kind":"model_signal","symbol":"AAPL","model_id":"m",
+            "interval_secs":60,"quantity":2.0,"threshold":0.5,"broker_id":"paper","enabled":true,
+            "created_at":"2025-01-01T00:00:00Z","last_run_at":null,"last_result":null}]"#,
+        )
+        .unwrap();
+        let e = AutomationEngine::new(path);
+        let rules = e.list();
+        assert_eq!(rules.len(), 1);
+        assert!(!rules[0].allow_short);
+        assert_eq!(rules[0].orders_today, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allow_short_is_stored_toggled_and_persisted() {
+        let (e, path) = engine();
+        let r = e.add_rule(
+            "s".into(),
+            AutomationKind::ModelSignal,
+            "AAPL".into(),
+            "m".into(),
+            60,
+            1.0,
+            0.5,
+            "paper".into(),
+            true,
+        );
+        assert!(r.allow_short);
+        assert!(e.set_allow_short(&r.id, false));
+        assert!(!AutomationEngine::new(path.clone()).get(&r.id).unwrap().allow_short);
+        assert!(e.set_allow_short(&r.id, true));
+        assert!(AutomationEngine::new(path.clone()).get(&r.id).unwrap().allow_short);
+        assert!(!e.set_allow_short("missing", true));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

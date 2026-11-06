@@ -3,7 +3,7 @@ use crate::commands::python_runtime;
 use crate::commands::scanner::ScanCriterionDto;
 use crate::commands::strategy::StrategyBacktestRequestDto;
 use crate::commands::copilot_mode::{self, ChatMode};
-use crate::commands::{automation, copilot_more, copilot_tools, data, ml, quant, scanner, strategy};
+use crate::commands::{automation, copilot_more, copilot_tools, data, ml, ml_estimators, quant, scanner, strategy};
 use crate::dto::MLTrainingRequestDto;
 use crate::state::AppState;
 use crate::validation;
@@ -119,7 +119,7 @@ async fn dispatch_tool(
     trace: &mut Vec<ToolCallTrace>,
     pending: &mut Vec<PendingApprovalDto>,
 ) -> Option<Value> {
-    let detail = trace_detail(name, args);
+    let detail = format!("{}{}", trace_detail(name, args), copilot_tools::estimator_card_note(name, args, runtime_paths));
     let refused = mode == ChatMode::Ask && copilot_mode::refused_in_ask(name, args, state, runtime_paths);
     // Ask mode is read-only. The model is not offered write tools, but a call that arrives
     // anyway (a stale tool list, a hallucinated name) is refused here, not executed.
@@ -136,7 +136,9 @@ async fn dispatch_tool(
     }
     let gated = copilot_mode::requires_approval(mode, name, args, state, runtime_paths);
 
-    let key = tool_approval_key(name, args);
+    // A custom-estimator run is approved for the file content the card showed, not for whatever
+    // the file holds later.
+    let key = format!("{}{}", tool_approval_key(name, args), copilot_tools::approval_key_suffix(name, args, runtime_paths));
     let cached = if gated { state.copilot_tool_cache.lock().unwrap().get(&key).cloned() } else { None };
     let approved = gated && state.copilot_approvals.lock().unwrap().contains(&key);
     let gate = copilot_tools::audit::gate(false, gated, cached.is_some(), approved);
@@ -403,13 +405,17 @@ fn tool_schemas() -> Value {
             "required": ["symbol"] })),
         ("list_ml_models", "List trained ML models with metrics", json!({
             "type": "object", "properties": {} })),
-        ("train_ml_model", "Train an ML model with time-series cross-validation. Best path: build_dataset, then train_ml_model {algorithm, dataset}. Returns model_id, metrics, trading result against buy and hold, and flags for weak spots; read get_model for per-fold detail. Alternatively give data_path, target_column and feature_columns for a CSV you already have with a label column.", json!({
+        ("train_ml_model", "Train an ML model with time-series cross-validation. Best path: build_dataset, then train_ml_model {algorithm, dataset}. Returns model_id, metrics, trading result against buy and hold, and flags for weak spots; read get_model for per-fold detail. Use holdout_pct to also score a final untouched stretch. Alternatively give data_path, target_column and feature_columns for a CSV you already have with a label column. list_algorithms shows every algorithm with its hyperparameters. algorithm `custom` trains the Python estimator file estimator_file and needs the user's approval.", json!({
             "type": "object", "properties": {
-                "algorithm": {"type": "string", "enum": ["random_forest", "gradient_boosting", "logistic_regression", "xgboost"]},
+                "algorithm": {"type": "string", "enum": ml_estimators::ALGORITHMS},
                 "dataset": {"type": "string", "description": "name of a dataset from build_dataset; supplies data_path, target and features"},
                 "feature_columns": {"type": "array", "items": {"type": "string"}, "description": "optional subset of the dataset's features; required with data_path"},
-                "hyperparams": {"type": "object", "description": "allowed keys per algorithm. random_forest: n_estimators 1-2000, max_depth 1-100 or null, min_samples_leaf 1-1000, max_features sqrt|log2|int|0-1 float, class_weight balanced|balanced_subsample, random_state. gradient_boosting: n_estimators, learning_rate (0,1], max_depth 1-20, subsample (0,1], random_state. xgboost: gradient_boosting keys plus colsample_bytree (0,1]. logistic_regression: C, max_iter, class_weight balanced"},
+                "hyperparams": {"type": "object", "description": "constructor parameters of the algorithm, by name (see list_algorithms for the names and defaults); out-of-range values are rejected with the allowed range. For `custom` they are passed to make_estimator(params)"},
                 "n_splits": {"type": "integer", "default": 5, "description": "time-series CV folds, 2-20"},
+                "trade_mode": {"type": "string", "enum": ["long_flat", "long_short"], "default": "long_flat", "description": "how the evaluation trades the predictions. long_short also shorts the bearish class (direction 0, return_threshold -1); only choose it for a model meant for an automation with allow_short"},
+                "holdout_pct": {"type": "number", "description": "0-40: share of the final time steps kept out of cross-validation and scored once"},
+                "random_state": {"type": "integer", "description": "seed for estimators that take one (default 42)"},
+                "estimator_file": {"type": "string", "description": "with algorithm custom: a file from save_estimator_file, e.g. centroid.py"},
                 "lag_periods": {"type": "array", "items": {"type": "integer"}, "description": "add lagged copies of each feature (1-250). Default none with a dataset, [1] with data_path"},
                 "return_column": {"type": "string", "description": "column holding each row's forward return, used for the trading result; set automatically for datasets"},
                 "data_path": {"type": "string", "description": "CSV path (not needed with dataset)"},
@@ -443,7 +449,7 @@ fn tool_schemas() -> Value {
                 "order_id": {"type": "string"},
                 "broker_id": {"type": "string", "default": "paper"} },
             "required": ["order_id"] })),
-        ("create_automation", "Create a persisted scheduled rule: run model_id's signal on symbol every interval_secs and place quantity via broker_id when probability >= threshold. Defaults to paper.", json!({
+        ("create_automation", "Create a persisted scheduled rule: run model_id's signal on symbol every interval_secs and place quantity via broker_id when probability >= threshold. Defaults to paper. By default it only goes long or flat. allow_short=true lets it sell short on the bearish class; it is refused when the broker cannot short, and on a live broker it needs the user's approval.", json!({
             "type": "object", "properties": {
                 "name": {"type": "string"},
                 "symbol": {"type": "string"},
@@ -451,7 +457,8 @@ fn tool_schemas() -> Value {
                 "interval_secs": {"type": "integer", "default": 300},
                 "quantity": {"type": "number", "default": 1},
                 "threshold": {"type": "number", "default": 0.5},
-                "broker_id": {"type": "string", "default": "paper"} },
+                "broker_id": {"type": "string", "default": "paper"},
+                "allow_short": {"type": "boolean", "default": false, "description": "let the rule go short (sell what it does not own) on the model's bearish class. Opt-in: leave false unless the user asked for shorting; try paper first"} },
             "required": ["name", "symbol", "model_id"] })),
         ("list_automations", "List all automation rules with last-run status", json!({
             "type": "object", "properties": {} })),
@@ -508,6 +515,29 @@ fn clamp_limit(v: Option<&Value>, default: usize, max: usize) -> usize {
     v.and_then(|x| x.as_u64())
         .map(|n| (n as usize).clamp(1, max))
         .unwrap_or(default)
+}
+
+/// An optional string argument; present but not a string is an error, not silently dropped.
+fn optional_str(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("`{key}` must be a string")),
+    }
+}
+
+fn optional_number(args: &Value, key: &str) -> Result<Option<f64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_f64().map(Some).ok_or_else(|| format!("`{key}` must be a number")),
+    }
+}
+
+fn optional_integer(args: &Value, key: &str) -> Result<Option<i64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_i64().map(Some).ok_or_else(|| format!("`{key}` must be a whole number")),
+    }
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -806,7 +836,17 @@ async fn exec_tool(
                     .unwrap_or_else(|| if dataset.is_some() { Vec::new() } else { vec![1] }),
                 dataset,
                 return_column: args.get("return_column").and_then(|v| v.as_str()).map(String::from),
+                trade_mode: optional_str(args, "trade_mode")?,
+                holdout_pct: optional_number(args, "holdout_pct")?,
+                estimator_file: optional_str(args, "estimator_file")?,
+                random_state: optional_integer(args, "random_state")?,
             };
+            if req.algorithm == "custom" {
+                // Reaching here means the user approved this run or already approved this exact
+                // file content (see `copilot_mode::requires_approval`). Remember it, so the same
+                // content does not ask again; an edit changes the hash and asks once more.
+                copilot_tools::trust_estimator(state, args, runtime_paths);
+            }
             let r =
                 ml::train_ml_model_inner(req, &models.models_dir, runtime_paths, state, "copilot")
                     .await?;
@@ -978,10 +1018,15 @@ async fn exec_tool(
                     .and_then(|v| v.as_str())
                     .unwrap_or("paper")
                     .to_string(),
+                // Shorting is opt-in: only when the call asks for it. A live broker is gated by
+                // `copilot_mode::live_involved`, and `create_automation_inner` refuses a broker
+                // that cannot short.
+                allow_short: copilot_tools::wants_short(args),
             };
             let created = automation::create_automation_inner(dto, state)?;
             Ok(json!({"created": created.id, "name": created.name,
-                      "broker_id": created.broker_id, "interval_secs": created.interval_secs}))
+                      "broker_id": created.broker_id, "interval_secs": created.interval_secs,
+                      "allow_short": created.allow_short}))
         }
         "list_automations" => {
             let list: Vec<automation::AutomationDto> = state
@@ -1512,8 +1557,14 @@ mod approval_key_tests {
 mod ml_tool_tests {
     use super::*;
 
-    const ML_READ: &[&str] = &["list_feature_catalog", "list_datasets", "preview_dataset", "get_model", "list_ml_models"];
-    const ML_WRITE: &[&str] = &["build_dataset", "delete_dataset", "update_model", "train_ml_model"];
+    const ML_READ: &[&str] = &[
+        "list_feature_catalog", "list_datasets", "preview_dataset", "get_model", "list_ml_models",
+        "check_expression", "list_symbol_data", "list_algorithms", "list_estimator_files",
+    ];
+    const ML_WRITE: &[&str] = &[
+        "build_dataset", "delete_dataset", "update_model", "train_ml_model",
+        "fetch_symbol_history", "save_estimator_file", "delete_estimator_file",
+    ];
 
     fn function<'a>(all: &'a Value, name: &str) -> &'a Value {
         all.as_array()
@@ -1559,9 +1610,61 @@ mod ml_tool_tests {
         // The algorithm list is the one the backend accepts (the old text offered svm and linear_regression).
         let algos: Vec<&str> = train["algorithm"]["enum"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
         for algo in &algos {
-            assert!(crate::validation::validate_algorithm(algo).is_ok(), "{algo} is not a valid algorithm");
+            assert!(ml_estimators::validate_algorithm_id(algo).is_ok(), "{algo} is not a valid algorithm");
         }
-        assert_eq!(algos.len(), 4);
+        assert_eq!(algos, ml_estimators::ALGORITHMS);
+        assert!(algos.contains(&"custom") && algos.contains(&"extra_trees") && algos.contains(&"hist_gradient_boosting"));
+        for field in ["trade_mode", "holdout_pct", "random_state", "estimator_file"] {
+            assert!(train.get(field).is_some(), "train_ml_model should accept `{field}`");
+        }
+        assert_eq!(train["trade_mode"]["enum"], json!(["long_flat", "long_short"]));
+    }
+
+    #[test]
+    fn build_dataset_offers_dates_formulas_context_fee_and_thresholds() {
+        let all = tool_schemas();
+        let props = &function(&all, "build_dataset")["function"]["parameters"]["properties"];
+        for field in ["from", "to", "custom_features", "context_symbols", "fee_pct"] {
+            assert!(props.get(field).is_some(), "build_dataset should accept `{field}`");
+        }
+        for field in ["up_threshold_pct", "down_threshold_pct", "threshold_pct"] {
+            assert!(props["label"]["properties"].get(field).is_some(), "label should accept `{field}`");
+        }
+        let formula = &props["custom_features"]["items"];
+        assert_eq!(formula["required"], json!(["name", "expr"]));
+        // What the schema advertises is what the request type reads.
+        let req = copilot_more::build_request(&json!({
+            "name": "d", "symbols": ["SPY"], "features": [], "from": "2024-01-01", "to": "2024-06-30", "fee_pct": 0.1,
+            "custom_features": [{"name": "gap", "expr": "open / shift(close, 1) - 1"}], "context_symbols": ["QQQ"],
+            "label": {"horizon_bars": 5, "kind": "return_threshold", "up_threshold_pct": 1.0, "down_threshold_pct": 0.5}
+        })).unwrap();
+        assert_eq!((req.from.as_deref(), req.to.as_deref(), req.fee_pct), (Some("2024-01-01"), Some("2024-06-30"), 0.1));
+        assert_eq!((req.custom_features[0].name.as_str(), req.context_symbols.clone()), ("gap", vec!["QQQ".to_string()]));
+        assert_eq!((req.label.up_threshold_pct, req.label.down_threshold_pct), (Some(1.0), Some(0.5)));
+    }
+
+    #[test]
+    fn the_new_tools_have_the_right_required_fields_and_create_automation_takes_allow_short() {
+        let all = tool_schemas();
+        let required = |name: &str| -> Vec<String> {
+            function(&all, name)["function"]["parameters"]["required"]
+                .as_array()
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(required("check_expression"), ["expr", "symbol"]);
+        assert_eq!(required("list_symbol_data"), ["symbols"]);
+        assert_eq!(required("fetch_symbol_history"), ["symbol"]);
+        assert_eq!(required("save_estimator_file"), ["name", "content"]);
+        assert_eq!(required("delete_estimator_file"), ["name"]);
+        assert!(required("list_algorithms").is_empty() && required("list_estimator_files").is_empty());
+        let auto = &function(&all, "create_automation")["function"];
+        assert_eq!(auto["parameters"]["properties"]["allow_short"]["type"], "boolean");
+        assert_eq!(auto["parameters"]["properties"]["allow_short"]["default"], false);
+        assert!(!required("create_automation").contains(&"allow_short".to_string()), "shorting is never required");
+        for name in ML_READ.iter().chain(ML_WRITE) {
+            assert!(function(&all, name)["function"]["description"].as_str().unwrap().len() > 20, "{name}");
+        }
     }
 
     #[test]
@@ -1614,5 +1717,208 @@ mod ml_tool_tests {
             &json!({"algorithm": "xgboost", "data_path": "exports/a.csv", "target_column": "signal"}),
         );
         assert!(csv.contains("exports/a.csv") && csv.contains("signal"), "{csv}");
+    }
+}
+
+#[cfg(test)]
+mod approval_flow_tests {
+    use super::*;
+    use copilot_tools::test_support::{state as test_state, write_estimator, ESTIMATOR};
+
+    type Run = (Option<Value>, Vec<ToolCallTrace>, Vec<PendingApprovalDto>);
+
+    async fn run(state: &AppState, paths: &python_runtime::RuntimePaths, mode: ChatMode, name: &str, args: Value) -> Run {
+        let models = ml::ModelRegistry::new(paths);
+        let (mut trace, mut pending) = (Vec::new(), Vec::new());
+        let out = dispatch_tool(name, &args, state, &models, paths, mode, &mut trace, &mut pending).await;
+        (out, trace, pending)
+    }
+
+    fn custom(file: &str) -> Value {
+        json!({"algorithm": "custom", "dataset": "d", "estimator_file": file})
+    }
+
+    #[tokio::test]
+    async fn agent_mode_pauses_a_custom_run_and_the_card_shows_the_code() {
+        let (state, paths) = test_state("flow-custom").await;
+        write_estimator(&paths, "mine.py", ESTIMATOR);
+        let (out, trace, pending) = run(&state, &paths, ChatMode::Agent, "train_ml_model", custom("mine.py")).await;
+        assert!(out.is_none(), "nothing may run before approval");
+        assert_eq!(pending.len(), 1);
+        let hash = copilot_tools::content_hash(ESTIMATOR);
+        assert!(pending[0].detail.contains(&hash) && pending[0].detail.contains("make_estimator"), "{}", pending[0].detail);
+        assert!(pending[0].detail.contains("custom estimator mine.py"), "{}", pending[0].detail);
+        assert!(pending[0].key.contains("#estimator="), "{}", pending[0].key);
+        assert!(trace[0].detail.ends_with("awaiting approval"), "{}", trace[0].detail);
+    }
+
+    #[tokio::test]
+    async fn an_approval_does_not_carry_over_to_edited_estimator_content() {
+        let (state, paths) = test_state("flow-edit").await;
+        write_estimator(&paths, "mine.py", ESTIMATOR);
+        let (_, _, pending) = run(&state, &paths, ChatMode::Review, "train_ml_model", custom("mine.py")).await;
+        let approved_key = pending[0].key.clone();
+        state.copilot_approvals.lock().unwrap().insert(approved_key.clone());
+        // The file changes after the user looked at the card.
+        write_estimator(&paths, "mine.py", "import os\ndef make_estimator(params):\n    os.system('x')\n");
+        let (out, _, pending) = run(&state, &paths, ChatMode::Review, "train_ml_model", custom("mine.py")).await;
+        assert!(out.is_none(), "the old approval must not run the new code");
+        assert_eq!(pending.len(), 1);
+        assert_ne!(pending[0].key, approved_key);
+        assert!(pending[0].detail.contains("import os"), "{}", pending[0].detail);
+    }
+
+    #[tokio::test]
+    async fn ask_mode_refuses_custom_training_and_every_new_write_tool() {
+        let (state, paths) = test_state("flow-ask").await;
+        write_estimator(&paths, "mine.py", ESTIMATOR);
+        for (name, args) in [
+            ("train_ml_model", custom("mine.py")),
+            ("save_estimator_file", json!({"name": "x.py", "content": ESTIMATOR})),
+            ("delete_estimator_file", json!({"name": "mine.py"})),
+            ("fetch_symbol_history", json!({"symbol": "SPY"})),
+        ] {
+            let (out, trace, pending) = run(&state, &paths, ChatMode::Ask, name, args).await;
+            let out = out.unwrap_or_else(|| panic!("{name} should answer, not pause"));
+            assert!(out["error"].as_str().unwrap().contains("Ask mode"), "{name}: {out}");
+            assert!(pending.is_empty() && !trace[0].ok, "{name}");
+        }
+        assert!(paths.work_root().join("estimators/mine.py").exists(), "refused calls change nothing");
+        assert!(!paths.work_root().join("estimators/x.py").exists());
+    }
+
+    #[tokio::test]
+    async fn a_live_short_automation_pauses_in_agent_mode_with_short_leading_the_card() {
+        let (state, paths) = test_state("flow-short").await;
+        let args = json!({"name": "m", "symbol": "TCS.NS", "model_id": "m1", "allow_short": true, "broker_id": "zerodha"});
+        for mode in [ChatMode::Agent, ChatMode::Review] {
+            let (out, _, pending) = run(&state, &paths, mode, "create_automation", args.clone()).await;
+            assert!(out.is_none(), "{mode:?}: nothing runs before approval");
+            assert!(pending[0].detail.starts_with("[LIVE zerodha] [SHORT] "), "{}", pending[0].detail);
+        }
+        assert!(state.automations.list().is_empty(), "no rule was created");
+    }
+
+    #[tokio::test]
+    async fn a_paper_short_automation_is_created_with_the_flag_only_when_asked() {
+        let (state, paths) = test_state("flow-paper-short").await;
+        let make = |name: &str, extra: Value| {
+            let mut args = json!({"name": name, "symbol": "SPY", "model_id": "m1"});
+            if !extra.is_null() {
+                args["allow_short"] = extra;
+            }
+            args
+        };
+        // (name, allow_short argument, expected flag on the saved rule)
+        for (name, flag, expected) in [
+            ("asked", json!(true), true),
+            ("declined", json!(false), false),
+            ("silent", Value::Null, false),
+            ("sloppy", json!("true"), false),
+        ] {
+            let (out, _, pending) = run(&state, &paths, ChatMode::Agent, "create_automation", make(name, flag)).await;
+            assert!(pending.is_empty(), "paper actions run in Agent mode");
+            let out = out.unwrap();
+            assert_eq!(out["allow_short"], expected, "{name}: {out}");
+            let rule = state.automations.list().into_iter().find(|r| r.name == name).unwrap();
+            assert_eq!(rule.allow_short, expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn estimator_files_are_saved_listed_and_deleted_and_the_copilot_save_is_not_an_approval() {
+        let (state, paths) = test_state("flow-files").await;
+        let (out, trace, _) = run(&state, &paths, ChatMode::Agent, "save_estimator_file", json!({"name": "mine.py", "content": ESTIMATOR})).await;
+        let out = out.unwrap();
+        assert_eq!(out["saved"], true, "{out}");
+        assert_eq!(out["approved_for_training"], false);
+        assert!(trace[0].ok);
+        assert!(paths.work_root().join("estimators/mine.py").exists());
+        let recorded = state.copilot_trusted_files.lock().unwrap().get("estimators/mine.py").cloned().unwrap();
+        assert!(recorded.starts_with("authored:"), "{recorded}");
+
+        let (listed, _, _) = run(&state, &paths, ChatMode::Ask, "list_estimator_files", json!({})).await;
+        let listed = listed.unwrap();
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["files"][0]["name"], "mine.py");
+        assert_eq!(listed["files"][0]["approved_for_training"], false);
+        assert!(listed["files"][0].get("content").is_none(), "the list stays small");
+        let (one, _, _) = run(&state, &paths, ChatMode::Ask, "list_estimator_files", json!({"name": "mine.py"})).await;
+        assert!(one.unwrap()["content"].as_str().unwrap().contains("make_estimator"));
+
+        copilot_tools::trust_estimator(&state, &custom("mine.py"), &paths);
+        let (listed, _, _) = run(&state, &paths, ChatMode::Ask, "list_estimator_files", json!({})).await;
+        assert_eq!(listed.unwrap()["files"][0]["approved_for_training"], true);
+
+        // A bad file is rejected with the reason; nothing is written or trusted.
+        let (bad, trace, _) = run(&state, &paths, ChatMode::Agent, "save_estimator_file", json!({"name": "../evil.py", "content": ESTIMATOR})).await;
+        assert!(bad.unwrap()["error"].is_string() && !trace[0].ok);
+        let (bad, _, _) = run(&state, &paths, ChatMode::Agent, "save_estimator_file", json!({"name": "nomake.py", "content": "x = 1\n"})).await;
+        assert!(bad.unwrap()["error"].as_str().unwrap().contains("make_estimator"));
+
+        let (gone, _, _) = run(&state, &paths, ChatMode::Agent, "delete_estimator_file", json!({"name": "mine.py"})).await;
+        assert_eq!(gone.unwrap()["deleted"], "mine.py");
+        assert!(!paths.work_root().join("estimators/mine.py").exists());
+        assert!(state.copilot_trusted_files.lock().unwrap().get("estimators/mine.py").is_none(), "approval goes with the file");
+        let (again, _, _) = run(&state, &paths, ChatMode::Agent, "delete_estimator_file", json!({"name": "mine.py"})).await;
+        assert!(again.unwrap()["error"].as_str().unwrap().contains("no estimator file"));
+    }
+
+    #[tokio::test]
+    async fn the_formula_and_data_tools_read_the_same_core_as_the_ui() {
+        let (state, paths) = test_state("flow-data").await;
+        let (bad, _, _) = run(&state, &paths, ChatMode::Ask, "check_expression", json!({"expr": "sma(close, ", "symbol": "SPY"})).await;
+        let bad = bad.unwrap();
+        assert_eq!(bad["ok"], false, "{bad}");
+        assert!(bad["error"].is_string() && bad["error_pos"].is_number(), "{bad}");
+        let (good, _, _) = run(&state, &paths, ChatMode::Ask, "check_expression", json!({"expr": "sma(close, 20) / close - 1", "symbol": "SPY"})).await;
+        let good = good.unwrap();
+        assert_eq!(good["ok"], true, "{good}");
+        assert_eq!(good["warmup_bars"], 19);
+        let (missing, _, _) = run(&state, &paths, ChatMode::Ask, "check_expression", json!({"symbol": "SPY"})).await;
+        assert!(missing.unwrap()["error"].as_str().unwrap().contains("expr"));
+
+        let (listed, _, _) = run(&state, &paths, ChatMode::Ask, "list_symbol_data", json!({"symbols": ["spy", "QQQ"], "timeframe": "1h"})).await;
+        let listed = listed.unwrap();
+        assert_eq!(listed["symbols"][0]["symbol"], "SPY");
+        assert_eq!(listed["symbols"][0]["bars"], 0);
+        assert_eq!(listed["symbols"][1]["timeframe"], "1h");
+        let (none, _, _) = run(&state, &paths, ChatMode::Ask, "list_symbol_data", json!({"symbols": []})).await;
+        assert!(none.unwrap()["error"].is_string());
+
+        // Argument errors are caught before any download starts.
+        for args in [json!({"symbol": "SPY", "bars": 0}), json!({"symbol": "SPY", "bars": "many"}), json!({"symbol": "SPY", "timeframe": "3m"}), json!({})] {
+            let (out, trace, _) = run(&state, &paths, ChatMode::Agent, "fetch_symbol_history", args.clone()).await;
+            assert!(out.unwrap()["error"].is_string() && !trace[0].ok, "{args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_executed_custom_run_trusts_exactly_the_content_it_ran() {
+        let (state, paths) = test_state("flow-trust-on-run").await;
+        write_estimator(&paths, "mine.py", ESTIMATOR);
+        let args = custom("mine.py");
+        assert!(copilot_tools::needs_approval("train_ml_model", &args, &state, &paths));
+        // The dataset does not exist, so training stops early; the run was still approved.
+        let models = ml::ModelRegistry::new(&paths);
+        let err = exec_tool("train_ml_model", &args, &state, &models, &paths).await.unwrap_err();
+        assert!(!err.is_empty());
+        assert!(!copilot_tools::needs_approval("train_ml_model", &args, &state, &paths), "approved content is remembered");
+        // A run with another algorithm touches nothing.
+        let (state2, paths2) = test_state("flow-trust-other").await;
+        write_estimator(&paths2, "mine.py", ESTIMATOR);
+        let _ = exec_tool("train_ml_model", &json!({"algorithm": "random_forest", "dataset": "d", "estimator_file": "mine.py"}), &state2, &ml::ModelRegistry::new(&paths2), &paths2).await;
+        assert!(state2.copilot_trusted_files.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn extended_training_arguments_must_have_the_right_types() {
+        assert!(optional_str(&json!({"trade_mode": 3}), "trade_mode").is_err());
+        assert_eq!(optional_str(&json!({"trade_mode": "long_short"}), "trade_mode").unwrap().as_deref(), Some("long_short"));
+        assert_eq!(optional_str(&json!({}), "trade_mode").unwrap(), None);
+        assert!(optional_number(&json!({"holdout_pct": "20"}), "holdout_pct").is_err());
+        assert_eq!(optional_number(&json!({"holdout_pct": 20}), "holdout_pct").unwrap(), Some(20.0));
+        assert!(optional_integer(&json!({"random_state": 1.5}), "random_state").is_err());
+        assert_eq!(optional_integer(&json!({"random_state": null}), "random_state").unwrap(), None);
     }
 }

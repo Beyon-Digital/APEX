@@ -163,6 +163,51 @@ impl ZerodhaExecutionAdapter {
     }
 }
 
+/// One position per symbol. Kite reports a separate `net` row for each product (CNC, MIS,
+/// NRML), but APEX tracks a single position per broker and symbol, so rows that share a symbol
+/// would overwrite each other. Their signed quantities are added, so a long in one product and
+/// a short in another net out to the exposure the account really has. A symbol that nets to
+/// zero is dropped.
+fn merge_products(rows: Vec<Position>) -> Vec<Position> {
+    let mut order: Vec<Symbol> = Vec::new();
+    let mut merged: std::collections::HashMap<String, (f64, f64, f64, Position)> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let signed = if row.side == OrderSide::Buy { row.quantity } else { -row.quantity };
+        match merged.get_mut(&row.symbol.0) {
+            Some((net, cost, pnl, _)) => {
+                *net += signed;
+                *cost += row.avg_price * row.quantity;
+                *pnl += row.pnl;
+            }
+            None => {
+                order.push(row.symbol.clone());
+                merged.insert(row.symbol.0.clone(), (signed, row.avg_price * row.quantity, row.pnl, row));
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|symbol| {
+            let (net, cost, pnl, mut position) = merged.remove(&symbol.0)?;
+            if net.abs() < 1e-9 {
+                return None;
+            }
+            let gross: f64 = if position.avg_price > 0.0 { cost / position.avg_price } else { 0.0 };
+            let _ = gross;
+            position.quantity = net.abs();
+            position.side = if net > 0.0 { OrderSide::Buy } else { OrderSide::Sell };
+            position.pnl = pnl;
+            position.pnl_pct = if position.avg_price > 0.0 {
+                pnl / (position.avg_price * position.quantity) * 100.0
+            } else {
+                0.0
+            };
+            Some(position)
+        })
+        .collect()
+}
+
 #[async_trait]
 impl ExecutionPort for ZerodhaExecutionAdapter {
     async fn place_order(&self, order: &NewOrderRequest) -> Result<OrderId> {
@@ -270,6 +315,7 @@ impl ExecutionPort for ZerodhaExecutionAdapter {
             .and_then(|n| n.as_array())
             .map(|net| net.iter().filter_map(|p| Self::position_from_json(p, "zerodha")).collect())
             .unwrap_or_default();
+        let positions = merge_products(positions);
         debug!("Fetched {} positions from Zerodha", positions.len());
         Ok(positions)
     }

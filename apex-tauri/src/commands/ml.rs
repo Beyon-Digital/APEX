@@ -1,5 +1,6 @@
-use super::{ml_datasets, ml_features, python_runtime};
+use super::{ml_datasets, ml_estimators, ml_expr, ml_features, python_runtime};
 use crate::dto::{
+    CustomFeatureDto, HoldoutDto,
     CvFoldDto, FeatureImportanceDto, LabelSpecDto, MLModelDto, MLTrainingRequestDto,
     MLTrainingResultDto, ModelDetailDto, ModelSignalHistoryDto, ModelSignalPointDto,
     ModelUsageDto, TradingSummaryDto,
@@ -315,6 +316,15 @@ pub(crate) fn build_detail(
         trading: field::<TradingSummaryDto>(&raw, "trading"),
         log_tail,
         used_by,
+        trade_mode: match raw.get("trade_mode").and_then(|v| v.as_str()) {
+            Some(mode @ ("long_flat" | "long_short")) => mode.to_string(),
+            _ => "long_flat".to_string(),
+        },
+        holdout: field::<HoldoutDto>(&raw, "holdout"),
+        custom_features: field::<Vec<CustomFeatureDto>>(&raw, "custom_features").unwrap_or_default(),
+        context_symbols: field(&raw, "context_symbols").unwrap_or_default(),
+        fee_pct: field(&raw, "fee_pct").unwrap_or(0.0),
+        estimator_file: field(&raw, "estimator_file"),
     })
 }
 
@@ -462,80 +472,23 @@ pub(crate) fn update_ml_model_inner(
 
 // ── Training ─────────────────────────────────────────────────────────
 
-fn is_int(v: &Value, min: i64, max: i64) -> bool {
-    match v {
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                (min..=max).contains(&i)
-            } else if let Some(f) = n.as_f64() {
-                f.fract() == 0.0 && f >= min as f64 && f <= max as f64
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
+pub(crate) use ml_estimators::validate_hyperparams;
+
+pub(crate) const MAX_HOLDOUT_PCT: f64 = 40.0;
+pub(crate) const TRADE_MODES: &[&str] = &["long_flat", "long_short"];
+/// How long a training run may take before it is stopped. Override with `APEX_ML_TRAIN_TIMEOUT_SECS`.
+pub(crate) const DEFAULT_TRAIN_TIMEOUT_SECS: u64 = 20 * 60;
+
+pub(crate) fn training_timeout() -> std::time::Duration {
+    timeout_from(std::env::var("APEX_ML_TRAIN_TIMEOUT_SECS").ok().as_deref())
 }
 
-/// Float in (0, max]; integers are fine.
-fn is_pos_float(v: &Value, max: f64) -> bool {
-    v.as_f64().map(|f| f.is_finite() && f > 0.0 && f <= max).unwrap_or(false)
-}
-
-/// Allow-list check of one hyperparameter. Mirrors `ml/trainer.py` (`validate_hyperparams`),
-/// which is the authority; this runs first so a bad request fails before Python is started.
-fn check_hyperparam(algorithm: &str, key: &str, v: &Value) -> Result<(), String> {
-    let ok = match (algorithm, key) {
-        ("random_forest" | "gradient_boosting" | "xgboost", "random_state") => is_int(v, 0, 2_147_483_647),
-        ("random_forest" | "gradient_boosting" | "xgboost", "n_estimators") => is_int(v, 1, 2000),
-        ("random_forest", "max_depth") => v.is_null() || is_int(v, 1, 100),
-        ("gradient_boosting" | "xgboost", "max_depth") => is_int(v, 1, 20),
-        ("random_forest", "min_samples_leaf") => is_int(v, 1, 1000),
-        ("random_forest", "max_features") => match v {
-            Value::Null => true,
-            Value::String(s) => s == "sqrt" || s == "log2",
-            Value::Number(n) if n.is_i64() || n.is_u64() => is_int(v, 1, 1000),
-            Value::Number(n) => n.as_f64().map(|f| f > 0.0 && f <= 1.0).unwrap_or(false),
-            _ => false,
-        },
-        ("random_forest", "class_weight") => v.is_null() || matches!(v.as_str(), Some("balanced" | "balanced_subsample")),
-        ("gradient_boosting" | "xgboost", "learning_rate") => is_pos_float(v, 1.0),
-        ("gradient_boosting" | "xgboost", "subsample") => is_pos_float(v, 1.0),
-        ("xgboost", "colsample_bytree") => is_pos_float(v, 1.0),
-        ("logistic_regression", "C") => is_pos_float(v, 1_000_000.0),
-        ("logistic_regression", "max_iter") => is_int(v, 1, 100_000),
-        ("logistic_regression", "class_weight") => v.is_null() || v.as_str() == Some("balanced"),
-        _ => {
-            return Err(format!(
-                "unknown hyperparameter `{key}` for {algorithm}; allowed: {}",
-                allowed_hyperparams(algorithm).join(", ")
-            ))
-        }
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("invalid value {v} for hyperparameter `{key}` of {algorithm}"))
-    }
-}
-
-fn allowed_hyperparams(algorithm: &str) -> &'static [&'static str] {
-    match algorithm {
-        "random_forest" => &["n_estimators", "max_depth", "min_samples_leaf", "max_features", "class_weight", "random_state"],
-        "gradient_boosting" => &["n_estimators", "learning_rate", "max_depth", "subsample", "random_state"],
-        "logistic_regression" => &["C", "max_iter", "class_weight"],
-        "xgboost" => &["n_estimators", "max_depth", "learning_rate", "subsample", "colsample_bytree", "random_state"],
-        _ => &[],
-    }
-}
-
-pub(crate) fn validate_hyperparams(algorithm: &str, hyperparams: &HashMap<String, Value>) -> Result<(), String> {
-    let mut keys: Vec<&String> = hyperparams.keys().collect();
-    keys.sort();
-    for key in keys {
-        check_hyperparam(algorithm, key, &hyperparams[key])?;
-    }
-    Ok(())
+fn timeout_from(setting: Option<&str>) -> std::time::Duration {
+    let secs = setting
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(1, 7200))
+        .unwrap_or(DEFAULT_TRAIN_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Request after validation, with dataset defaults applied, plus the JSON sent to the trainer.
@@ -553,10 +506,23 @@ pub(crate) fn prepare_training(
     runtime_paths: &python_runtime::RuntimePaths,
     actor: &str,
 ) -> Result<PreparedTraining, String> {
-    validation::validate_algorithm(&request.algorithm)?;
+    ml_estimators::validate_algorithm_id(&request.algorithm)?;
     validate_hyperparams(&request.algorithm, &request.hyperparams)?;
     if request.n_splits < 2 || request.n_splits > 20 {
         return Err("n_splits must be between 2 and 20".into());
+    }
+    let trade_mode = request.trade_mode.as_deref().unwrap_or("long_flat");
+    if !TRADE_MODES.contains(&trade_mode) {
+        return Err(format!("trade_mode must be one of {}", TRADE_MODES.join(", ")));
+    }
+    let holdout_pct = request.holdout_pct.unwrap_or(0.0);
+    if !holdout_pct.is_finite() || !(0.0..=MAX_HOLDOUT_PCT).contains(&holdout_pct) {
+        return Err(format!("holdout_pct must be between 0 and {MAX_HOLDOUT_PCT}"));
+    }
+    if let Some(seed) = request.random_state {
+        if !(0..=2_147_483_647).contains(&seed) {
+            return Err("random_state must be an integer from 0 to 2147483647".into());
+        }
     }
     for lag in &request.lag_periods {
         if *lag < 1 || *lag > 250 {
@@ -575,7 +541,20 @@ pub(crate) fn prepare_training(
         "output_dir": models_dir.to_string_lossy().to_string(),
         "source": if actor == "copilot" { "copilot" } else { "user" },
         "return_column": request.return_column,
+        "trade_mode": trade_mode,
+        "holdout_pct": holdout_pct,
+        "random_state": request.random_state,
     });
+    if request.algorithm == "custom" {
+        let name = request
+            .estimator_file
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .ok_or_else(|| "algorithm `custom` needs an estimator_file (save one in the Train tab first)".to_string())?;
+        let path = ml_estimators::resolve_for_training(runtime_paths.work_root(), name)?;
+        payload["estimator_file"] = serde_json::json!(name);
+        payload["estimator_path"] = serde_json::json!(path.to_string_lossy());
+    }
 
     let data_path;
     if let Some(name) = &request.dataset {
@@ -586,14 +565,16 @@ pub(crate) fn prepare_training(
         if !runtime_paths.resolve_user_relative_path(&data_path).exists() {
             return Err(format!("dataset `{name}` has no data file at {data_path}; rebuild it"));
         }
+        // Catalog features AND the dataset's custom formulas are columns of the CSV.
+        let available = ml_datasets::all_feature_columns(&info);
         let features = if request.feature_columns.is_empty() {
-            info.features.clone()
+            available.clone()
         } else {
             for f in &request.feature_columns {
-                if !info.features.contains(f) {
+                if !available.contains(f) {
                     return Err(format!(
                         "feature `{f}` is not in dataset `{name}` (it has: {})",
-                        info.features.join(", ")
+                        available.join(", ")
                     ));
                 }
             }
@@ -607,11 +588,18 @@ pub(crate) fn prepare_training(
         }
         payload["dataset"] = serde_json::json!(name);
         payload["horizon_bars"] = serde_json::json!(info.label.horizon_bars);
+        // The recipe a model needs to rebuild its features at inference time is written into the
+        // model's metadata by the trainer, from here. Read from the serialized sidecar so a dataset
+        // built before these fields existed simply yields the defaults.
+        let side = serde_json::to_value(&info).unwrap_or(Value::Null);
         payload["dataset_meta"] = serde_json::json!({
             "name": info.name,
             "symbols": info.symbols,
             "timeframe": info.timeframe,
             "label": info.label,
+            "custom_features": side.get("custom_features").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "context_symbols": side.get("context_symbols").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "fee_pct": side.get("fee_pct").and_then(|v| v.as_f64()).unwrap_or(0.0),
         });
     } else {
         validation::validate_path(&request.data_path)?;
@@ -690,7 +678,23 @@ async fn train_core(
     runtime_paths: &python_runtime::RuntimePaths,
     actor: &str,
 ) -> Result<MLTrainingResultDto, String> {
+    train_core_with(request, models_dir, runtime_paths, actor, training_timeout()).await
+}
+
+/// [`train_core`] with an explicit time limit. When it runs out the trainer process is killed and
+/// the caller records a failed activity entry.
+pub(crate) async fn train_core_with(
+    request: &MLTrainingRequestDto,
+    models_dir: &Path,
+    runtime_paths: &python_runtime::RuntimePaths,
+    actor: &str,
+    limit: std::time::Duration,
+) -> Result<MLTrainingResultDto, String> {
     let prepared = prepare_training(request, models_dir, runtime_paths, actor)?;
+
+    // Keys and values are checked against the installed estimator before a trainer is started.
+    let catalog = ml_estimators::fetch_algorithms(runtime_paths).await?;
+    ml_estimators::validate_with_catalog(&catalog, &request.algorithm, &request.hyperparams)?;
 
     let python = python_runtime::resolve_python_executable(
         runtime_paths,
@@ -711,9 +715,20 @@ async fn train_core(
             serde_json::to_string(&prepared.payload)
                 .map_err(|e| format!("Failed to encode training payload: {e}"))?,
         );
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), command.output())
+    // Numeric libraries default to every core; a training run should not take the whole machine.
+    for var in ["OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"] {
+        if std::env::var_os(var).is_none() {
+            command.env(var, "4");
+        }
+    }
+    let output = ml_estimators::output_with_limit(command, limit)
         .await
-        .map_err(|_| "Training took longer than 30 minutes and was stopped".to_string())?
+        .map_err(|_| {
+            format!(
+                "Training took longer than {} and was stopped. Use fewer rounds, a smaller dataset or a faster algorithm.",
+                ml_estimators::describe_duration(limit)
+            )
+        })?
         .map_err(|e| format!("Failed to start Python trainer with {}: {e}", python.display()))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -792,16 +807,25 @@ struct PredictorBatchResult {
 struct ScoringModel {
     meta: ModelMetadataFile,
     model_path: PathBuf,
+    /// Formulas the model's features include, read from the metadata (empty for older models).
+    custom_features: Vec<crate::dto::CustomFeatureDto>,
+    /// Symbols those formulas read with `other(...)`, plus any the metadata lists.
+    context_symbols: Vec<String>,
 }
 
 fn load_scoring_model(models_dir: &Path, model_id: &str) -> Result<ScoringModel, String> {
-    let (meta, _) = read_metadata_raw(models_dir, model_id)?;
+    let (meta, raw) = read_metadata_raw(models_dir, model_id)?;
     validate_model_file(&meta.model_file)?;
     let model_path = models_dir.join(&meta.model_file);
     if !model_path.exists() {
         return Err(format!("Model artifact missing: {}", model_path.display()));
     }
-    Ok(ScoringModel { meta, model_path })
+    let (custom_features, context_symbols) = ml_features::custom_spec_from_metadata(&raw)?;
+    // Only what this model's features actually use: a model trained on a subset of the dataset's
+    // columns must not be refused because an unused formula's context symbol has no bars.
+    let (custom_features, context_symbols) =
+        ml_features::narrow_to_used(&custom_features, &context_symbols, &meta.feature_names)?;
+    Ok(ScoringModel { meta, model_path, custom_features, context_symbols })
 }
 
 fn scoring_timeframe(meta: &ModelMetadataFile) -> &'static str {
@@ -837,14 +861,35 @@ pub(crate) async fn ensure_fresh_model_bars(
     let timeframe = model_timeframe(models_dir, model_id)?;
     let bars = super::data::load_bars(state, symbol, Some(timeframe), 300).await?;
     match bars.last() {
-        None => Err(format!("no {timeframe} bars for {symbol}")),
-        Some(last) if chrono::Utc::now() - last.time > max_bar_age(timeframe) => Err(format!(
-            "newest {timeframe} bar for {symbol} is from {} (stale); refusing to score on old data",
-            last.time.format("%Y-%m-%d %H:%M")
-        )),
-        Some(_) => Ok(()),
+        None => return Err(format!("no {timeframe} bars for {symbol}")),
+        Some(last) if chrono::Utc::now() - last.time > max_bar_age(timeframe) => {
+            return Err(format!(
+                "newest {timeframe} bar for {symbol} is from {} (stale); refusing to score on old data",
+                last.time.format("%Y-%m-%d %H:%M")
+            ))
+        }
+        Some(_) => {}
     }
+    // Formulas that read other symbols (other("SPY", ...)) are scored from stored bars, so those
+    // symbols need the same refresh, or the context goes stale and every run fails.
+    for context in scoring_context_symbols(models_dir, model_id)? {
+        if context.eq_ignore_ascii_case(symbol) {
+            continue;
+        }
+        super::data::load_bars(state, &context, Some(timeframe), 300)
+            .await
+            .map_err(|e| format!("could not refresh context symbol {context}: {e}"))?;
+    }
+    Ok(())
 }
+
+/// The other symbols this model's formulas read when it scores (empty for most models).
+pub(crate) fn scoring_context_symbols(models_dir: &Path, model_id: &str) -> Result<Vec<String>, String> {
+    Ok(load_scoring_model(models_dir, model_id)?.context_symbols)
+}
+
+/// How long one scoring call may run before it is killed.
+const PREDICT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Run `python -m ml.predict <args>` and return the last JSON line of its output.
 async fn run_predictor(
@@ -857,16 +902,19 @@ async fn run_predictor(
         "APEX_ML_PYTHON_PATH",
         &["APEX_STRATEGY_PYTHON_PATH"],
     )?;
-    let output = Command::new(&python)
+    let mut command = Command::new(&python);
+    command
         .current_dir(runtime_paths.work_root())
         .env("PYTHONPATH", python_runtime::build_python_path(runtime_paths)?)
         .env("PYTHONIOENCODING", "utf-8")
-        .kill_on_drop(true)
         .arg("-m")
         .arg("ml.predict")
-        .args(args)
-        .output()
+        .args(args);
+    // Scoring loads the model, and a model can be a user's own estimator, so a stuck predictor
+    // must not hang an automation or the Copilot forever. The child is killed on timeout.
+    let output = ml_estimators::output_with_limit(command, PREDICT_TIMEOUT)
         .await
+        .map_err(|why| format!("{context}: the predictor {why}; the model or its estimator may be stuck"))?
         .map_err(|e| format!("Failed to start Python predictor with {}: {e}", python.display()))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -902,7 +950,7 @@ pub(crate) async fn model_signal_inner(
     validation::validate_symbol(symbol)?;
     let model = load_scoring_model(models_dir, model_id)?;
     let names = &model.meta.feature_names;
-    let need = ml_features::required_bars(names)?;
+    let need = ml_features::required_bars_with(names, &model.custom_features)?;
     let timeframe = ml_features::parse_timeframe(scoring_timeframe(&model.meta))
         .unwrap_or(apex_core::domain::models::Timeframe::D1);
 
@@ -910,7 +958,7 @@ pub(crate) async fn model_signal_inner(
     let bars = storage
         .query_ohlcv(OHLCVQuery {
             symbol: Symbol(symbol.to_string()),
-            timeframe,
+            timeframe: timeframe.clone(),
             from: chrono::DateTime::UNIX_EPOCH,
             to: chrono::Utc::now(),
             limit: Some(limit),
@@ -924,7 +972,12 @@ pub(crate) async fn model_signal_inner(
         ));
     }
 
-    let features = ml_features::latest_features(&bars, names, symbol)?;
+    let context_symbols = ml_features::context_symbols_needed(&model.custom_features, &model.context_symbols)?;
+    let context = ml_features::load_context_from_storage(storage, &context_symbols, timeframe.clone(), limit * 2).await?;
+    if let Some(last) = bars.last() {
+        ml_features::check_context_fresh(&context, last.time, max_bar_age(scoring_timeframe(&model.meta)))?;
+    }
+    let features = ml_features::latest_features_with(&bars, names, &model.custom_features, &context, symbol)?;
     let stdout = run_predictor(
         runtime_paths,
         vec![
@@ -979,7 +1032,18 @@ pub(crate) fn scorable_rows(
     names: &[String],
     n: usize,
 ) -> Result<(Vec<usize>, Vec<Vec<f64>>), String> {
-    let matrix = ml_features::model_matrix(bars, names)?;
+    scorable_rows_with(bars, names, &[], &ml_expr::Context::new(), n)
+}
+
+/// [`scorable_rows`] for a model with custom features and context symbols.
+pub(crate) fn scorable_rows_with(
+    bars: &[apex_core::domain::models::OHLCV],
+    names: &[String],
+    custom: &[crate::dto::CustomFeatureDto],
+    context: &ml_expr::Context,
+    n: usize,
+) -> Result<(Vec<usize>, Vec<Vec<f64>>), String> {
+    let matrix = ml_features::model_matrix_with(bars, names, custom, context)?;
     let first = bars.len().saturating_sub(n);
     let mut idx = Vec::new();
     let mut rows = Vec::new();
@@ -1011,10 +1075,19 @@ pub async fn model_signal_history(
     let n = n.min(MAX_HISTORY_BARS);
     let model = load_scoring_model(&models.models_dir, &model_id)?;
     let names = &model.meta.feature_names;
-    let need = ml_features::required_bars(names)?;
+    let need = ml_features::required_bars_with(names, &model.custom_features)?;
 
-    let loaded = super::data::load_bars(&app_state, &symbol, Some(scoring_timeframe(&model.meta)), n + need + 5).await?;
-    let (idx, rows) = scorable_rows(&loaded, names, n)?;
+    let timeframe_name = scoring_timeframe(&model.meta);
+    let loaded = super::data::load_bars(&app_state, &symbol, Some(timeframe_name), n + need + 5).await?;
+    let mut context = ml_expr::Context::new();
+    for sym in ml_features::context_symbols_needed(&model.custom_features, &model.context_symbols)? {
+        let ctx_bars = super::data::load_bars(&app_state, &sym, Some(timeframe_name), (n + need + 5) * 2).await?;
+        if ctx_bars.is_empty() {
+            return Err(format!("no stored bars for context symbol {sym}, which this model's custom features read; fetch its history first"));
+        }
+        context.insert(sym, ctx_bars);
+    }
+    let (idx, rows) = scorable_rows_with(&loaded, names, &model.custom_features, &context, n)?;
     if rows.is_empty() {
         return Err(format!(
             "Not enough stored bars for {symbol} ({} loaded; this model's features need {need}); fetch history first",
@@ -1070,7 +1143,9 @@ pub(crate) fn delete_model_files(models_dir: &Path, model_id: &str) -> Result<bo
         }
     }
     let mut removed_any = false;
-    for path in [metadata, artifact, log_path(models_dir, model_id)] {
+    // A custom estimator's code is saved next to the model under a name derived from its id.
+    let estimator_copy = models_dir.join(format!("{model_id}_estimator.py"));
+    for path in [metadata, artifact, log_path(models_dir, model_id), estimator_copy] {
         if path.exists() {
             fs::remove_file(&path)
                 .map_err(|e| format!("Failed to delete {:?}: {e}", path))?;
@@ -1128,36 +1203,95 @@ mod tests {
     }
 
     #[test]
-    fn hyperparameters_are_checked_against_an_allow_list() {
+    fn hyperparameters_get_a_structural_check_before_anything_starts() {
+        // Everything the old allow-list accepted still passes.
         assert!(validate_hyperparams("random_forest", &hp(json!({"n_estimators": 200, "max_depth": null, "min_samples_leaf": 3, "max_features": "sqrt", "class_weight": "balanced", "random_state": 7}))).is_ok());
         assert!(validate_hyperparams("random_forest", &hp(json!({"max_features": 0.5}))).is_ok());
         assert!(validate_hyperparams("gradient_boosting", &hp(json!({"learning_rate": 0.05, "subsample": 0.8, "max_depth": 3}))).is_ok());
         assert!(validate_hyperparams("logistic_regression", &hp(json!({"C": 0.5, "max_iter": 500, "class_weight": "balanced"}))).is_ok());
         assert!(validate_hyperparams("xgboost", &hp(json!({"colsample_bytree": 0.7, "learning_rate": 0.1}))).is_ok());
         assert!(validate_hyperparams("random_forest", &HashMap::new()).is_ok());
+        // Parameters the old list did not know are fine, and so are the new algorithms.
+        assert!(validate_hyperparams("random_forest", &hp(json!({"min_samples_split": 8, "bootstrap": false, "criterion": "entropy"}))).is_ok());
+        assert!(validate_hyperparams("hist_gradient_boosting", &hp(json!({"max_iter": 50, "l2_regularization": 1.5}))).is_ok());
+        assert!(validate_hyperparams("extra_trees", &hp(json!({"n_estimators": 50}))).is_ok());
+        assert!(validate_hyperparams("svm", &HashMap::new()).is_err(), "unknown algorithm");
 
-        let err = validate_hyperparams("random_forest", &hp(json!({"learning_rate": 0.1}))).unwrap_err();
-        assert!(err.contains("unknown hyperparameter `learning_rate`") && err.contains("n_estimators"), "{err}");
-        let err = validate_hyperparams("random_forest", &hp(json!({"n_jobs": 8}))).unwrap_err();
-        assert!(err.contains("n_jobs"), "{err}");
-        for (algo, bad) in [
-            ("random_forest", json!({"n_estimators": 0})),
-            ("random_forest", json!({"n_estimators": 100000})),
-            ("random_forest", json!({"n_estimators": "many"})),
-            ("random_forest", json!({"n_estimators": true})),
-            ("random_forest", json!({"n_estimators": 10.5})),
-            ("random_forest", json!({"max_features": "auto"})),
-            ("random_forest", json!({"class_weight": "everything"})),
-            ("gradient_boosting", json!({"learning_rate": 0})),
-            ("gradient_boosting", json!({"learning_rate": 5})),
-            ("gradient_boosting", json!({"subsample": 1.5})),
-            ("logistic_regression", json!({"C": -1})),
-            ("logistic_regression", json!({"class_weight": "balanced_subsample"})),
-            ("xgboost", json!({"max_depth": 99})),
-            ("xgboost", json!({"random_state": -1})),
+        // Cost parameters have hard caps; the caps themselves are allowed.
+        for (algo, key, cap) in [
+            ("random_forest", "n_estimators", 5000),
+            ("hist_gradient_boosting", "max_iter", 100_000),
+            ("logistic_regression", "max_iter", 100_000),
+            ("gradient_boosting", "max_depth", 200),
+            ("xgboost", "max_depth", 200),
         ] {
-            assert!(validate_hyperparams(algo, &hp(bad.clone())).is_err(), "{algo} {bad}");
+            assert!(validate_hyperparams(algo, &hp(json!({ key: cap }))).is_ok(), "{algo} {key}");
+            let err = validate_hyperparams(algo, &hp(json!({ key: cap + 1 }))).unwrap_err();
+            assert!(err.contains(key) && err.contains(&cap.to_string()), "{err}");
         }
+        // Objects, arrays, bad names and too many keys never reach Python.
+        for bad in [json!({"init": {"a": 1}}), json!({"n_estimators": [1, 2]}), json!({"bad key": 1}), json!({"1x": 1}), json!({"": 1})] {
+            assert!(validate_hyperparams("random_forest", &hp(bad.clone())).is_err(), "{bad}");
+        }
+        let many: HashMap<String, Value> = (0..61).map(|i| (format!("k{i}"), json!(1))).collect();
+        assert!(validate_hyperparams("custom", &many).unwrap_err().contains("too many"));
+        // Custom estimators take lists of scalars.
+        assert!(validate_hyperparams("custom", &hp(json!({"weights": [1, 2, 3], "k": 4}))).is_ok());
+        assert!(validate_hyperparams("custom", &hp(json!({"weights": [[1]]}))).is_err());
+    }
+
+    fn param(key: &str, kind: &str, min: Option<f64>, max: Option<f64>, choices: Option<Vec<&str>>) -> crate::dto::ParamDefDto {
+        crate::dto::ParamDefDto {
+            key: key.into(), label: key.into(), kind: kind.into(), default: Value::Null, min, max,
+            choices: choices.map(|c| c.into_iter().map(String::from).collect()), help: String::new(),
+        }
+    }
+
+    fn mini_catalog() -> Vec<crate::dto::AlgorithmDto> {
+        vec![
+            crate::dto::AlgorithmDto {
+                id: "random_forest".into(), label: "RF".into(), description: String::new(), accepts_extra_params: true,
+                params: vec![
+                    param("n_estimators", "int", Some(1.0), Some(5000.0), None),
+                    param("max_features", "choice", None, None, Some(vec!["sqrt", "log2"])),
+                    param("bootstrap", "bool", None, None, None),
+                    param("min_weight_fraction_leaf", "float", Some(0.0), Some(0.5), None),
+                ],
+            },
+            crate::dto::AlgorithmDto { id: "custom".into(), label: "C".into(), description: String::new(), accepts_extra_params: true, params: vec![] },
+        ]
+    }
+
+    #[test]
+    fn the_catalog_check_lists_valid_keys_and_checks_types_and_ranges() {
+        let cat = mini_catalog();
+        let check = |v: Value| ml_estimators::validate_with_catalog(&cat, "random_forest", &hp(v));
+        assert!(check(json!({"n_estimators": 10, "max_features": "log2", "bootstrap": false, "min_weight_fraction_leaf": 0.1})).is_ok());
+        assert!(check(json!({"max_features": 3})).is_ok(), "a count is a valid max_features");
+        assert!(check(json!({"n_jobs": 8})).is_ok(), "n_jobs is clamped by the trainer, not rejected");
+        assert!(check(json!({"max_depth": null})).is_err(), "not in this mini catalog");
+        let err = check(json!({"definitely_not_real": 1})).unwrap_err();
+        assert!(err.contains("unknown hyperparameter `definitely_not_real`"), "{err}");
+        assert!(err.contains("valid: n_estimators, max_features, bootstrap, min_weight_fraction_leaf"), "{err}");
+        for (bad, key) in [
+            (json!({"n_estimators": 0}), "n_estimators"),
+            (json!({"n_estimators": 5001}), "n_estimators"),
+            (json!({"n_estimators": 10.5}), "n_estimators"),
+            (json!({"n_estimators": "10"}), "n_estimators"),
+            (json!({"max_features": "auto"}), "max_features"),
+            (json!({"bootstrap": 1}), "bootstrap"),
+            (json!({"min_weight_fraction_leaf": 0.9}), "min_weight_fraction_leaf"),
+            (json!({"n_jobs": 0}), "n_jobs"),
+            (json!({"n_jobs": 2.5}), "n_jobs"),
+        ] {
+            let err = check(bad.clone()).unwrap_err();
+            assert!(err.contains(key), "{bad}: {err}");
+        }
+        // An algorithm that is not installed (xgboost missing) is reported as such.
+        let err = ml_estimators::validate_with_catalog(&cat, "xgboost", &HashMap::new()).unwrap_err();
+        assert!(err.contains("not available") && err.contains("random_forest"), "{err}");
+        // Custom estimators take any parameter names.
+        assert!(ml_estimators::validate_with_catalog(&cat, "custom", &hp(json!({"anything": 1}))).is_ok());
     }
 
     #[test]
@@ -1360,6 +1494,29 @@ mod tests {
     }
 
     #[test]
+    fn scoring_context_symbols_are_those_the_used_formulas_read() {
+        let dir = temp("ctx");
+        let id = "ctx_model_20261106T000000Z";
+        let meta = r#"{
+          "model_id": "ctx_model_20261106T000000Z", "algorithm": "random_forest",
+          "feature_names": ["ret_1", "rel_qqq"], "target_column": "target",
+          "metrics": {"accuracy": 0.5}, "model_file": "ctx_model_20261106T000000Z.joblib",
+          "created_utc": "20261106T000000Z",
+          "custom_features": [
+            {"name": "rel_qqq", "expr": "close / other(\"QQQ\", \"close\")"},
+            {"name": "unused", "expr": "close / other(\"SPY\", \"close\")"}
+          ],
+          "context_symbols": ["QQQ", "SPY"]
+        }"#;
+        fs::write(dir.join(format!("{id}.json")), meta).unwrap();
+        fs::write(dir.join(format!("{id}.joblib")), b"x").unwrap();
+        // SPY is recorded and has a formula, but the model's features do not use it.
+        assert_eq!(scoring_context_symbols(&dir, id).unwrap(), vec!["QQQ".to_string()]);
+        let old = write_old_model(&dir);
+        assert!(scoring_context_symbols(&dir, &old).unwrap().is_empty());
+    }
+
+    #[test]
     fn model_timeframe_reads_the_trained_timeframe_and_defaults_to_daily() {
         let dir = temp("tf");
         let id = write_old_model(&dir);
@@ -1408,6 +1565,51 @@ mod tests {
     }
 
     #[test]
+    fn custom_feature_columns_can_be_selected_and_are_included_by_default() {
+        use crate::dto::{BuildDatasetRequestDto, CustomFeatureDto, LabelSpecDto};
+        let root = temp("prepare-custom");
+        let paths = python_runtime::RuntimePaths::for_test(&root);
+        let models = root.join("models");
+        let req = BuildDatasetRequestDto {
+            name: "ds2".into(),
+            symbols: vec!["AAPL".into()],
+            timeframe: "1d".into(),
+            bars: 200,
+            features: vec!["ret_1".into()],
+            custom_features: vec![CustomFeatureDto { name: "mom".into(), expr: "ret(close, 5)".into() }],
+            label: LabelSpecDto { horizon_bars: 3, kind: "direction".into(), threshold_pct: 0.0, ..Default::default() },
+            ..Default::default()
+        };
+        let req = ml_datasets::normalize_request(&req).unwrap();
+        let rel = ml_datasets::relative_csv_path(&paths, "ds2");
+        let (csv, info) = ml_datasets::assemble_with(
+            &req,
+            &[("AAPL".into(), synthetic_bars(120))],
+            &ml_expr::Context::new(),
+            "user",
+            &rel,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        ml_datasets::write_dataset(&ml_datasets::datasets_dir(&paths), &csv, &info).unwrap();
+
+        // Default: every column of the dataset, custom ones included.
+        let request: MLTrainingRequestDto = serde_json::from_str(r#"{"algorithm":"random_forest","dataset":"ds2"}"#).unwrap();
+        let p = prepare_training(&request, &models, &paths, "user").unwrap();
+        assert_eq!(p.payload["feature_columns"], json!(["ret_1", "mom"]));
+
+        // Explicit selection may name the custom column; unknown names are still rejected.
+        let request: MLTrainingRequestDto =
+            serde_json::from_str(r#"{"algorithm":"random_forest","dataset":"ds2","feature_columns":["mom"]}"#).unwrap();
+        let p = prepare_training(&request, &models, &paths, "user").unwrap();
+        assert_eq!(p.payload["feature_columns"], json!(["mom"]));
+        let request: MLTrainingRequestDto =
+            serde_json::from_str(r#"{"algorithm":"random_forest","dataset":"ds2","feature_columns":["nope"]}"#).unwrap();
+        let err = prepare_training(&request, &models, &paths, "user").unwrap_err();
+        assert!(err.contains("nope") && err.contains("mom"), "{err}");
+    }
+
+    #[test]
     fn prepare_training_applies_dataset_defaults() {
         use crate::dto::{BuildDatasetRequestDto, LabelSpecDto};
         let root = temp("prepare");
@@ -1419,7 +1621,8 @@ mod tests {
             timeframe: "1d".into(),
             bars: 200,
             features: vec!["ret_1".into(), "rsi_14".into()],
-            label: LabelSpecDto { horizon_bars: 3, kind: "direction".into(), threshold_pct: 0.0 },
+            label: LabelSpecDto { horizon_bars: 3, kind: "direction".into(), threshold_pct: 0.0, ..Default::default() },
+            ..Default::default()
         };
         let req = ml_datasets::normalize_request(&req).unwrap();
         let rel = ml_datasets::relative_csv_path(&paths, "ds1");
@@ -1447,8 +1650,8 @@ mod tests {
         request.dataset = None;
         assert!(prepare_training(&request, &models, &paths, "user").is_err(), "no data_path");
         request.dataset = Some("ds1".into());
-        request.hyperparams = hp(json!({"bogus": 1}));
-        assert!(prepare_training(&request, &models, &paths, "user").unwrap_err().contains("bogus"));
+        request.hyperparams = hp(json!({"bad key": 1}));
+        assert!(prepare_training(&request, &models, &paths, "user").unwrap_err().contains("bad key"));
         request.hyperparams.clear();
         request.n_splits = 1;
         assert!(prepare_training(&request, &models, &paths, "user").is_err());
@@ -1483,7 +1686,8 @@ mod tests {
             timeframe: "1d".into(),
             bars: 400,
             features: vec!["ret_1".into(), "ret_5".into(), "rsi_14".into(), "vol_10".into(), "macd_hist".into()],
-            label: LabelSpecDto { horizon_bars: 5, kind: "direction".into(), threshold_pct: 0.0 },
+            label: LabelSpecDto { horizon_bars: 5, kind: "direction".into(), threshold_pct: 0.0, ..Default::default() },
+            ..Default::default()
         })
         .unwrap();
         let series = vec![("AAA".to_string(), synthetic_bars(400)), ("BBB".to_string(), synthetic_bars(380))];
@@ -1550,4 +1754,337 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+
+    // ── Trade mode, hold-out, seeds, custom estimators ───────────────
+
+    fn build_dataset_files(paths: &python_runtime::RuntimePaths, name: &str, symbols: &[&str], bars: usize) {
+        build_dataset_files_with(paths, name, symbols, bars, json!({}));
+    }
+
+    /// Like [`build_dataset_files`], with extra request fields (custom_features, fee_pct, ...), built
+    /// by the real builder so the CSV and the sidecar agree.
+    fn build_dataset_files_with(paths: &python_runtime::RuntimePaths, name: &str, symbols: &[&str], bars: usize, extra: Value) {
+        use crate::dto::BuildDatasetRequestDto;
+        let mut doc = json!({
+            "name": name, "symbols": symbols, "timeframe": "1d", "bars": bars,
+            "features": ["ret_1", "ret_5", "rsi_14", "vol_10", "macd_hist"],
+            "label": {"horizon_bars": 5, "kind": "direction", "threshold_pct": 0.0}
+        });
+        doc.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let req: BuildDatasetRequestDto = serde_json::from_value(doc).unwrap();
+        let req = ml_datasets::normalize_request(&req).unwrap();
+        let series: Vec<(String, Vec<apex_core::domain::models::OHLCV>)> =
+            symbols.iter().enumerate().map(|(i, s)| (s.to_string(), synthetic_bars(bars - i * 15))).collect();
+        let rel = ml_datasets::relative_csv_path(paths, name);
+        let (csv, info) =
+            ml_datasets::assemble_with(&req, &series, &ml_expr::Context::new(), "user", &rel, chrono::Utc::now()).unwrap();
+        ml_datasets::write_dataset(&ml_datasets::datasets_dir(paths), &csv, &info).unwrap();
+    }
+
+    /// Rewrite fields of a dataset's sidecar the way a custom-feature build would have written them.
+    fn edit_sidecar(paths: &python_runtime::RuntimePaths, name: &str, edit: impl FnOnce(&mut Value)) {
+        let path = ml_datasets::datasets_dir(paths).join(format!("{name}.dataset.json"));
+        let mut doc: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        edit(&mut doc);
+        fs::write(&path, doc.to_string()).unwrap();
+    }
+
+    /// A temp work root with the project's Python sources linked in, or None when there is no
+    /// virtualenv (the test is then skipped).
+    fn python_root(name: &str) -> Option<(PathBuf, python_runtime::RuntimePaths, PathBuf)> {
+        let repo = python_runtime::repo_root().unwrap();
+        let src = repo.join("apex-python");
+        if !src.join(".venv").join("bin").join("python").exists() {
+            eprintln!("skipping: apex-python virtualenv not found");
+            return None;
+        }
+        let root = temp(name);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&src, root.join("apex-python")).unwrap();
+        #[cfg(not(unix))]
+        return None;
+        let paths = python_runtime::RuntimePaths::for_test(&root);
+        let models = root.join("models");
+        fs::create_dir_all(&models).unwrap();
+        Some((root, paths, models))
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn new_request_fields_are_optional_and_round_trip() {
+        let r: MLTrainingRequestDto = serde_json::from_value(json!({
+            "algorithm": "custom", "dataset": "d", "estimator_file": "mine.py", "trade_mode": "long_short",
+            "holdout_pct": 15.0, "random_state": 7, "hyperparams": {"k": 3}
+        }))
+        .unwrap();
+        assert_eq!((r.trade_mode.as_deref(), r.holdout_pct, r.random_state), (Some("long_short"), Some(15.0), Some(7)));
+        assert_eq!(r.estimator_file.as_deref(), Some("mine.py"));
+        let plain: MLTrainingRequestDto = serde_json::from_str(r#"{"algorithm":"random_forest","dataset":"d"}"#).unwrap();
+        assert!(plain.trade_mode.is_none() && plain.holdout_pct.is_none() && plain.estimator_file.is_none() && plain.random_state.is_none());
+        let back = serde_json::to_value(&plain).unwrap();
+        assert!(back.get("trade_mode").is_none(), "unset options are not serialized");
+        assert_eq!(MLTrainingRequestDto::default().n_splits, 5);
+    }
+
+    #[test]
+    fn prepare_training_validates_and_forwards_the_new_options() {
+        let root = temp("prepare-new");
+        let paths = python_runtime::RuntimePaths::for_test(&root);
+        let models = root.join("models");
+        build_dataset_files(&paths, "dsx", &["AAPL"], 120);
+        edit_sidecar(&paths, "dsx", |d| {
+            d["custom_features"] = json!([{"name": "mom", "expr": "close / shift(close, 5) - 1"}]);
+            d["context_symbols"] = json!(["SPY"]);
+            d["fee_pct"] = json!(0.1);
+        });
+
+        let mut req: MLTrainingRequestDto = serde_json::from_str(r#"{"algorithm":"random_forest","dataset":"dsx"}"#).unwrap();
+        let p = prepare_training(&req, &models, &paths, "user").unwrap();
+        assert_eq!(p.payload["trade_mode"], "long_flat");
+        assert_eq!(p.payload["holdout_pct"], 0.0);
+        assert!(p.payload["random_state"].is_null());
+        assert_eq!(p.payload["dataset_meta"]["custom_features"], json!([{"name": "mom", "expr": "close / shift(close, 5) - 1"}]));
+        assert_eq!(p.payload["dataset_meta"]["context_symbols"], json!(["SPY"]));
+        assert_eq!(p.payload["dataset_meta"]["fee_pct"], 0.1);
+        assert!(p.payload.get("estimator_path").is_none());
+
+        req.trade_mode = Some("long_short".into());
+        req.holdout_pct = Some(25.0);
+        req.random_state = Some(9);
+        let p = prepare_training(&req, &models, &paths, "user").unwrap();
+        assert_eq!((p.payload["trade_mode"].as_str(), p.payload["holdout_pct"].as_f64(), p.payload["random_state"].as_i64()), (Some("long_short"), Some(25.0), Some(9)));
+
+        for (mutate, fragment) in [
+            (Box::new(|r: &mut MLTrainingRequestDto| r.trade_mode = Some("short_only".into())) as Box<dyn Fn(&mut MLTrainingRequestDto)>, "trade_mode"),
+            (Box::new(|r| r.holdout_pct = Some(41.0)), "holdout_pct"),
+            (Box::new(|r| r.holdout_pct = Some(-1.0)), "holdout_pct"),
+            (Box::new(|r| r.holdout_pct = Some(f64::NAN)), "holdout_pct"),
+            (Box::new(|r| r.random_state = Some(-1)), "random_state"),
+            (Box::new(|r| r.random_state = Some(2_147_483_648)), "random_state"),
+            (Box::new(|r| r.algorithm = "svm".into()), "Unknown algorithm"),
+        ] {
+            let mut bad = req.clone();
+            mutate(&mut bad);
+            assert!(prepare_training(&bad, &models, &paths, "user").unwrap_err().contains(fragment), "{fragment}");
+        }
+        req.holdout_pct = Some(40.0);
+        assert!(prepare_training(&req, &models, &paths, "user").is_ok(), "40 is allowed");
+
+        // Custom estimators need a saved file, found by exact name inside <work root>/estimators.
+        req.algorithm = "custom".into();
+        assert!(prepare_training(&req, &models, &paths, "user").unwrap_err().contains("estimator_file"));
+        req.estimator_file = Some("../evil.py".into());
+        assert!(prepare_training(&req, &models, &paths, "user").is_err());
+        req.estimator_file = Some("mine.py".into());
+        assert!(prepare_training(&req, &models, &paths, "user").unwrap_err().contains("not found"));
+        ml_estimators::write_file(&root, "mine.py", ml_estimators::ESTIMATOR_TEMPLATE).unwrap();
+        let p = prepare_training(&req, &models, &paths, "user").unwrap();
+        assert_eq!(p.payload["estimator_file"], "mine.py");
+        assert_eq!(p.payload["estimator_path"].as_str().unwrap(), root.join("estimators").join("mine.py").to_string_lossy());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn model_detail_reads_the_new_metadata_and_old_files_get_defaults() {
+        let dir = temp("detail-new");
+        let id = write_old_model(&dir);
+        let old = build_detail(&dir, &id, vec![]).unwrap();
+        assert_eq!(old.trade_mode, "long_flat");
+        assert!(old.holdout.is_none() && old.custom_features.is_empty() && old.context_symbols.is_empty());
+        assert_eq!(old.fee_pct, 0.0);
+        assert!(old.estimator_file.is_none());
+
+        let mut doc: Value = serde_json::from_str(OLD_METADATA).unwrap();
+        doc["trade_mode"] = json!("long_short");
+        doc["holdout"] = json!({"rows": 40, "accuracy": 0.55, "baseline_accuracy": 0.5, "pct": 20.0, "steps": 20, "start_step": 80, "embargo_steps": 5, "total_steps": 100,
+            "trading": {"strategy_return_pct": 3.0, "buy_hold_return_pct": 1.0, "hit_rate": 0.6, "trades": 12, "max_drawdown_pct": -2.0, "sharpe": 0.9}});
+        doc["custom_features"] = json!([{"name": "mom", "expr": "ret(close, 5)"}]);
+        doc["context_symbols"] = json!(["SPY"]);
+        doc["fee_pct"] = json!(0.05);
+        doc["estimator_file"] = json!("mine.py");
+        doc["random_state"] = json!(42);
+        fs::write(dir.join(format!("{id}.json")), doc.to_string()).unwrap();
+        let d = build_detail(&dir, &id, vec![]).unwrap();
+        assert_eq!(d.trade_mode, "long_short");
+        let h = d.holdout.unwrap();
+        assert_eq!((h.rows, h.accuracy, h.baseline_accuracy), (40, 0.55, Some(0.5)));
+        assert_eq!(h.trading.unwrap().trades, 12);
+        assert_eq!(d.custom_features.len(), 1);
+        assert_eq!(d.custom_features[0].name, "mom");
+        assert_eq!(d.context_symbols, vec!["SPY"]);
+        assert_eq!(d.fee_pct, 0.05);
+        assert_eq!(d.estimator_file.as_deref(), Some("mine.py"));
+
+        // A garbage trade_mode or a malformed hold-out never hides the model.
+        doc["trade_mode"] = json!("sideways");
+        doc["holdout"] = json!({"rows": "many"});
+        fs::write(dir.join(format!("{id}.json")), doc.to_string()).unwrap();
+        let d = build_detail(&dir, &id, vec![]).unwrap();
+        assert_eq!(d.trade_mode, "long_flat");
+        assert!(d.holdout.is_none());
+        // And the serialized detail has the field names the UI reads.
+        let wire = serde_json::to_value(&d).unwrap();
+        for key in ["trade_mode", "holdout", "custom_features", "context_symbols", "fee_pct", "estimator_file"] {
+            assert!(wire.get(key).is_some(), "{key}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_model_also_removes_its_estimator_copy() {
+        let dir = temp("delete-copy");
+        let id = write_old_model(&dir);
+        fs::write(dir.join(format!("{id}_estimator.py")), "def make_estimator(p): pass\n").unwrap();
+        fs::write(dir.join("other_estimator.py"), "keep").unwrap();
+        assert!(delete_model_files(&dir, &id).unwrap());
+        assert!(!dir.join(format!("{id}_estimator.py")).exists());
+        assert!(dir.join("other_estimator.py").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trainer_timeout_defaults_to_twenty_minutes_and_is_bounded() {
+        let secs = |v| timeout_from(v).as_secs();
+        assert_eq!(secs(None), 1200);
+        assert_eq!(secs(Some("not a number")), 1200);
+        assert_eq!(secs(Some(" 90 ")), 90);
+        assert_eq!(secs(Some("0")), 1, "never zero");
+        assert_eq!(secs(Some("999999")), 7200, "never more than two hours");
+    }
+
+    #[test]
+    fn a_slow_training_run_is_stopped_with_a_clear_message() {
+        let Some((root, paths, models)) = python_root("timeout") else { return };
+        build_dataset_files(&paths, "slow", &["AAA"], 300);
+        let request: MLTrainingRequestDto = serde_json::from_value(json!({"algorithm": "random_forest", "dataset": "slow", "n_splits": 3})).unwrap();
+        let err = block_on(train_core_with(&request, &models, &paths, "user", std::time::Duration::from_millis(50))).unwrap_err();
+        assert!(err.contains("longer than 50 ms") && err.contains("was stopped"), "{err}");
+        assert!(fs::read_dir(&models).unwrap().next().is_none(), "a stopped run leaves no model behind");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_hyperparameters_fail_before_a_trainer_is_started() {
+        let Some((root, paths, models)) = python_root("badkey") else { return };
+        build_dataset_files(&paths, "bk", &["AAA"], 200);
+        let request: MLTrainingRequestDto = serde_json::from_value(json!({
+            "algorithm": "random_forest", "dataset": "bk", "hyperparams": {"learning_rate": 0.1}
+        }))
+        .unwrap();
+        // A zero-length limit would fail with "stopped" if a trainer were started.
+        let err = block_on(train_core_with(&request, &models, &paths, "user", std::time::Duration::from_millis(1))).unwrap_err();
+        assert!(err.contains("unknown hyperparameter `learning_rate`") && err.contains("n_estimators"), "{err}");
+        // A parameter the old list never allowed passes the catalog check and trains.
+        let ok: MLTrainingRequestDto = serde_json::from_value(json!({
+            "algorithm": "extra_trees", "dataset": "bk", "n_splits": 3, "random_state": 11,
+            "hyperparams": {"n_estimators": 12, "max_depth": 3, "criterion": "entropy", "min_samples_split": 6, "n_jobs": 32}
+        }))
+        .unwrap();
+        let r = block_on(train_core(&ok, &models, &paths, "user")).unwrap();
+        let d = build_detail(&models, &r.model_id, vec![]).unwrap();
+        assert_eq!(d.algorithm, "extra_trees");
+        assert_eq!(d.hyperparams["criterion"], "entropy");
+        assert_eq!(d.hyperparams["n_jobs"], 4, "n_jobs is clamped, never passed through");
+        assert_eq!(d.hyperparams["random_state"], 11);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trade_mode_holdout_and_the_dataset_recipe_reach_the_model_detail() {
+        let Some((root, paths, models)) = python_root("modes") else { return };
+        // A real custom feature, so its column is in the data file as well as the sidecar.
+        build_dataset_files_with(
+            &paths,
+            "md",
+            &["AAA", "BBB"],
+            400,
+            json!({"custom_features": [{"name": "mom", "expr": "close / shift(close, 5) - 1"}], "fee_pct": 0.1}),
+        );
+        // The context symbol is recorded on the dataset without any formula reading it.
+        edit_sidecar(&paths, "md", |d| {
+            d["context_symbols"] = json!(["SPY"]);
+        });
+        let train = |extra: Value| {
+            let mut req = json!({"algorithm": "random_forest", "dataset": "md", "n_splits": 3, "hyperparams": {"n_estimators": 12, "max_depth": 4}});
+            req.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let request: MLTrainingRequestDto = serde_json::from_value(req).unwrap();
+            let r = block_on(train_core(&request, &models, &paths, "user")).unwrap();
+            build_detail(&models, &r.model_id, vec![]).unwrap()
+        };
+        let plain = train(json!({}));
+        assert_eq!(plain.trade_mode, "long_flat");
+        assert!(plain.holdout.is_none());
+        assert_eq!(plain.fee_pct, 0.1);
+        assert_eq!(plain.context_symbols, vec!["SPY"]);
+        assert_eq!(plain.custom_features[0].name, "mom");
+        assert_eq!(plain.hyperparams["random_state"], 42);
+
+        let both = train(json!({"trade_mode": "long_short", "holdout_pct": 20.0}));
+        assert_eq!(both.trade_mode, "long_short");
+        let h = both.holdout.expect("hold-out result");
+        assert!(h.rows > 0 && (0.0..=1.0).contains(&h.accuracy));
+        assert!(h.baseline_accuracy.is_some());
+        let t = both.trading.unwrap();
+        assert!(t.trades > plain.trading.unwrap().trades, "class 0 now shorts, so there are more trades");
+        assert!(both.log_tail.contains("Hold-out"), "{}", both.log_tail);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_custom_estimator_trains_and_is_scored_from_its_copy_after_the_original_is_deleted() {
+        let Some((root, paths, models)) = python_root("custom") else { return };
+        build_dataset_files(&paths, "cu", &["AAA", "BBB"], 300);
+        // The template the UI offers is itself a working estimator.
+        ml_estimators::write_file(&root, "centroid.py", ml_estimators::ESTIMATOR_TEMPLATE).unwrap();
+        let request: MLTrainingRequestDto = serde_json::from_value(json!({
+            "algorithm": "custom", "dataset": "cu", "n_splits": 3, "estimator_file": "centroid.py",
+            "hyperparams": {"shrink": 0.1}, "holdout_pct": 15.0
+        }))
+        .unwrap();
+        let r = block_on(train_core(&request, &models, &paths, "user")).unwrap();
+        let d = build_detail(&models, &r.model_id, vec![]).unwrap();
+        assert_eq!(d.algorithm, "custom");
+        assert_eq!(d.estimator_file.as_deref(), Some("centroid.py"));
+        assert!(d.holdout.is_some());
+        let copy = models.join(format!("{}_estimator.py", r.model_id));
+        assert_eq!(fs::read_to_string(&copy).unwrap(), ml_estimators::ESTIMATOR_TEMPLATE);
+        let raw: Value = serde_json::from_str(&fs::read_to_string(models.join(format!("{}.json", r.model_id))).unwrap()).unwrap();
+        assert_eq!(raw["estimator_sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(raw["estimator_copy"], format!("{}_estimator.py", r.model_id));
+
+        // Edit, then delete the original; the model must still score.
+        ml_estimators::write_file(&root, "centroid.py", "def make_estimator(params):\n    raise RuntimeError('edited')\n").unwrap();
+        ml_estimators::remove_file(&root, "centroid.py").unwrap();
+        let model = load_scoring_model(&models, &r.model_id).unwrap();
+        let features = ml_features::latest_features(&synthetic_bars(300), &model.meta.feature_names, "AAA").unwrap();
+        let out = block_on(run_predictor(
+            &paths,
+            vec!["--model-path".into(), model.model_path.clone().into_os_string(), "--features-json".into(), serde_json::to_string(&features).unwrap().into()],
+            "custom",
+        ))
+        .unwrap();
+        let signal: PredictorCliResult = serde_json::from_str(&out).unwrap();
+        assert!(signal.signal == 0 || signal.signal == 1);
+        assert!(signal.probability.is_some());
+
+        // Deleting the model deletes the copy too.
+        assert!(delete_model_files(&models, &r.model_id).unwrap());
+        assert!(!copy.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_broken_custom_estimator_fails_with_the_python_error() {
+        let Some((root, paths, models)) = python_root("custom-bad") else { return };
+        build_dataset_files(&paths, "cb", &["AAA"], 200);
+        ml_estimators::write_file(&root, "broken.py", "def make_estimator(params):\n    return object()\n").unwrap();
+        let request: MLTrainingRequestDto = serde_json::from_value(json!({"algorithm": "custom", "dataset": "cb", "estimator_file": "broken.py"})).unwrap();
+        let err = block_on(train_core(&request, &models, &paths, "user")).unwrap_err();
+        assert!(err.contains("fit()"), "{err}");
+        assert!(fs::read_dir(&models).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
 }

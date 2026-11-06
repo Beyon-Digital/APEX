@@ -13,9 +13,18 @@ Evaluation notes
   therefore drops (embargoes) training rows whose label window reaches into the test period, so
   nothing the model trains on was decided by test-period prices.
 * When the data carries a forward-return column, each fold is also scored as a trading rule:
-  1 = long, anything else = flat, using rows spaced ``horizon_bars`` apart so a return is never
-  counted twice.  The rule never shorts, because APEX automations are long/flat only: a number
-  that included short profits would be one the automation could not earn.
+  using rows spaced ``horizon_bars`` apart so a return is never counted twice.  ``trade_mode``
+  decides what a prediction means: ``long_flat`` (default) only ever holds longs, which is what an
+  automation does unless shorting is switched on for it; ``long_short`` also shorts.  Class meaning
+  follows the dataset's label kind: ``direction`` (0/1): 1 = long, 0 = short or flat;
+  ``return_threshold`` (-1/0/1): 1 = long, -1 = short or flat, 0 = flat.  Without a label spec the
+  second mapping is used, so 0/1 data is long/flat in both modes.
+* ``holdout_pct`` removes the last share of the time steps before cross-validation (with an
+  embargo of ``horizon_bars`` steps), fits the final model on the rest only, and scores the
+  hold-out once, so that number never influenced any choice.
+* Custom estimators (``algorithm="custom"``) are imported from a user file, see
+  :mod:`ml.estimators`.  The file is copied next to the model so scoring keeps working if the
+  original is edited or deleted.
 """
 
 from __future__ import annotations
@@ -36,139 +45,23 @@ from typing import Any, Callable
 import joblib
 import numpy as np
 import polars as pl
-from sklearn.base import BaseEstimator, clone
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.base import BaseEstimator
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from ml.estimators import LabelEncodedClassifier
+from ml import catalog
+from ml.catalog import DEFAULT_SEED, MAX_SEED, check_model_size, validate_hyperparams  # noqa: F401 - re-exported
+from ml.estimators import (
+    LabelEncodedClassifier,
+    estimator_module_name,
+    file_sha256,
+    import_estimator_file,
+    make_custom_estimator,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# ------------------------------------------------------------------
-# Hyperparameter allow-list
-# ------------------------------------------------------------------
-
-_MAX_SEED = 2**31 - 1
-
-
-def _is_number(v: Any) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
-
-
-def _int_in(lo: int, hi: int, allow_none: bool = False) -> tuple[str, Callable[[Any], Any]]:
-    desc = f"an integer from {lo} to {hi}" + (" or null" if allow_none else "")
-
-    def check(v: Any) -> Any:
-        if v is None and allow_none:
-            return None
-        if _is_number(v) and float(v).is_integer() and lo <= v <= hi:
-            return int(v)
-        raise ValueError
-
-    return desc, check
-
-
-def _float_in(hi: float) -> tuple[str, Callable[[Any], Any]]:
-    desc = f"a number greater than 0 and at most {hi:g}"
-
-    def check(v: Any) -> Any:
-        if _is_number(v) and 0 < v <= hi:
-            return float(v)
-        raise ValueError
-
-    return desc, check
-
-
-def _choice(*options: Any) -> tuple[str, Callable[[Any], Any]]:
-    desc = "one of " + ", ".join("null" if o is None else repr(o) for o in options)
-
-    def check(v: Any) -> Any:
-        if v in options and not isinstance(v, bool):
-            return v
-        raise ValueError
-
-    return desc, check
-
-
-def _max_features() -> tuple[str, Callable[[Any], Any]]:
-    desc = "'sqrt', 'log2', null, an integer from 1 to 1000 or a fraction in (0, 1]"
-
-    def check(v: Any) -> Any:
-        if v is None or v in ("sqrt", "log2"):
-            return v
-        if isinstance(v, bool):
-            raise ValueError
-        if isinstance(v, int) and 1 <= v <= 1000:
-            return v
-        if isinstance(v, float) and 0 < v <= 1:
-            return v
-        raise ValueError
-
-    return desc, check
-
-
-HYPERPARAMS: dict[str, dict[str, tuple[str, Callable[[Any], Any]]]] = {
-    "random_forest": {
-        "n_estimators": _int_in(1, 2000),
-        "max_depth": _int_in(1, 100, allow_none=True),
-        "min_samples_leaf": _int_in(1, 1000),
-        "max_features": _max_features(),
-        "class_weight": _choice(None, "balanced", "balanced_subsample"),
-        "random_state": _int_in(0, _MAX_SEED),
-    },
-    "gradient_boosting": {
-        "n_estimators": _int_in(1, 2000),
-        "learning_rate": _float_in(1.0),
-        "max_depth": _int_in(1, 20),
-        "subsample": _float_in(1.0),
-        "random_state": _int_in(0, _MAX_SEED),
-    },
-    "logistic_regression": {
-        "C": _float_in(1_000_000.0),
-        "max_iter": _int_in(1, 100_000),
-        "class_weight": _choice(None, "balanced"),
-    },
-    "xgboost": {
-        "n_estimators": _int_in(1, 2000),
-        "max_depth": _int_in(1, 20),
-        "learning_rate": _float_in(1.0),
-        "subsample": _float_in(1.0),
-        "colsample_bytree": _float_in(1.0),
-        "random_state": _int_in(0, _MAX_SEED),
-    },
-}
-
-# Algorithms whose results should be reproducible unless the caller picks another seed.
-_DEFAULT_SEED = 42
-
-
-def validate_hyperparams(algorithm: str, hyperparams: dict[str, Any] | None) -> dict[str, Any]:
-    """Return the checked (and normalised) hyperparameters, or raise ``ValueError``.
-
-    Only keys on the algorithm's allow-list are accepted, each with a type and range check.
-    """
-    if algorithm not in HYPERPARAMS:
-        raise ValueError(f"Unknown algorithm '{algorithm}'. Supported: {sorted(HYPERPARAMS)}")
-    allowed = HYPERPARAMS[algorithm]
-    out: dict[str, Any] = {}
-    for key, value in (hyperparams or {}).items():
-        if key not in allowed:
-            raise ValueError(
-                f"unknown hyperparameter '{key}' for {algorithm}; allowed: {', '.join(allowed)}"
-            )
-        desc, check = allowed[key]
-        try:
-            out[key] = check(value)
-        except ValueError:
-            raise ValueError(
-                f"invalid value {value!r} for hyperparameter '{key}' of {algorithm}: expected {desc}"
-            ) from None
-    return out
 
 
 # ------------------------------------------------------------------
@@ -179,7 +72,7 @@ def validate_hyperparams(algorithm: str, hyperparams: dict[str, Any] | None) -> 
 class TrainingConfig:
     """Everything needed to kick off a training run."""
 
-    algorithm: str  # "random_forest" | "gradient_boosting" | "xgboost" | "logistic_regression"
+    algorithm: str  # see ml.catalog.supported_ids()
     data_path: str  # path to Parquet / CSV
     target_column: str
     feature_columns: list[str] = field(default_factory=list)
@@ -191,12 +84,22 @@ class TrainingConfig:
     return_column: str | None = None
     #: dataset name when the data came from the workbench
     dataset: str | None = None
-    #: {"name", "symbols", "timeframe", "label"} copied from the dataset sidecar
+    #: {"name", "symbols", "timeframe", "label", "custom_features", "context_symbols", "fee_pct"}
+    #: copied from the dataset sidecar
     dataset_meta: dict[str, Any] | None = None
     #: bars covered by each label; sets the embargo and the trade spacing
     horizon_bars: int = 0
     #: who started the run: "user" | "copilot"
     source: str = "user"
+    #: how the evaluation trades predictions: "long_flat" | "long_short"
+    trade_mode: str = "long_flat"
+    #: share (0-40) of the final time steps kept out of cross-validation and scored once
+    holdout_pct: float = 0.0
+    #: seed for estimators that take one; None means the fixed default (42)
+    random_state: int | None = None
+    #: custom estimator: file name (``my_model.py``) and the absolute path it is read from
+    estimator_file: str | None = None
+    estimator_path: str | None = None
 
 
 @dataclass
@@ -227,6 +130,9 @@ class Prepared:
     n_steps: int
 
 
+TRADE_MODES = ("long_flat", "long_short")
+MAX_HOLDOUT_PCT = 40
+
 _BARS_PER_YEAR = {"1m": 98_280, "5m": 19_656, "15m": 6_552, "1h": 1_638, "4h": 410, "1d": 252, "1w": 52}
 
 
@@ -251,12 +157,6 @@ def _clean(obj: Any) -> Any:
 class ModelTrainer:
     """Train, evaluate, and register ML models for APEX strategies."""
 
-    _ALGORITHMS: dict[str, type[BaseEstimator]] = {
-        "random_forest": RandomForestClassifier,
-        "gradient_boosting": GradientBoostingClassifier,
-        "logistic_regression": LogisticRegression,
-    }
-
     def train(self, config: TrainingConfig) -> TrainedModel:
         """End-to-end train → evaluate → register pipeline."""
         buffer = io.StringIO()
@@ -273,10 +173,23 @@ class ModelTrainer:
 
     def _train(self, config: TrainingConfig, buffer: io.StringIO) -> TrainedModel:
         started = time.perf_counter()
-        logger.info("Starting training run: algorithm=%s source=%s", config.algorithm, config.source)
+        logger.info(
+            "Starting training run: algorithm=%s source=%s trade_mode=%s holdout=%s%%",
+            config.algorithm, config.source, config.trade_mode, config.holdout_pct,
+        )
         hyperparams = validate_hyperparams(config.algorithm, config.hyperparams)
         if not 2 <= config.n_splits <= 20:
             raise ValueError("n_splits must be between 2 and 20")
+        if config.trade_mode not in TRADE_MODES:
+            raise ValueError(f"trade_mode must be one of {', '.join(TRADE_MODES)}")
+        if not (isinstance(config.holdout_pct, (int, float)) and 0 <= config.holdout_pct <= MAX_HOLDOUT_PCT):
+            raise ValueError(f"holdout_pct must be between 0 and {MAX_HOLDOUT_PCT}")
+        if config.random_state is not None and not (
+            isinstance(config.random_state, int) and not isinstance(config.random_state, bool)
+            and 0 <= config.random_state <= MAX_SEED
+        ):
+            raise ValueError(f"random_state must be an integer from 0 to {MAX_SEED}")
+        estimator = self._load_estimator_source(config)
 
         df = self._load_data(config)
         data = self._build_features(df, config)
@@ -284,6 +197,19 @@ class ModelTrainer:
             "Loaded %d usable rows, %d features, %d time steps, embargo=%d bars",
             len(data.y), len(data.feature_names), data.n_steps, config.horizon_bars,
         )
+
+        usable_rows = len(data.y)
+        # Refuse a configuration that cannot fit in memory before spending time on it.
+        check_model_size(config.algorithm, hyperparams, usable_rows, int(len(set(data.y.tolist()))))
+        holdout_data = None
+        split_info = None
+        if config.holdout_pct > 0:
+            data, holdout_data, split_info = self._split_holdout(data, config)
+            logger.info(
+                "Hold-out: last %d of %d time steps (%d rows) kept out; embargo %d steps; %d rows for cross-validation and the final fit",
+                split_info["steps"], split_info["total_steps"], len(holdout_data.y), split_info["embargo_steps"], len(data.y),
+            )
+
         classes = np.unique(data.y)
         if len(classes) < 2:
             raise ValueError(
@@ -291,19 +217,80 @@ class ModelTrainer:
                 "a model needs at least two. Use a longer history, more symbols or a smaller threshold."
             )
         logger.info("Classes: %s", {int(c): int((data.y == c).sum()) for c in classes})
+        label_kind = self._label_kind(config, np.unique(np.concatenate([data.y, holdout_data.y])) if holdout_data else classes)
 
-        model = self._build_model(config.algorithm, hyperparams, classes)
-        folds, metrics, trading_periods = self._evaluate(model, data, config)
+        hyperparams = self._with_seed(config, hyperparams)
+        factory = self._model_factory(config, hyperparams, classes, estimator)
+        folds, metrics, trading_periods = self._evaluate(factory, data, config, label_kind)
 
+        model = factory()
         model.fit(data.x, data.y)
         logger.info("Final model fitted on %d rows", len(data.y))
+
+        holdout = None
+        if holdout_data is not None:
+            holdout = self._score_holdout(model, holdout_data, config, label_kind, split_info)
 
         trading = self._summarise_trading(trading_periods, config)
         importances = self._importances(model, data.feature_names)
         duration = round(time.perf_counter() - started, 2)
         return self._register(
-            model, data, metrics, folds, trading, importances, hyperparams, duration, config, buffer
+            model, data, metrics, folds, trading, importances, hyperparams, duration, config, buffer,
+            holdout=holdout, estimator=estimator, total_rows=usable_rows,
         )
+
+    # ------------------------------------------------------------------
+    # Estimator construction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _with_seed(config: TrainingConfig, hyperparams: dict[str, Any]) -> dict[str, Any]:
+        """Fill in ``random_state`` for estimators that take one, so runs repeat exactly."""
+        out = dict(hyperparams)
+        seed = DEFAULT_SEED if config.random_state is None else int(config.random_state)
+        if config.algorithm == catalog.CUSTOM:
+            out.setdefault("random_state", seed)
+        elif "random_state" in catalog.param_specs(config.algorithm):
+            out.setdefault("random_state", seed)
+        return out
+
+    def _load_estimator_source(self, config: TrainingConfig) -> dict[str, Any] | None:
+        """Read the custom estimator file once; its bytes and hash are what gets used and saved."""
+        if config.algorithm != catalog.CUSTOM:
+            return None
+        if not config.estimator_path or not config.estimator_file:
+            raise ValueError("algorithm 'custom' needs an estimator_file (save one in the Train tab first)")
+        path = Path(config.estimator_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"estimator file not found: {config.estimator_file}")
+        data = path.read_bytes()
+        sha = file_sha256(data)
+        module_name = estimator_module_name(sha)
+        module = import_estimator_file(path, module_name)
+        if file_sha256(path.read_bytes()) != sha:
+            raise ValueError(f"{config.estimator_file} changed while it was being loaded; run the training again")
+        return {"name": config.estimator_file, "path": str(path), "bytes": data, "sha256": sha,
+                "module_name": module_name, "module": module}
+
+    def _model_factory(
+        self, config: TrainingConfig, hyperparams: dict[str, Any], classes: np.ndarray, estimator: dict[str, Any] | None
+    ) -> Callable[[], BaseEstimator]:
+        """Return a function that builds a fresh, unfitted model (one per fold, one for the end)."""
+        algorithm = config.algorithm
+        if algorithm == catalog.CUSTOM:
+            module = estimator["module"]
+            return lambda: make_custom_estimator(module, hyperparams)
+        cls = catalog.estimator_class(algorithm)
+        params = dict(hyperparams)
+        if algorithm == "xgboost":
+            params.setdefault("n_jobs", 1)
+            params.setdefault("verbosity", 0)
+            contiguous = list(classes) == list(range(len(classes)))
+            return lambda: cls(**params) if contiguous else LabelEncodedClassifier(cls(**params))
+        if algorithm == "logistic_regression":
+            # Features are on very different scales; the scaler is part of the saved model.
+            return lambda: make_pipeline(StandardScaler(), cls(**params))
+        return lambda: cls(**params)
 
     # ------------------------------------------------------------------
     # Pipeline stages
@@ -412,28 +399,6 @@ class ModelTrainer:
                 end[idx[:-horizon]] = step[idx[horizon:]]
         return end
 
-    def _build_model(self, algorithm: str, hyperparams: dict[str, Any], classes: np.ndarray) -> BaseEstimator:
-        """Instantiate the requested estimator."""
-        params = dict(hyperparams)
-        if algorithm == "xgboost":
-            import xgboost as xgb  # noqa: PLC0415
-
-            params.setdefault("random_state", _DEFAULT_SEED)
-            contiguous = list(classes) == list(range(len(classes)))
-            est = xgb.XGBClassifier(n_jobs=1, verbosity=0, **params)
-            return est if contiguous else LabelEncodedClassifier(est)
-        cls = self._ALGORITHMS.get(algorithm)
-        if cls is None:
-            raise ValueError(
-                f"Unknown algorithm '{algorithm}'. "
-                f"Supported: {sorted([*self._ALGORITHMS, 'xgboost'])}"
-            )
-        if algorithm == "logistic_regression":
-            # Features are on very different scales; the scaler is part of the saved model.
-            return make_pipeline(StandardScaler(), cls(**params))
-        params.setdefault("random_state", _DEFAULT_SEED)
-        return cls(**params)
-
     def _folds(self, data: Prepared, config: TrainingConfig):
         """Yield (train_idx, test_idx) with the embargo applied."""
         horizon = max(int(config.horizon_bars), 0)
@@ -458,7 +423,9 @@ class ModelTrainer:
                 )
             yield train_idx, test_idx
 
-    def _evaluate(self, model: BaseEstimator, data: Prepared, config: TrainingConfig):
+    def _evaluate(
+        self, factory: Callable[[], BaseEstimator], data: Prepared, config: TrainingConfig, label_kind: str = "return_threshold"
+    ):
         """Run the embargoed time-series CV; return per-fold records, mean metrics, trade periods."""
         records: list[dict[str, Any]] = []
         periods: list[dict[str, Any]] = []
@@ -471,7 +438,7 @@ class ModelTrainer:
                     f"fold {fold} training rows contain a single class; "
                     "use a longer history, more symbols or fewer folds"
                 )
-            fold_model = clone(model)
+            fold_model = factory()
             fold_model.fit(data.x[train_idx], data.y[train_idx])
             preds = fold_model.predict(data.x[test_idx])
             y_test = data.y[test_idx]
@@ -491,7 +458,8 @@ class ModelTrainer:
             }
             if can_trade:
                 trade = self._trade_fold(
-                    preds, data.ret[test_idx], data.step[test_idx], data.group[test_idx], horizon
+                    preds, data.ret[test_idx], data.step[test_idx], data.group[test_idx], horizon,
+                    kind=label_kind, trade_mode=config.trade_mode, fee=self._fee(config),
                 )
                 periods.append(trade)
                 record["trade_return_pct"] = trade["return_pct"]
@@ -513,18 +481,63 @@ class ModelTrainer:
         return records, metrics, periods
 
     @staticmethod
+    def _label_kind(config: TrainingConfig, classes: np.ndarray) -> str:
+        """"direction" or "return_threshold": which meaning the classes have.
+
+        Read from the dataset's label spec; without one, inferred from the classes. Data with no
+        -1 class and no label spec is treated like ``return_threshold`` (0 = flat), which is how
+        automations read a legacy model.
+        """
+        kind = ((config.dataset_meta or {}).get("label") or {}).get("kind")
+        if kind in ("direction", "return_threshold"):
+            return kind
+        return "return_threshold"
+
+    @staticmethod
+    def _fee(config: TrainingConfig) -> float:
+        """Round-trip cost as a fraction (the dataset's ``fwd_ret`` already has it subtracted)."""
+        try:
+            fee = float((config.dataset_meta or {}).get("fee_pct") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(fee, 0.0) / 100.0 if math.isfinite(fee) else 0.0
+
+    @staticmethod
+    def _positions(preds: np.ndarray, kind: str, trade_mode: str) -> np.ndarray:
+        """Position taken for each prediction: 1 long, -1 short, 0 flat.
+
+        ``direction``: 1 = long, 0 = short (``long_short``) or flat. ``return_threshold``:
+        1 = long, -1 = short (``long_short``) or flat, 0 = flat. Any other class is flat.
+        """
+        preds = np.asarray(preds)
+        pos = np.zeros(len(preds), dtype=float)
+        pos[preds == 1] = 1.0
+        if trade_mode == "long_short":
+            pos[preds == (0 if kind == "direction" else -1)] = -1.0
+        return pos
+
+    @staticmethod
     def _trade_fold(
-        preds: np.ndarray, ret: np.ndarray, step: np.ndarray, group: np.ndarray, horizon: int
+        preds: np.ndarray,
+        ret: np.ndarray,
+        step: np.ndarray,
+        group: np.ndarray,
+        horizon: int,
+        kind: str = "return_threshold",
+        trade_mode: str = "long_flat",
+        fee: float = 0.0,
     ) -> dict[str, Any]:
         """Trade the predicted signals on rows spaced ``horizon`` apart on a shared time grid.
 
         Time steps are bucketed into windows of ``horizon`` steps starting at the fold's first step.
         Each symbol trades its first row in every window, so a slot is one point in time for all
         symbols, whatever their calendars or start dates. The slot's return is the equal weight
-        average of ``position * forward_return`` over the symbols present, where the position is 1
-        (long) for a prediction of 1 and 0 (flat) for every other class.
+        average of the per-symbol results over the symbols present. A long earns ``ret``; a short
+        earns ``-ret - 2 * fee`` (``ret`` already has the round-trip fee taken off, which would
+        otherwise turn the fee into income for a short); a flat row earns nothing.
         """
-        slots: dict[int, list[tuple[float, float]]] = {}
+        positions = ModelTrainer._positions(preds, kind, trade_mode)
+        slots: dict[int, list[tuple[float, float, bool]]] = {}
         if len(step):
             origin = int(np.min(step))
             for g in np.unique(group):
@@ -536,17 +549,18 @@ class ModelTrainer:
                     if slot in seen:
                         continue
                     seen.add(slot)
-                    # Long/flat: only class 1 holds a position. -1 ("down") exits, it never shorts.
-                    slots.setdefault(slot, []).append((1.0 if preds[i] == 1 else 0.0, float(ret[i])))
+                    r = float(ret[i])
+                    pnl = r if positions[i] > 0 else (-r - 2.0 * fee if positions[i] < 0 else 0.0)
+                    slots.setdefault(slot, []).append((pnl, r, bool(positions[i] != 0)))
         strategy, hold, wins, trades = [], [], 0, 0
         for s in sorted(slots):
             pairs = slots[s]
-            strategy.append(float(np.mean([p * r for p, r in pairs])))
-            hold.append(float(np.mean([r for _, r in pairs])))
-            for p, r in pairs:
-                if p != 0:
+            strategy.append(float(np.mean([p for p, _, _ in pairs])))
+            hold.append(float(np.mean([r for _, r, _ in pairs])))
+            for pnl, _, traded in pairs:
+                if traded:
                     trades += 1
-                    wins += 1 if p * r > 0 else 0
+                    wins += 1 if pnl > 0 else 0
         growth = float(np.prod(1 + np.array(strategy))) if strategy else 1.0
         return {
             "return_pct": (growth - 1) * 100,
@@ -556,6 +570,67 @@ class ModelTrainer:
             "strategy": strategy,
             "hold": hold,
         }
+
+    # ------------------------------------------------------------------
+    # Hold-out
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _subset(data: Prepared, mask: np.ndarray, n_steps: int) -> Prepared:
+        return Prepared(
+            data.x[mask], data.y[mask], None if data.ret is None else data.ret[mask], data.step[mask],
+            data.label_end[mask], data.group[mask], data.feature_names, n_steps,
+        )
+
+    def _split_holdout(self, data: Prepared, config: TrainingConfig):
+        """Split off the last ``holdout_pct`` percent of distinct time steps.
+
+        Returns ``(fit_data, holdout_data, info)``. ``fit_data`` (used for cross-validation and for
+        the final fit) keeps only rows whose time step lies at least ``horizon`` steps before the
+        hold-out and whose label is decided before the hold-out starts, so no label window reaches
+        into it.
+        """
+        horizon = max(int(config.horizon_bars), 0)
+        total = data.n_steps
+        steps = max(1, int(round(total * float(config.holdout_pct) / 100.0)))
+        hold_start = total - steps
+        cv_end = hold_start - horizon
+        fit_mask = (data.step < cv_end) & (data.label_end < hold_start)
+        hold_mask = data.step >= hold_start
+        if cv_end < 2 or not fit_mask.any() or not hold_mask.any():
+            raise ValueError(
+                f"a {config.holdout_pct:g}% hold-out of {total} time steps with a {horizon}-bar embargo leaves too little "
+                "data; use a smaller hold-out or build a larger dataset"
+            )
+        info = {
+            "pct": float(config.holdout_pct), "steps": int(steps), "total_steps": int(total),
+            "start_step": int(hold_start), "embargo_steps": int(horizon),
+        }
+        return self._subset(data, fit_mask, int(cv_end)), self._subset(data, hold_mask, int(total)), info
+
+    def _score_holdout(
+        self, model: BaseEstimator, hold: Prepared, config: TrainingConfig, label_kind: str, info: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Score the final model once on the hold-out rows."""
+        preds = np.asarray(model.predict(hold.x))
+        record: dict[str, Any] = {
+            "rows": int(len(hold.y)),
+            "accuracy": float(accuracy_score(hold.y, preds)),
+            "baseline_accuracy": float(np.bincount(hold.y - hold.y.min()).max() / len(hold.y)),
+            "trading": None,
+            **info,
+        }
+        if hold.ret is not None and set(np.unique(hold.y)) <= {-1, 0, 1}:
+            trade = self._trade_fold(
+                preds, hold.ret, hold.step, hold.group, max(int(config.horizon_bars), 1),
+                kind=label_kind, trade_mode=config.trade_mode, fee=self._fee(config),
+            )
+            record["trading"] = self._summarise_trading([trade], config)
+        logger.info(
+            "Hold-out (%d rows): accuracy=%.4f baseline=%.4f%s", record["rows"], record["accuracy"], record["baseline_accuracy"],
+            "" if record["trading"] is None else f" trade_return={record['trading']['strategy_return_pct']:.2f}% trades={record['trading']['trades']}",
+        )
+        return record
 
     @staticmethod
     def _summarise_trading(periods: list[dict[str, Any]], config: TrainingConfig) -> dict[str, float] | None:
@@ -634,6 +709,9 @@ class ModelTrainer:
         duration: float,
         config: TrainingConfig,
         buffer: io.StringIO,
+        holdout: dict[str, Any] | None = None,
+        estimator: dict[str, Any] | None = None,
+        total_rows: int | None = None,
     ) -> TrainedModel:
         """Persist model with joblib + companion metadata json and log."""
         out_dir = Path(config.output_dir)
@@ -659,10 +737,26 @@ class ModelTrainer:
 
         logger.info("Model saved to %s", model_path)
 
+        estimator_meta: dict[str, Any] = {}
+        if estimator is not None:
+            # Keep the exact code the model was trained with next to it.
+            copy_name = f"{model_id}_estimator.py"
+            try:
+                (out_dir / copy_name).write_bytes(estimator["bytes"])
+            except OSError:
+                model_path.unlink(missing_ok=True)
+                raise
+            estimator_meta = {
+                "estimator_file": estimator["name"],
+                "estimator_path": config.estimator_path,
+                "estimator_sha256": estimator["sha256"],
+                "estimator_copy": copy_name,
+                "estimator_module": estimator["module_name"],
+            }
+            logger.info("Estimator file copied to %s (sha256 %s)", copy_name, estimator["sha256"][:12])
+
         meta = config.dataset_meta or {}
         effective = dict(hyperparams)
-        if config.algorithm in ("random_forest", "gradient_boosting", "xgboost"):
-            effective.setdefault("random_state", _DEFAULT_SEED)
         metadata = {
             "model_id": model_id,
             "algorithm": config.algorithm,
@@ -686,12 +780,21 @@ class ModelTrainer:
             "symbols": list(meta.get("symbols") or []),
             "timeframe": meta.get("timeframe"),
             "label": meta.get("label"),
-            "rows": int(len(data.y)),
+            "rows": int(total_rows if total_rows is not None else len(data.y)),
             "duration_secs": duration,
             "library_versions": self._library_versions(),
             "cv_folds": folds,
             "feature_importance": importances,
             "trading": trading,
+            "trade_mode": config.trade_mode,
+            "holdout": holdout,
+            "random_state": effective.get("random_state"),
+            # Copied from the dataset so inference can recompute the same features.
+            "custom_features": list(meta.get("custom_features") or []),
+            "context_symbols": list(meta.get("context_symbols") or []),
+            "fee_pct": float(meta.get("fee_pct") or 0.0),
+            **({"estimator_file": None} if estimator is None else {}),
+            **estimator_meta,
         }
         metadata_path = out_dir / f"{model_id}.json"
         metadata_path.write_text(json.dumps(_clean(metadata), indent=2, allow_nan=False))

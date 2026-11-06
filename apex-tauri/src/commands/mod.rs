@@ -15,7 +15,9 @@ pub mod health;
 pub mod live;
 pub mod market;
 pub mod ml;
+pub mod ml_expr;
 pub mod ml_datasets;
+pub mod ml_estimators;
 pub mod ml_features;
 pub mod news;
 pub mod notebook;
@@ -27,6 +29,7 @@ pub mod quant;
 pub mod risk;
 pub mod scanner;
 pub mod settings;
+pub mod signal_policy;
 pub mod strategy;
 pub mod vault;
 

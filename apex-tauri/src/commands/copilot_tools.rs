@@ -24,6 +24,87 @@ pub fn content_hash(content: &str) -> String {
     hex::encode(&Sha256::digest(content.as_bytes())[..6])
 }
 
+/// Whether this call trains with a user-supplied Python estimator (which runs arbitrary code).
+pub fn is_custom_training(name: &str, args: &Value) -> bool {
+    name == "train_ml_model" && args.get("algorithm").and_then(|v| v.as_str()) == Some("custom")
+}
+
+fn estimator_name(args: &Value) -> &str {
+    args.get("estimator_file").and_then(|v| v.as_str()).unwrap_or("").trim()
+}
+
+/// Hash of the estimator file's current content, or `None` when it cannot be read.
+pub fn estimator_file_hash(args: &Value, paths: &RuntimePaths) -> Option<String> {
+    let path = super::ml_estimators::resolve_for_training(paths.work_root(), estimator_name(args)).ok()?;
+    std::fs::read_to_string(path).ok().map(|text| content_hash(&text))
+}
+
+/// A custom-estimator training run needs approval unless the file's exact current content was
+/// already approved (`ml_estimators::needs_approval`, the same content-hash mechanism as
+/// `run_backtest`). An unreadable or missing file always asks.
+pub fn custom_training_needs_approval(name: &str, args: &Value, state: &AppState, paths: &RuntimePaths) -> bool {
+    is_custom_training(name, args) && super::ml_estimators::needs_approval(state, paths.work_root(), estimator_name(args))
+}
+
+/// The Copilot wrote this estimator: remember its hash as authored, not approved. The value can
+/// never equal a bare hash, so `ml_estimators::needs_approval` keeps asking. A hash the user
+/// already approved stays approved when the same content is saved again.
+pub fn note_estimator_authored(state: &AppState, name: &str, content: &str) {
+    let hash = content_hash(content);
+    let mut trusted = state.copilot_trusted_files.lock().unwrap_or_else(|p| p.into_inner());
+    let key = super::ml_estimators::trust_key(name);
+    if trusted.get(&key) != Some(&hash) {
+        trusted.insert(key, format!("authored:{hash}"));
+    }
+}
+
+/// The user approved training with this estimator (or it was already trusted): trust the
+/// content it has right now. Any later edit changes the hash and asks again.
+pub fn trust_estimator(state: &AppState, args: &Value, paths: &RuntimePaths) {
+    if let Some(hash) = estimator_file_hash(args, paths) {
+        state
+            .copilot_trusted_files
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(super::ml_estimators::trust_key(estimator_name(args)), hash);
+    }
+}
+
+pub fn forget_estimator(state: &AppState, name: &str) {
+    state
+        .copilot_trusted_files
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&super::ml_estimators::trust_key(name));
+}
+
+/// Extra text for the approval card of a custom-estimator run: the file's hash and the start of
+/// its code, so the user sees what they are agreeing to. Empty for every other call.
+pub fn estimator_card_note(name: &str, args: &Value, paths: &RuntimePaths) -> String {
+    if !is_custom_training(name, args) {
+        return String::new();
+    }
+    let file = estimator_name(args);
+    let Some(path) = super::ml_estimators::resolve_for_training(paths.work_root(), file).ok() else {
+        return format!(" - estimator {file} was not found");
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return format!(" - estimator {file} could not be read");
+    };
+    let preview: String = text.chars().filter(|c| *c != '\r').take(160).collect::<String>().replace('\n', " ⏎ ");
+    format!(" - {file}: {} chars, hash {}. This Python runs on your machine. Starts: {preview}", text.chars().count(), content_hash(&text))
+}
+
+/// Extra suffix for the approval key of a custom-estimator run, so an approval covers the
+/// content the user saw and not whatever the file holds when the call is replayed.
+pub fn approval_key_suffix(name: &str, args: &Value, paths: &RuntimePaths) -> String {
+    if is_custom_training(name, args) {
+        format!("#estimator={}", estimator_file_hash(args, paths).unwrap_or_else(|| "missing".into()))
+    } else {
+        String::new()
+    }
+}
+
 /// Whether a tool call beyond the base write list needs the user's approval.
 ///
 /// * `start_strategy` and `modify_order` always do.
@@ -31,6 +112,8 @@ pub fn content_hash(content: &str) -> String {
 ///   closes its position at market.
 /// * `run_backtest` and strategy runs execute the file's Python, so they need
 ///   approval unless the copilot wrote that exact content and the user approved it.
+/// * `train_ml_model` with the `custom` algorithm runs an estimator file's Python, so it needs
+///   approval unless the user already approved that file's exact content.
 pub fn needs_approval(name: &str, args: &Value, state: &AppState, paths: &RuntimePaths) -> bool {
     if EXTRA_WRITE_TOOLS.contains(&name) || super::copilot_more::WRITE_TOOLS.contains(&name) {
         return true;
@@ -51,6 +134,7 @@ pub fn needs_approval(name: &str, args: &Value, state: &AppState, paths: &Runtim
             let trusted = state.copilot_trusted_files.lock().unwrap().get(path).cloned();
             !(current.is_some() && current == trusted)
         }
+        "train_ml_model" => custom_training_needs_approval(name, args, state, paths),
         _ => false,
     }
 }
@@ -358,7 +442,14 @@ pub fn describe_call(name: &str, args: &Value) -> String {
         .filter(|b| *b != "paper")
         .map(|b| format!("[LIVE {b}] "))
         .unwrap_or_default();
-    format!("{live}{}", describe_call_inner(name, args))
+    // Shorting leads the card too: it is the part of an automation the user must not miss.
+    let short = if name == "create_automation" && wants_short(args) { "[SHORT] " } else { "" };
+    format!("{live}{short}{}", describe_call_inner(name, args))
+}
+
+/// Whether a `create_automation` call asks for the rule to be allowed to sell short.
+pub fn wants_short(args: &Value) -> bool {
+    args.get("allow_short").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 fn describe_call_inner(name: &str, args: &Value) -> String {
@@ -408,8 +499,9 @@ fn describe_call_inner(name: &str, args: &Value) -> String {
         ),
         "stop_strategy" | "get_strategy_session" => format!("{} {}", name.replace('_', " "), s("path")),
         "create_automation" => format!(
-            "Automation `{}`: model {} on {}, qty {}, every {}s, threshold {}, on {}",
+            "Automation `{}`{}: model {} on {}, qty {}, every {}s, threshold {}, on {}",
             s("name"),
+            if wants_short(args) { " (may go SHORT: sells shares it does not own)" } else { "" },
             s("model_id"),
             s("symbol"),
             args.get("quantity").and_then(|v| v.as_f64()).unwrap_or(1.0),
@@ -469,7 +561,15 @@ pub const ML_WORKFLOW: &str = "ML WORKFLOW (building a model for automated tradi
 - Read the result and get_model before you praise it: accuracy against baseline_accuracy (always guessing the common class), strategy return against buy and hold, number of trades, whether the folds agree, and which features carry the importance. Read the flags.\n\
 - Iterate: change hyperparameters (shallower trees, fewer estimators, class_weight), drop noisy features, change the horizon or timeframe, add symbols. Change one thing per run and compare runs.\n\
 - Only a model that beats both the baseline and buy and hold on several folds with enough trades earns a create_automation, and then on the paper broker with a small quantity. Never go live on your own.\n\
-- Warn the user about overfitting: many features on few rows, a great score on one fold, a few trades. Say plainly when a model is not good enough.";
+- Warn the user about overfitting: many features on few rows, a great score on one fold, a few trades. Say plainly when a model is not good enough.\n\
+- Choose the data: list_symbol_data shows what is stored, fetch_symbol_history downloads more. Add your own formulas as custom_features, but check each with check_expression first, keep them trailing-window (past bars only) and set fee_pct to the real round-trip cost.\n\
+- Train with holdout_pct (for example 20) so the last stretch of time is scored once, untouched by tuning. Compare the hold-out result and the cross-validated result against the baseline; a gap between them means overfitting. list_algorithms shows every algorithm and its hyperparameters. The `custom` algorithm trains a Python estimator file you write with save_estimator_file, and the user must approve running it.";
+
+/// Shorting rules for the system prompt.
+pub const SHORTING_NOTE: &str = "SHORTING\n\
+- Automations are long/flat unless create_automation is given allow_short=true. It is opt-in: leave it off unless the user asks, and try it on the paper broker first.\n\
+- Class meanings: a `direction` model's 1 = long and 0 = short (flat when shorting is off). A `return_threshold` model's 1 = long, -1 = short (flat when off), 0 = flat. train_ml_model trade_mode `long_short` evaluates with shorts, `long_flat` (default) without.\n\
+- Live shorting is disabled unless the user's config sets allow_live_shorting and the broker supports it. Never enable shorting on a live broker without telling the user the risk first: a short can lose more than it was opened with.";
 
 /// The system prompt, including a live snapshot of everything the copilot
 /// needs to reason about the account without having to call tools first.
@@ -536,6 +636,7 @@ pub fn system_prompt(state: &AppState, paths: &RuntimePaths, mode: super::copilo
          - If something looks wrong or the user asks to stop everything, call kill_switch.\n\
          - Answer tersely. This is decision support, not financial advice.\n\n\
          {ml_workflow}\n\n\
+         {shorting}\n\n\
          STATUS\n\
          risk_halted={} session_pnl={:.2} max_daily_loss={:.0}\n\
          live_armed={} live_orders_today={}/{} max_qty_per_order={} allow_live_trading={} vault={:?} \
@@ -566,6 +667,7 @@ pub fn system_prompt(state: &AppState, paths: &RuntimePaths, mode: super::copilo
         if files.is_empty() { "(none)".to_string() } else { files.join(", ") },
         mode_note = mode.prompt_note(),
         ml_workflow = ML_WORKFLOW,
+        shorting = SHORTING_NOTE,
     )
 }
 
@@ -586,6 +688,9 @@ pub mod audit {
         "delete_dataset",
         "delete_ml_model",
         "update_model",
+        "fetch_symbol_history",
+        "save_estimator_file",
+        "delete_estimator_file",
     ];
 
     /// How a tool call turns into log entries.
@@ -643,6 +748,9 @@ pub mod audit {
             "delete_dataset" => class("dataset", "dataset.delete", SelfRecording, false),
             "delete_ml_model" => class("model", "model.delete", SelfRecording, false),
             "update_model" => class("model", "model.update", SelfRecording, false),
+            "fetch_symbol_history" => class("dataset", "dataset.fetch", SelfRecording, true),
+            "save_estimator_file" => class("system", "estimator.save", SelfRecording, false),
+            "delete_estimator_file" => class("system", "estimator.delete", SelfRecording, false),
             _ => return None,
         })
     }
@@ -765,7 +873,8 @@ pub mod audit {
             "create_automation" => {
                 let name = text(args, "name");
                 let id = out.get("created").and_then(Value::as_str).unwrap_or("");
-                (id.to_string(), format!("Created automation {name}"), format!("Could not create automation {name}"))
+                let short = if args.get("allow_short").and_then(Value::as_bool).unwrap_or(false) { " (shorting allowed)" } else { "" };
+                (id.to_string(), format!("Created automation {name}{short}"), format!("Could not create automation {name}"))
             }
             "set_automation_enabled" => {
                 let on = args.get("enabled").and_then(Value::as_bool).unwrap_or(false);
@@ -1097,6 +1206,32 @@ pub mod audit {
     }
 }
 
+/// A real `AppState` on a temporary folder, for tests of the approval rules and the Copilot's
+/// file tools. Nothing is shared with the user's data: the config, database and vault are created
+/// under the temp root.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::commands::python_runtime::RuntimePaths;
+    use crate::state::AppState;
+
+    pub const ESTIMATOR: &str = "def make_estimator(params):\n    return None\n";
+
+    pub async fn state(name: &str) -> (AppState, RuntimePaths) {
+        let root = std::env::temp_dir().join(format!("apex-copilot-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = RuntimePaths::for_test(&root);
+        let state = AppState::init(paths.clone()).await.expect("test AppState");
+        (state, paths)
+    }
+
+    pub fn write_estimator(paths: &RuntimePaths, name: &str, content: &str) {
+        let dir = paths.work_root().join("estimators");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1209,5 +1344,131 @@ mod tests {
         assert!(text.contains("hash ") && text.contains("import os") && text.contains("replace existing"), "{text}");
         assert_eq!(content_hash("abc"), content_hash("abc"));
         assert_ne!(content_hash("abc"), content_hash("abd"));
+    }
+
+    // ── Shorting, custom estimators, new tools ──────────────────────
+
+    #[test]
+    fn a_short_automation_card_says_so_up_front() {
+        let paper = describe_call(
+            "create_automation",
+            &json!({"name": "m", "symbol": "TCS.NS", "model_id": "m1", "allow_short": true}),
+        );
+        assert!(paper.starts_with("[SHORT] "), "{paper}");
+        assert!(paper.contains("SHORT") && paper.contains("paper"), "{paper}");
+        let live = describe_call(
+            "create_automation",
+            &json!({"name": "m", "symbol": "TCS.NS", "model_id": "m1", "allow_short": true, "broker_id": "zerodha"}),
+        );
+        assert!(live.starts_with("[LIVE zerodha] [SHORT] "), "{live}");
+        // Without the flag nothing about shorting appears.
+        for args in [json!({"name": "m", "symbol": "X", "model_id": "m1"}), json!({"name": "m", "symbol": "X", "model_id": "m1", "allow_short": false})] {
+            assert!(!describe_call("create_automation", &args).contains("SHORT"));
+        }
+        // A string "true" from a sloppy model is not a yes.
+        assert!(!wants_short(&json!({"allow_short": "true"})));
+    }
+
+    #[test]
+    fn the_prompt_notes_cover_shorting_and_the_new_ml_advice() {
+        assert!(SHORTING_NOTE.lines().count() <= 5);
+        for needle in ["allow_short", "opt-in", "paper", "direction", "return_threshold", "allow_live_shorting", "Never enable shorting on a live broker"] {
+            assert!(SHORTING_NOTE.contains(needle), "shorting note should mention `{needle}`");
+        }
+        for needle in ["custom_features", "check_expression", "trailing-window", "holdout_pct", "baseline", "fee_pct", "save_estimator_file", "approve"] {
+            assert!(ML_WORKFLOW.contains(needle), "ML workflow should mention `{needle}`");
+        }
+        assert!(ML_WORKFLOW.lines().count() <= 15, "{} lines", ML_WORKFLOW.lines().count());
+    }
+
+    #[test]
+    fn new_write_tools_are_logged_once_by_their_own_function() {
+        let check = |tool: &str, kind: &str, action: &str, informational: bool| {
+            let c = audit::classify(tool).unwrap_or_else(|| panic!("{tool} has no class"));
+            assert_eq!((c.kind, c.action, c.informational), (kind, action, informational), "{tool}");
+            assert_eq!(c.rule, audit::Rule::SelfRecording, "{tool}");
+            assert!(audit::SELF_RECORDING.contains(&tool), "{tool}");
+            assert!(audit::plan(tool, &json!({}), &Ok(json!({})), None).is_none(), "{tool} would be logged twice");
+        };
+        check("fetch_symbol_history", "dataset", "dataset.fetch", true);
+        check("save_estimator_file", "system", "estimator.save", false);
+        check("delete_estimator_file", "system", "estimator.delete", false);
+        for read in ["check_expression", "list_symbol_data", "list_algorithms", "list_estimator_files"] {
+            assert!(audit::classify(read).is_none(), "{read} records nothing");
+        }
+    }
+
+    #[test]
+    fn a_created_short_automation_is_logged_as_such() {
+        let args = json!({"name": "m", "allow_short": true});
+        let entry = audit::plan("create_automation", &args, &Ok(json!({"created": "a1"})), None).unwrap();
+        assert!(entry.summary.contains("shorting allowed"), "{}", entry.summary);
+        let plain = audit::plan("create_automation", &json!({"name": "m"}), &Ok(json!({"created": "a1"})), None).unwrap();
+        assert!(!plain.summary.contains("short"), "{}", plain.summary);
+    }
+
+    #[test]
+    fn only_custom_training_counts_as_running_an_estimator() {
+        assert!(is_custom_training("train_ml_model", &json!({"algorithm": "custom"})));
+        assert!(!is_custom_training("train_ml_model", &json!({"algorithm": "random_forest"})));
+        assert!(!is_custom_training("save_estimator_file", &json!({"algorithm": "custom"})));
+    }
+
+    #[tokio::test]
+    async fn a_custom_run_asks_until_the_exact_content_was_approved() {
+        let (state, paths) = test_support::state("custom-trust").await;
+        let args = json!({"algorithm": "custom", "dataset": "d", "estimator_file": "mine.py"});
+        // No file: asks.
+        assert!(needs_approval("train_ml_model", &args, &state, &paths));
+        test_support::write_estimator(&paths, "mine.py", test_support::ESTIMATOR);
+        assert!(needs_approval("train_ml_model", &args, &state, &paths), "an unapproved file asks");
+
+        // The Copilot wrote it: recorded as authored, still not approved.
+        note_estimator_authored(&state, "mine.py", test_support::ESTIMATOR);
+        let recorded = state.copilot_trusted_files.lock().unwrap().get("estimators/mine.py").cloned().unwrap();
+        assert!(recorded.starts_with("authored:"), "{recorded}");
+        assert!(needs_approval("train_ml_model", &args, &state, &paths), "authored is not approved");
+
+        // The user approved this run: the content is trusted.
+        trust_estimator(&state, &args, &paths);
+        assert!(!needs_approval("train_ml_model", &args, &state, &paths));
+        // Saving the same content again does not undo an approval.
+        note_estimator_authored(&state, "mine.py", test_support::ESTIMATOR);
+        assert!(!needs_approval("train_ml_model", &args, &state, &paths));
+
+        // Any edit asks again.
+        let edited = "def make_estimator(params):\n    return 1\n";
+        test_support::write_estimator(&paths, "mine.py", edited);
+        assert!(needs_approval("train_ml_model", &args, &state, &paths), "edited content is a new file");
+        note_estimator_authored(&state, "mine.py", edited);
+        assert!(needs_approval("train_ml_model", &args, &state, &paths));
+
+        // Other algorithms never involve the estimator check.
+        assert!(!needs_approval("train_ml_model", &json!({"algorithm": "random_forest", "dataset": "d"}), &state, &paths));
+        // Forgetting (the file was deleted) removes the approval.
+        trust_estimator(&state, &args, &paths);
+        forget_estimator(&state, "mine.py");
+        assert!(needs_approval("train_ml_model", &args, &state, &paths));
+    }
+
+    #[tokio::test]
+    async fn the_approval_key_and_card_follow_the_file_content() {
+        let (state, paths) = test_support::state("custom-key").await;
+        let _ = &state;
+        let args = json!({"algorithm": "custom", "dataset": "d", "estimator_file": "mine.py"});
+        assert_eq!(approval_key_suffix("train_ml_model", &args, &paths), "#estimator=missing");
+        assert!(estimator_card_note("train_ml_model", &args, &paths).contains("not found"));
+        test_support::write_estimator(&paths, "mine.py", test_support::ESTIMATOR);
+        let first = approval_key_suffix("train_ml_model", &args, &paths);
+        assert!(first.starts_with("#estimator=") && !first.ends_with("missing"));
+        let card = estimator_card_note("train_ml_model", &args, &paths);
+        assert!(card.contains(&content_hash(test_support::ESTIMATOR)) && card.contains("make_estimator") && card.contains("runs on your machine"), "{card}");
+        test_support::write_estimator(&paths, "mine.py", "def make_estimator(params):\n    return 2\n");
+        assert_ne!(first, approval_key_suffix("train_ml_model", &args, &paths), "an edit must invalidate an earlier approval");
+        // Other calls are untouched.
+        let plain = json!({"algorithm": "random_forest"});
+        assert_eq!(approval_key_suffix("train_ml_model", &plain, &paths), "");
+        assert_eq!(estimator_card_note("train_ml_model", &plain, &paths), "");
+        assert_eq!(approval_key_suffix("place_order", &args, &paths), "");
     }
 }

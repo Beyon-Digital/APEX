@@ -357,7 +357,7 @@ impl AppState {
             .read()
             .expect("brokers lock poisoned")
             .iter()
-            .map(|(broker_id, broker)| broker.to_dto(broker_id))
+            .map(|(broker_id, broker)| broker.to_dto(broker_id, self.automations_cfg.allow_live_shorting))
             .collect();
 
         connections.sort_by_key(|broker| {
@@ -375,7 +375,7 @@ impl AppState {
             .read()
             .expect("brokers lock poisoned")
             .get(broker_id)
-            .map(|broker| broker.to_dto(broker_id))
+            .map(|broker| broker.to_dto(broker_id, self.automations_cfg.allow_live_shorting))
     }
 
     pub fn set_broker_session(&self, broker_id: &str, session_token: &str) -> Result<()> {
@@ -551,7 +551,9 @@ impl AppState {
 
     /// Emergency stop: disarm live trading, halt the risk engine, pause
     /// automations, stop strategy sessions and cancel every working live order
-    /// APEX knows about.
+    /// APEX knows about. Nothing here depends on the side of a position: working orders are
+    /// cancelled whether they would open, add to or close a long or a short (closing a short is
+    /// a buy), and open positions of either side are left for the user to close.
     pub async fn kill_switch(&self) -> (Vec<String>, Vec<String>) {
         use apex_core::domain::models::OrderStatus;
         self.live_guard.set_armed(false);

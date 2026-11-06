@@ -8,9 +8,13 @@
 //! * a catalog id (`ret_1`, `rsi_14`, ...),
 //! * a lag of one: `<name>_lag<n>` is the value of `<name>` `n` bars earlier,
 //! * a legacy column from models trained before the catalog existed (`sma_20`, `bb_upper`,
-//!   `volume_lag_1`, `close`, ...). Their old definitions are kept so those models still score.
+//!   `volume_lag_1`, `close`, ...). Their old definitions are kept so those models still score,
+//! * a custom feature: a formula from [`super::ml_expr`] with a name of the user's choosing. It
+//!   also accepts the `_lag<n>` suffix. Custom features and the context symbols they read are
+//!   stored with the dataset and the model, so scoring computes them the same way.
 
-use crate::dto::FeatureDefDto;
+use super::ml_expr::{self, Compiled, Context};
+use crate::dto::{CustomFeatureDto, FeatureDefDto};
 use apex_core::application::indicators as ind;
 use apex_core::domain::models::{Timeframe, OHLCV};
 use std::collections::HashMap;
@@ -300,6 +304,8 @@ fn legacy_column(name: &str, s: &Series) -> Option<Vec<f64>> {
 enum Resolved {
     Catalog(String),
     Legacy(String),
+    /// A user formula; `warmup` is its static warmup.
+    Custom { name: String, warmup: usize },
     /// `base` shifted back by `lag` bars.
     Lag { base: Box<Resolved>, lag: usize },
 }
@@ -309,6 +315,7 @@ impl Resolved {
         match self {
             Resolved::Catalog(id) => warmup_of(id).unwrap_or(0),
             Resolved::Legacy(name) => legacy_warmup(name).unwrap_or(0),
+            Resolved::Custom { warmup, .. } => *warmup,
             Resolved::Lag { base, lag } => base.warmup() + lag,
         }
     }
@@ -317,6 +324,7 @@ impl Resolved {
         match self {
             Resolved::Catalog(id) => format!("c:{id}"),
             Resolved::Legacy(name) => format!("l:{name}"),
+            Resolved::Custom { name, .. } => format!("u:{name}"),
             Resolved::Lag { base, .. } => base.base_key(),
         }
     }
@@ -324,12 +332,9 @@ impl Resolved {
 
 const MAX_LAG: usize = 250;
 
-fn resolve(name: &str) -> Result<Resolved, String> {
-    if is_catalog_feature(name) {
-        return Ok(Resolved::Catalog(name.to_string()));
-    }
-    if legacy_warmup(name).is_some() {
-        return Ok(Resolved::Legacy(name.to_string()));
+fn resolve(name: &str, customs: &Customs) -> Result<Resolved, String> {
+    if let Some(base) = resolve_base(name, customs) {
+        return Ok(base);
     }
     // `<base>_lag<n>`
     if let Some(pos) = name.rfind("_lag") {
@@ -339,42 +344,205 @@ fn resolve(name: &str) -> Result<Resolved, String> {
             if lag == 0 || lag > MAX_LAG {
                 return Err(format!("feature `{name}`: lag must be between 1 and {MAX_LAG}"));
             }
-            let inner = if is_catalog_feature(base) {
-                Resolved::Catalog(base.to_string())
-            } else if legacy_warmup(base).is_some() {
-                Resolved::Legacy(base.to_string())
-            } else {
-                return Err(unknown_feature(name));
-            };
+            let inner = resolve_base(base, customs).ok_or_else(|| unknown_feature(name))?;
             return Ok(Resolved::Lag { base: Box::new(inner), lag });
         }
     }
     Err(unknown_feature(name))
 }
 
+fn resolve_base(name: &str, customs: &Customs) -> Option<Resolved> {
+    if is_catalog_feature(name) {
+        return Some(Resolved::Catalog(name.to_string()));
+    }
+    if legacy_warmup(name).is_some() {
+        return Some(Resolved::Legacy(name.to_string()));
+    }
+    customs
+        .get(name)
+        .map(|c| Resolved::Custom { name: name.to_string(), warmup: c.compiled.warmup })
+}
+
 fn unknown_feature(name: &str) -> String {
     format!(
-        "feature `{name}` cannot be computed: it is not in the feature catalog, not a lag of one (`<feature>_lag<n>`) \
-         and not a legacy indicator column"
+        "feature `{name}` cannot be computed: it is not in the feature catalog, not a custom feature of this model, \
+         not a lag of one (`<feature>_lag<n>`) and not a legacy indicator column"
     )
 }
 
-/// Bars needed before every feature in `names` has a value on the newest bar.
-pub fn required_bars(names: &[String]) -> Result<usize, String> {
-    let mut need = 1;
-    for name in names {
-        need = need.max(resolve(name)?.warmup() + 1);
+// ── Custom features ──────────────────────────────────────────────────
+
+/// Most custom features one dataset or model may carry.
+pub const MAX_CUSTOM_FEATURES: usize = 20;
+/// Most context symbols one dataset or model may read.
+pub const MAX_CONTEXT_SYMBOLS: usize = 10;
+
+/// Names that would collide with dataset columns.
+const RESERVED_NAMES: &[&str] = &["time", "symbol", "fwd_ret", "target"];
+
+/// Rules for a custom feature name: `[a-z][a-z0-9_]{0,40}`, not a catalog id, not a legacy column,
+/// not a dataset column and not shaped like a lag (`x_lag3`), so it can never be mistaken for
+/// something else.
+pub fn validate_custom_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let shape_ok = name.len() <= 41
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !shape_ok {
+        return Err(format!(
+            "custom feature name `{name}` is not allowed: use a lowercase letter, then lowercase letters, digits or '_' (41 characters at most)"
+        ));
     }
-    Ok(need)
+    if is_catalog_feature(name) {
+        return Err(format!("custom feature name `{name}` is already a catalog feature; choose another name"));
+    }
+    if legacy_warmup(name).is_some() || RESERVED_NAMES.contains(&name) {
+        return Err(format!("custom feature name `{name}` is reserved; choose another name"));
+    }
+    if let Some(pos) = name.rfind("_lag") {
+        let digits = &name[pos + 4..];
+        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "custom feature name `{name}` ends in _lag<number>, which is reserved for lagged copies of a feature"
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct Custom {
+    compiled: Compiled,
+}
+
+/// The compiled custom features of a dataset or model, looked up by name.
+#[derive(Default)]
+pub struct Customs {
+    items: Vec<(String, Custom)>,
+}
+
+impl Customs {
+    /// Check names (valid, unique) and compile every formula. Errors name the feature and, for
+    /// formula errors, the character position.
+    pub fn new(custom: &[CustomFeatureDto]) -> Result<Customs, String> {
+        if custom.len() > MAX_CUSTOM_FEATURES {
+            return Err(format!("too many custom features ({}); the limit is {MAX_CUSTOM_FEATURES}", custom.len()));
+        }
+        let mut items: Vec<(String, Custom)> = Vec::new();
+        for c in custom {
+            validate_custom_name(&c.name)?;
+            if items.iter().any(|(n, _)| *n == c.name) {
+                return Err(format!("custom feature `{}` is defined twice", c.name));
+            }
+            let compiled =
+                ml_expr::compile(&c.expr).map_err(|e| format!("custom feature `{}`: {e}", c.name))?;
+            items.push((c.name.clone(), Custom { compiled }));
+        }
+        Ok(Customs { items })
+    }
+
+    fn get(&self, name: &str) -> Option<&Custom> {
+        self.items.iter().find(|(n, _)| n == name).map(|(_, c)| c)
+    }
+
+    /// Upper-case context symbols read by any formula, in order of first use.
+    pub fn referenced_symbols(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (_, c) in &self.items {
+            for s in &c.compiled.referenced_symbols {
+                if !out.contains(s) {
+                    out.push(s.clone());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn warmup(&self, name: &str) -> Option<usize> {
+        self.get(name).map(|c| c.compiled.warmup)
+    }
+}
+
+/// Custom features and context symbols recorded in a model's metadata JSON (`custom_features`:
+/// `[{name, expr}]`, `context_symbols`: `["SPY"]`). Both are optional; older models have neither.
+pub fn custom_spec_from_metadata(raw: &serde_json::Value) -> Result<(Vec<CustomFeatureDto>, Vec<String>), String> {
+    let custom = match raw.get("custom_features") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| format!("model metadata has unreadable custom_features: {e}"))?,
+    };
+    let context = match raw.get("context_symbols") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| format!("model metadata has unreadable context_symbols: {e}"))?,
+    };
+    Ok((custom, context))
+}
+
+/// Context symbols a set of custom features reads (upper case, in order of first use).
+pub fn referenced_symbols(custom: &[CustomFeatureDto]) -> Result<Vec<String>, String> {
+    Ok(Customs::new(custom)?.referenced_symbols())
+}
+
+/// Canonical form of a context symbol list: trimmed, upper case, no duplicates.
+pub fn normalize_symbols(symbols: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in symbols {
+        let s = s.trim().to_uppercase();
+        crate::validation::validate_symbol(&s)?;
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    if out.len() > MAX_CONTEXT_SYMBOLS {
+        return Err(format!("too many context symbols ({}); the limit is {MAX_CONTEXT_SYMBOLS}", out.len()));
+    }
+    Ok(out)
 }
 
 // ── Public matrix API ────────────────────────────────────────────────
+
+/// Bars needed before every feature in `names` has a value on the newest bar.
+pub fn required_bars(names: &[String]) -> Result<usize, String> {
+    required_bars_with(names, &[])
+}
+
+/// [`required_bars`] for a model that also has custom features.
+pub fn required_bars_with(names: &[String], custom: &[CustomFeatureDto]) -> Result<usize, String> {
+    let customs = Customs::new(custom)?;
+    let mut need = 1;
+    for name in names {
+        need = need.max(resolve(name, &customs)?.warmup() + 1);
+    }
+    Ok(need)
+}
 
 /// Per-bar feature vectors for exactly `names` (in that order); NaN while a feature is warming
 /// up. Handles catalog ids, `<feature>_lag<n>` and legacy columns. Fails with a message naming any
 /// feature that cannot be computed.
 pub fn model_matrix(bars: &[OHLCV], names: &[String]) -> Result<Vec<Vec<f64>>, String> {
-    let resolved: Vec<Resolved> = names.iter().map(|n| resolve(n)).collect::<Result<_, _>>()?;
+    model_matrix_with(bars, names, &[], &Context::new())
+}
+
+/// [`model_matrix`] that also knows the model's custom features. `context` holds the bars of
+/// every symbol the formulas read with `other(...)` (keys upper case).
+pub fn model_matrix_with(
+    bars: &[OHLCV],
+    names: &[String],
+    custom: &[CustomFeatureDto],
+    context: &Context,
+) -> Result<Vec<Vec<f64>>, String> {
+    let customs = Customs::new(custom)?;
+    model_matrix_compiled(bars, names, &customs, context)
+}
+
+/// [`model_matrix_with`] for callers that compiled the custom features once already.
+pub fn model_matrix_compiled(
+    bars: &[OHLCV],
+    names: &[String],
+    customs: &Customs,
+    context: &Context,
+) -> Result<Vec<Vec<f64>>, String> {
+    let resolved: Vec<Resolved> = names.iter().map(|n| resolve(n, customs)).collect::<Result<_, _>>()?;
     let series = Series::from_bars(bars)?;
     let n = series.len();
 
@@ -391,6 +559,10 @@ pub fn model_matrix(bars: &[OHLCV], names: &[String]) -> Result<Vec<Vec<f64>>, S
         let col = match leaf {
             Resolved::Catalog(id) => catalog_column(id, &series),
             Resolved::Legacy(name) => legacy_column(name, &series),
+            Resolved::Custom { name, .. } => {
+                let c = customs.get(name).ok_or_else(|| unknown_feature(name))?;
+                Some(ml_expr::evaluate(&c.compiled, bars, context).map_err(|e| format!("custom feature `{name}`: {e}"))?)
+            }
             Resolved::Lag { .. } => None,
         }
         .ok_or_else(|| unknown_feature(&r.base_key()))?;
@@ -408,7 +580,8 @@ pub fn model_matrix(bars: &[OHLCV], names: &[String]) -> Result<Vec<Vec<f64>>, S
     Ok(rows)
 }
 
-/// Catalog-only matrix, used by the dataset builder.
+/// Catalog-only matrix.
+#[allow(dead_code)]
 pub fn compute_matrix(bars: &[OHLCV], feature_ids: &[String]) -> Result<Vec<Vec<f64>>, String> {
     for id in feature_ids {
         if !is_catalog_feature(id) {
@@ -420,8 +593,23 @@ pub fn compute_matrix(bars: &[OHLCV], feature_ids: &[String]) -> Result<Vec<Vec<
 
 /// Feature values of the newest bar as name -> value, failing when any is not yet defined.
 pub fn latest_features(bars: &[OHLCV], names: &[String], symbol: &str) -> Result<HashMap<String, f64>, String> {
-    let need = required_bars(names)?;
-    let matrix = model_matrix(bars, names)?;
+    latest_features_with(bars, names, &[], &Context::new(), symbol)
+}
+
+/// [`latest_features`] for a model with custom features and context symbols.
+pub fn latest_features_with(
+    bars: &[OHLCV],
+    names: &[String],
+    custom: &[CustomFeatureDto],
+    context: &Context,
+    symbol: &str,
+) -> Result<HashMap<String, f64>, String> {
+    let customs = Customs::new(custom)?;
+    let mut need = 1;
+    for name in names {
+        need = need.max(resolve(name, &customs)?.warmup() + 1);
+    }
+    let matrix = model_matrix_compiled(bars, names, &customs, context)?;
     let row = matrix
         .last()
         .ok_or_else(|| format!("no bars for {symbol}"))?;
@@ -436,6 +624,99 @@ pub fn latest_features(bars: &[OHLCV], names: &[String], symbol: &str) -> Result
         out.insert(name.clone(), *v);
     }
     Ok(out)
+}
+
+// ── Context bars for scoring ─────────────────────────────────────────
+
+/// The symbols to load for scoring: the model's recorded context symbols plus anything a formula
+/// reads, so a model whose metadata lost a context symbol still gets its data.
+pub fn context_symbols_needed(custom: &[CustomFeatureDto], recorded: &[String]) -> Result<Vec<String>, String> {
+    let mut out = normalize_symbols(recorded)?;
+    for s in referenced_symbols(custom)? {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
+/// The custom formulas a model's features really use, and the context symbols those formulas
+/// read. A feature is used when it is a custom feature's name or one of its lags (`name_lag<n>`).
+/// Recorded context symbols that no used formula reads are dropped: they are not needed to score.
+pub fn narrow_to_used(
+    custom: &[CustomFeatureDto],
+    recorded: &[String],
+    feature_names: &[String],
+) -> Result<(Vec<CustomFeatureDto>, Vec<String>), String> {
+    let uses = |name: &str| {
+        feature_names.iter().any(|f| {
+            f == name
+                || f.strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix("_lag"))
+                    .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or(false)
+        })
+    };
+    let used: Vec<CustomFeatureDto> = custom.iter().filter(|c| uses(&c.name)).cloned().collect();
+    // A used formula may only be referenced through a symbol the metadata did not list.
+    let symbols = context_symbols_needed(&used, &[])?;
+    let _ = recorded; // kept in the signature so callers state what was recorded
+    Ok((used, symbols))
+}
+
+/// Load the newest `limit` stored bars of each context symbol (same timeframe as the main
+/// symbol) from storage. Fails naming a symbol that has no bars.
+pub async fn load_context_from_storage(
+    storage: &std::sync::Arc<dyn apex_core::ports::storage::StoragePort>,
+    symbols: &[String],
+    timeframe: Timeframe,
+    limit: usize,
+) -> Result<Context, String> {
+    use apex_core::domain::models::{OHLCVQuery, Symbol};
+    let mut ctx = Context::new();
+    for sym in symbols {
+        let bars = storage
+            .query_ohlcv(OHLCVQuery {
+                symbol: Symbol(sym.clone()),
+                timeframe: timeframe.clone(),
+                from: chrono::DateTime::UNIX_EPOCH,
+                to: chrono::Utc::now(),
+                limit: Some(limit),
+            })
+            .await
+            .map_err(|e| format!("Failed to load bars for context symbol {sym}: {e}"))?;
+        if bars.is_empty() {
+            return Err(format!(
+                "no stored bars for context symbol {sym}, which this model's custom features read; fetch its history first (fetch_symbol_history)"
+            ));
+        }
+        ctx.insert(sym.clone(), bars);
+    }
+    Ok(ctx)
+}
+
+/// Refuse to score when a context symbol's newest bar is much older than the main symbol's. Forward
+/// fill would otherwise quietly feed a stale value into a live decision.
+pub fn check_context_fresh(
+    context: &Context,
+    main_last: chrono::DateTime<chrono::Utc>,
+    max_age: chrono::Duration,
+) -> Result<(), String> {
+    for (sym, bars) in context {
+        let newest = bars.iter().map(|b| b.time).max();
+        match newest {
+            None => return Err(format!("context symbol {sym} has no bars")),
+            Some(t) if main_last - t > max_age => {
+                return Err(format!(
+                    "newest bar of context symbol {sym} is from {} but the symbol being scored is at {}; refusing to score on stale context data",
+                    t.format("%Y-%m-%d %H:%M"),
+                    main_last.format("%Y-%m-%d %H:%M")
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -623,5 +904,251 @@ pub(crate) mod tests {
         assert_eq!(canonical_timeframe("1H"), Some("1h"));
         assert_eq!(canonical_timeframe("7d"), None);
         assert_eq!(parse_timeframe("5m"), Some(Timeframe::M5));
+    }
+
+    // ── Custom features ──────────────────────────────────────────────
+
+    fn custom(items: &[(&str, &str)]) -> Vec<CustomFeatureDto> {
+        items.iter().map(|(n, e)| CustomFeatureDto { name: n.to_string(), expr: e.to_string() }).collect()
+    }
+
+    fn names(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Another symbol on a sparser calendar (every third bar missing).
+    fn spy_context(n: usize) -> Context {
+        use apex_core::domain::models::Symbol;
+        let bars: Vec<OHLCV> = synthetic_bars(n)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i % 3 != 2)
+            .map(|(_, mut b)| {
+                b.symbol = Symbol("SPY".into());
+                b.close = b.close * 2.0 + 5.0;
+                b
+            })
+            .collect();
+        let mut ctx = Context::new();
+        ctx.insert("SPY".into(), bars);
+        ctx
+    }
+
+    #[test]
+    fn custom_columns_use_the_exact_name_and_equal_a_direct_evaluation() {
+        let bars = synthetic_bars(150);
+        let cf = custom(&[("mom5", "close / shift(close, 5) - 1"), ("trend", "close > sma(close, 20)")]);
+        let wanted = names(&["ret_1", "mom5", "trend", "mom5_lag3"]);
+        let m = model_matrix_with(&bars, &wanted, &cf, &Context::new()).unwrap();
+        let direct = ml_expr::evaluate(&ml_expr::compile(&cf[0].expr).unwrap(), &bars, &Context::new()).unwrap();
+        let trend = ml_expr::evaluate(&ml_expr::compile(&cf[1].expr).unwrap(), &bars, &Context::new()).unwrap();
+        for i in 0..bars.len() {
+            let eq = |a: f64, b: f64| (a.is_nan() && b.is_nan()) || a == b;
+            assert!(eq(m[i][1], direct[i]), "mom5 at {i}");
+            assert!(eq(m[i][2], trend[i]), "trend at {i}");
+            if i >= 3 {
+                assert!(eq(m[i][3], direct[i - 3]), "mom5_lag3 at {i}");
+            }
+        }
+        assert!(m[7][3].is_nan() && m[8][3].is_finite(), "lag 3 of a warmup-5 feature first exists at bar 8");
+        // The catalog column is unchanged by the presence of custom ones.
+        let plain = model_matrix(&bars, &names(&["ret_1"])).unwrap();
+        for i in 0..bars.len() {
+            assert!((plain[i][0].is_nan() && m[i][0].is_nan()) || plain[i][0] == m[i][0]);
+        }
+        assert_eq!(required_bars_with(&names(&["mom5", "mom5_lag3"]), &cf).unwrap(), 5 + 3 + 1, "mom5_lag3 is the deepest");
+        assert_eq!(required_bars_with(&wanted, &cf).unwrap(), 20, "trend needs the 20-bar average");
+        assert_eq!(required_bars_with(&names(&["trend"]), &cf).unwrap(), 20);
+    }
+
+    #[test]
+    fn custom_features_can_read_context_symbols() {
+        let bars = synthetic_bars(120);
+        let ctx = spy_context(120);
+        let cf = custom(&[("rel", "close / other(\"SPY\", \"close\")")]);
+        assert_eq!(referenced_symbols(&cf).unwrap(), vec!["SPY"]);
+        let m = model_matrix_with(&bars, &names(&["rel"]), &cf, &ctx).unwrap();
+        // Bar 5: SPY has bars 0,1,3,4,5 (2 is missing); bar 5 exists. Bar 8 is missing, so the
+        // value of bar 7 is used.
+        let spy = &ctx["SPY"];
+        let at = |t: chrono::DateTime<chrono::Utc>| spy.iter().filter(|b| b.time <= t).last().unwrap().close;
+        assert!((m[5][0] - bars[5].close / at(bars[5].time)).abs() < 1e-12);
+        assert!((m[8][0] - bars[8].close / at(bars[7].time)).abs() < 1e-12, "forward-filled from bar 7");
+    }
+
+    #[test]
+    fn missing_context_names_the_feature_and_the_symbol() {
+        let bars = synthetic_bars(60);
+        let cf = custom(&[("rel", "close / other(\"QQQ\", \"close\")")]);
+        let err = model_matrix_with(&bars, &names(&["rel"]), &cf, &Context::new()).unwrap_err();
+        assert!(err.contains("`rel`") && err.contains("QQQ"), "{err}");
+        let err = latest_features_with(&bars, &names(&["rel"]), &cf, &Context::new(), "AAA").unwrap_err();
+        assert!(err.contains("QQQ"), "{err}");
+    }
+
+    #[test]
+    fn custom_name_rules() {
+        for ok in ["a", "mom_5", "x1", &format!("a{}", "b".repeat(40))] {
+            assert!(validate_custom_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", "Mom", "1abc", "_x", "a-b", "a b", "naïve", &format!("a{}", "b".repeat(41)),
+            "ret_1",        // catalog id
+            "rsi_14",       // catalog id and legacy
+            "close",        // legacy column
+            "sma_20",       // legacy column
+            "fwd_ret", "target", "time", "symbol", // dataset columns
+            "x_lag3",       // looks like a lag
+            "ret_1_lag2",
+        ] {
+            assert!(validate_custom_name(bad).is_err(), "{bad}");
+        }
+        assert!(validate_custom_name("x_lagged").is_ok(), "only _lag<digits> is reserved");
+    }
+
+    #[test]
+    fn custom_set_validation_reports_the_feature_and_position() {
+        let e = Customs::new(&custom(&[("a", "close"), ("a", "open")])).err().unwrap();
+        assert!(e.contains("`a`") && e.contains("twice"), "{e}");
+        let e = Customs::new(&custom(&[("good", "close"), ("bad", "close +")])).err().unwrap();
+        assert!(e.contains("`bad`") && e.contains("character 8"), "{e}");
+        let e = Customs::new(&custom(&[("ret_5", "close")])).err().unwrap();
+        assert!(e.contains("catalog"), "{e}");
+        let many: Vec<CustomFeatureDto> = (0..=MAX_CUSTOM_FEATURES)
+            .map(|i| CustomFeatureDto { name: format!("f{i}"), expr: "close".into() })
+            .collect();
+        assert!(Customs::new(&many).err().unwrap().contains("too many"));
+        assert!(Customs::new(&many[..MAX_CUSTOM_FEATURES]).is_ok());
+    }
+
+    #[test]
+    fn a_lag_of_an_unknown_name_is_still_unknown() {
+        let bars = synthetic_bars(60);
+        let cf = custom(&[("mom", "ret(close, 3)")]);
+        let err = model_matrix_with(&bars, &names(&["nope_lag2"]), &cf, &Context::new()).unwrap_err();
+        assert!(err.contains("`nope_lag2`"), "{err}");
+        // Without the custom definition the same name is unknown, with a message that says so.
+        let err = model_matrix(&bars, &names(&["mom"])).unwrap_err();
+        assert!(err.contains("`mom`") && err.contains("custom feature"), "{err}");
+    }
+
+    #[test]
+    fn latest_features_with_custom_and_context_matches_the_matrix_row() {
+        let bars = synthetic_bars(160);
+        let ctx = spy_context(160);
+        let cf = custom(&[("rel", "ret(close, 3) - ret(other('SPY', 'close'), 3)"), ("z", "zscore(close, 30)")]);
+        let wanted = names(&["rel", "z", "rel_lag2", "rsi_14"]);
+        let latest = latest_features_with(&bars, &wanted, &cf, &ctx, "AAA").unwrap();
+        let m = model_matrix_with(&bars, &wanted, &cf, &ctx).unwrap();
+        for (j, n) in wanted.iter().enumerate() {
+            assert_eq!(latest[n], m[159][j], "{n}");
+        }
+        let err = latest_features_with(&bars[..20], &wanted, &cf, &ctx, "AAA").unwrap_err();
+        assert!(err.contains("`z`") && err.contains("AAA"), "{err}");
+    }
+
+    #[test]
+    fn context_symbols_needed_merges_recorded_and_referenced() {
+        let cf = custom(&[("a", "other('qqq', 'close')"), ("b", "other('SPY', 'open')")]);
+        let got = context_symbols_needed(&cf, &names(&["spy", "IWM"])).unwrap();
+        assert_eq!(got, vec!["SPY", "IWM", "QQQ"]);
+        assert!(context_symbols_needed(&[], &[]).unwrap().is_empty());
+        let too_many: Vec<String> = (0..=MAX_CONTEXT_SYMBOLS).map(|i| format!("S{i}")).collect();
+        assert!(normalize_symbols(&too_many).is_err());
+    }
+
+    #[test]
+    fn stale_context_is_refused() {
+        use chrono::Duration;
+        let main_last = synthetic_bars(100).last().unwrap().time;
+        let mut ctx = spy_context(100);
+        assert!(check_context_fresh(&ctx, main_last, Duration::days(6)).is_ok());
+        let stale: Vec<OHLCV> = ctx["SPY"].iter().filter(|b| b.time < main_last - Duration::days(30)).cloned().collect();
+        ctx.insert("SPY".into(), stale);
+        let err = check_context_fresh(&ctx, main_last, Duration::days(6)).unwrap_err();
+        assert!(err.contains("SPY") && err.contains("stale"), "{err}");
+        ctx.insert("SPY".into(), vec![]);
+        assert!(check_context_fresh(&ctx, main_last, Duration::days(6)).is_err());
+    }
+
+    #[test]
+    fn custom_features_have_no_lookahead() {
+        let bars = synthetic_bars(160);
+        let ctx = spy_context(160);
+        let cf = custom(&[("a", "ema(close, 8) / sma(close, 30) - 1"), ("b", "ret(other('SPY', 'close'), 2)")]);
+        let wanted = names(&["a", "b", "a_lag4"]);
+        let base = model_matrix_with(&bars, &wanted, &cf, &ctx).unwrap();
+        let cut = 90;
+        let mut p = bars.clone();
+        let mut p_ctx = ctx.clone();
+        for b in p.iter_mut().skip(cut + 1) {
+            b.close *= 1.7;
+            b.high = b.close * 1.1;
+            b.low = b.close * 0.9;
+        }
+        for b in p_ctx.get_mut("SPY").unwrap().iter_mut().filter(|b| b.time > bars[cut].time) {
+            b.close *= 0.4;
+        }
+        let other = model_matrix_with(&p, &wanted, &cf, &p_ctx).unwrap();
+        for i in 0..=cut {
+            for j in 0..3 {
+                assert!((base[i][j].is_nan() && other[i][j].is_nan()) || base[i][j] == other[i][j], "col {j} bar {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_spec_is_optional_and_strict_when_present() {
+        let none = serde_json::json!({"feature_names": ["ret_1"]});
+        assert_eq!(custom_spec_from_metadata(&none).unwrap(), (vec![], vec![]));
+        let some = serde_json::json!({
+            "custom_features": [{"name": "m", "expr": "ret(close, 3)"}],
+            "context_symbols": ["SPY"],
+        });
+        let (c, s) = custom_spec_from_metadata(&some).unwrap();
+        assert_eq!(c, custom(&[("m", "ret(close, 3)")]));
+        assert_eq!(s, vec!["SPY"]);
+        let bad = serde_json::json!({"custom_features": "nope"});
+        assert!(custom_spec_from_metadata(&bad).unwrap_err().contains("custom_features"));
+        assert_eq!(custom_spec_from_metadata(&serde_json::json!({"custom_features": null})).unwrap().0.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod narrow_tests {
+    use super::*;
+
+    fn cf(name: &str, expr: &str) -> CustomFeatureDto {
+        CustomFeatureDto { name: name.into(), expr: expr.into() }
+    }
+
+    #[test]
+    fn unused_formulas_and_their_context_symbols_are_dropped() {
+        let custom = vec![cf("rel_qqq", "close / other(\"QQQ\", \"close\")"), cf("mom", "ret(close, 5)")];
+        let recorded = vec!["QQQ".to_string(), "SPY".to_string()];
+        // The model was trained on a subset that excludes rel_qqq.
+        let names = vec!["ret_1".to_string(), "mom".to_string()];
+        let (used, symbols) = narrow_to_used(&custom, &recorded, &names).unwrap();
+        assert_eq!(used.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["mom"]);
+        assert!(symbols.is_empty(), "no used formula reads another symbol: {symbols:?}");
+    }
+
+    #[test]
+    fn a_used_formula_keeps_exactly_the_symbols_it_reads() {
+        let custom = vec![cf("rel_qqq", "close / other(\"QQQ\", \"close\")"), cf("mom", "ret(close, 5)")];
+        let names = vec!["rel_qqq".to_string()];
+        let (used, symbols) = narrow_to_used(&custom, &["SPY".to_string()], &names).unwrap();
+        assert_eq!(used.len(), 1);
+        assert_eq!(symbols, vec!["QQQ".to_string()]);
+    }
+
+    #[test]
+    fn a_lagged_custom_feature_counts_as_used_but_a_lookalike_name_does_not() {
+        let custom = vec![cf("mom", "ret(close, 5)"), cf("mom2", "ret(close, 9)")];
+        let names = vec!["mom_lag3".to_string()];
+        let (used, _) = narrow_to_used(&custom, &[], &names).unwrap();
+        assert_eq!(used.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["mom"]);
+        let (none, _) = narrow_to_used(&custom, &[], &["mom_lagx".to_string(), "mom20".to_string()]).unwrap();
+        assert!(none.is_empty());
     }
 }

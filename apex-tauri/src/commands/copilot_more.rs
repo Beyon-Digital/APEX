@@ -9,7 +9,10 @@
 //! chat mode (see `copilot_mode`). Everything else is read-only.
 
 use super::python_runtime::RuntimePaths;
-use super::{copilot_web, graph, health, market, ml, ml_datasets, ml_features, news, notebook, orderbook, quant};
+use super::{
+    copilot_tools, copilot_web, graph, health, market, ml, ml_datasets, ml_estimators, ml_features, news, notebook, orderbook,
+    quant,
+};
 use crate::dto::{
     BuildDatasetRequestDto, DatasetInfoDto, MLTrainingResultDto, ModelDetailDto, NotebookCellDto, NotebookDocumentDto,
     NotebookRunRequestDto,
@@ -27,6 +30,9 @@ pub const WRITE_TOOLS: &[&str] = &[
     "build_dataset",
     "delete_dataset",
     "update_model",
+    "fetch_symbol_history",
+    "save_estimator_file",
+    "delete_estimator_file",
 ];
 
 const MAX_NOTEBOOK_CELLS: usize = 50;
@@ -137,20 +143,89 @@ pub fn schemas() -> Vec<Value> {
         tool(
             "build_dataset",
             "Build a labelled ML dataset from stored bars: one row per bar with the chosen features and a label looking `label.horizon_bars` ahead \
-             (direction: 1 up / -1 down; return_threshold: 1 above +threshold, -1 below -threshold, else 0). Train on it with train_ml_model {dataset}. \
-             Fails if a symbol has too few bars.",
+             (direction: 1 up / 0 down; return_threshold: 1 above the up threshold, -1 below the down threshold, else 0). Train on it with train_ml_model {dataset}. \
+             Beyond the catalog `features` you can add `custom_features` ({name, expr} formulas, checked with check_expression first), choose a date range \
+             with from/to, set a round-trip cost with fee_pct (taken off every forward return before labelling), and give `context_symbols` that formulas read \
+             with other(\"SYMBOL\", \"close\"). Fails if a symbol has too few bars; use list_symbol_data and fetch_symbol_history first.",
             json!({"type": "object", "properties": {
                 "name": {"type": "string", "description": "lowercase letters, digits, _ or -, max 64 chars"},
                 "symbols": {"type": "array", "items": {"type": "string"}, "description": "1-30 symbols"},
                 "timeframe": {"type": "string", "default": "1d", "description": "1m, 5m, 15m, 1h, 4h, 1d or 1w"},
-                "bars": {"type": "integer", "default": 1000, "description": "bars per symbol (1-20000)"},
-                "features": {"type": "array", "items": {"type": "string"}, "description": "ids from list_feature_catalog"},
+                "bars": {"type": "integer", "default": 1000, "description": "bars per symbol (1-20000); ignored when from/to are given"},
+                "from": {"type": "string", "description": "first date to include, YYYY-MM-DD"},
+                "to": {"type": "string", "description": "last date to include, YYYY-MM-DD"},
+                "features": {"type": "array", "items": {"type": "string"}, "description": "ids from list_feature_catalog (may be empty when custom_features are given)"},
+                "custom_features": {"type": "array", "items": {"type": "object", "properties": {
+                    "name": {"type": "string", "description": "[a-z][a-z0-9_]{0,40}, not a catalog id"},
+                    "expr": {"type": "string", "description": "formula over open, high, low, close, volume with + - * /, comparisons, sma/ema/std/sum/max/min/zscore/rsi/ret/shift(x,n), abs/log/sqrt(x), atr(n), other(\"SYM\",\"field\"). Trailing windows only."}},
+                    "required": ["name", "expr"]}, "description": "max 20; keep formulas trailing-window"},
+                "context_symbols": {"type": "array", "items": {"type": "string"}, "description": "symbols other() formulas read (max 10); their history must be stored"},
+                "fee_pct": {"type": "number", "default": 0, "description": "round-trip cost in percent, 0-10"},
                 "label": {"type": "object", "properties": {
                     "horizon_bars": {"type": "integer", "description": "how many bars ahead the label looks (1-250)"},
                     "kind": {"type": "string", "enum": ["direction", "return_threshold"], "default": "direction"},
-                    "threshold_pct": {"type": "number", "description": "percent, required for return_threshold"}},
+                    "threshold_pct": {"type": "number", "description": "percent; for return_threshold, used for both sides unless up/down are given"},
+                    "up_threshold_pct": {"type": "number", "description": "return_threshold only: class 1 above this percent"},
+                    "down_threshold_pct": {"type": "number", "description": "return_threshold only: class -1 below minus this percent"}},
                     "required": ["horizon_bars"]}},
                 "required": ["name", "symbols", "features", "label"]}),
+        ),
+        tool(
+            "check_expression",
+            "Check a custom feature formula before using it in build_dataset. Returns ok, an error with the character position when it does not parse, \
+             warmup_bars (leading bars with no value) and the last few computed values on `symbol`'s stored bars. A formula that reads \
+             other(\"SYM\", ...) needs SYM's history stored.",
+            json!({"type": "object", "properties": {
+                "expr": {"type": "string", "description": "max 300 characters"},
+                "symbol": {"type": "string", "description": "symbol whose stored bars the sample is computed on"},
+                "timeframe": {"type": "string", "default": "1d"}},
+                "required": ["expr", "symbol"]}),
+        ),
+        tool(
+            "list_symbol_data",
+            "How many bars are stored for each symbol and timeframe (and the first and last bar time), without contacting any provider. \
+             Zero bars means fetch_symbol_history is needed before building a dataset.",
+            json!({"type": "object", "properties": {
+                "symbols": {"type": "array", "items": {"type": "string"}, "description": "1-40 symbols"},
+                "timeframe": {"type": "string", "default": "1d"}},
+                "required": ["symbols"]}),
+        ),
+        tool(
+            "fetch_symbol_history",
+            "Download bars for one symbol from the data provider into local storage so it can be used for datasets. Downloads data over the network.",
+            json!({"type": "object", "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string", "default": "1d"},
+                "bars": {"type": "integer", "default": 1000, "description": "1-5000 bars"}},
+                "required": ["symbol"]}),
+        ),
+        tool(
+            "list_algorithms",
+            "The ML algorithms train_ml_model accepts, each with a short description and its tunable hyperparameters (name and default). \
+             `custom` trains a Python estimator file you saved with save_estimator_file.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        tool(
+            "list_estimator_files",
+            "Custom estimator files (estimators/<name>.py): name, size, hash, last change and whether the user has approved this exact content for \
+             training. Pass `name` to also read one file's source.",
+            json!({"type": "object", "properties": {
+                "name": {"type": "string", "description": "e.g. centroid.py; include to read the source"}}}),
+        ),
+        tool(
+            "save_estimator_file",
+            "Create or replace a custom estimator file estimators/<name>.py. It must define make_estimator(params: dict) returning a scikit-learn style \
+             classifier (fit, predict, optionally predict_proba). Training with it (algorithm `custom`, estimator_file <name>) runs this Python on the user's \
+             machine and needs the user's approval unless they already approved this exact content.",
+            json!({"type": "object", "properties": {
+                "name": {"type": "string", "description": "[a-z][a-z0-9_]{0,40}.py"},
+                "content": {"type": "string", "description": "Python source, max 200 KB"}},
+                "required": ["name", "content"]}),
+        ),
+        tool(
+            "delete_estimator_file",
+            "Delete a custom estimator file. Models already trained with it keep their own copy.",
+            json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
         ),
         tool(
             "list_datasets",
@@ -204,6 +279,42 @@ pub fn describe(name: &str, args: &Value) -> Option<String> {
         ),
         "run_notebook_cell" => format!("Run cell {} of {} (executes Python)", s("cell_id"), s("path")),
         "list_feature_catalog" => "List the ML feature catalog".to_string(),
+        "check_expression" => format!(
+            "Check formula `{}` on {}",
+            s("expr").chars().take(120).collect::<String>(),
+            args.get("symbol").and_then(|v| v.as_str()).unwrap_or("?").to_uppercase()
+        ),
+        "list_symbol_data" => format!(
+            "List stored {} bars for {}",
+            args.get("timeframe").and_then(|v| v.as_str()).unwrap_or("1d"),
+            args.get("symbols")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "?".into())
+        ),
+        "fetch_symbol_history" => format!(
+            "Download {} {} bars of history for {} into local storage",
+            args.get("bars").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_DATASET_BARS as u64),
+            args.get("timeframe").and_then(|v| v.as_str()).unwrap_or("1d"),
+            args.get("symbol").and_then(|v| v.as_str()).unwrap_or("?").to_uppercase()
+        ),
+        "list_algorithms" => "List the ML algorithms and their hyperparameters".to_string(),
+        "list_estimator_files" => match args.get("name").and_then(|v| v.as_str()) {
+            Some(name) => format!("Read estimator file {name}"),
+            None => "List custom estimator files".to_string(),
+        },
+        "save_estimator_file" => {
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let preview: String = content.chars().filter(|c| *c != '\r').take(160).collect::<String>().replace('\n', " ⏎ ");
+            format!(
+                "Write estimator file {} - {} chars, hash {}. This Python runs on your machine when a model is trained with it. Starts: {preview}",
+                s("name"),
+                content.chars().count(),
+                copilot_tools::content_hash(content),
+            )
+        }
+        "delete_estimator_file" => format!("Delete estimator file {}", s("name")),
         "list_datasets" => "List ML datasets".to_string(),
         "preview_dataset" => format!("Preview dataset {}", s("name")),
         "get_model" => format!("Read model {}", s("model_id")),
@@ -219,17 +330,36 @@ pub fn describe(name: &str, args: &Value) -> Option<String> {
             let label = args.get("label");
             let horizon = label.and_then(|l| l.get("horizon_bars")).and_then(|v| v.as_u64()).map(|v| v.to_string()).unwrap_or_else(|| "?".into());
             let kind = label.and_then(|l| l.get("kind")).and_then(|v| v.as_str()).unwrap_or("direction");
-            let feature_count = args.get("features").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-            format!(
+            let count = |k: &str| args.get(k).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            let mut text = format!(
                 "Build dataset {}: {} {}, {} bars, {} features, {} label {} bars ahead",
                 s("name"),
                 list("symbols"),
                 args.get("timeframe").and_then(|v| v.as_str()).unwrap_or("1d"),
                 args.get("bars").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_DATASET_BARS as u64),
-                feature_count,
+                count("features"),
                 kind,
                 horizon
-            )
+            );
+            let mut extras: Vec<String> = Vec::new();
+            if count("custom_features") > 0 {
+                extras.push(format!("{} custom formula(s)", count("custom_features")));
+            }
+            if count("context_symbols") > 0 {
+                extras.push(format!("context {}", list("context_symbols")));
+            }
+            let from = args.get("from").and_then(|v| v.as_str());
+            let to = args.get("to").and_then(|v| v.as_str());
+            if from.is_some() || to.is_some() {
+                extras.push(format!("dates {} to {}", from.unwrap_or("start"), to.unwrap_or("latest")));
+            }
+            if let Some(fee) = args.get("fee_pct").and_then(|v| v.as_f64()).filter(|f| *f > 0.0) {
+                extras.push(format!("fee {fee}%"));
+            }
+            if !extras.is_empty() {
+                text.push_str(&format!(" ({})", extras.join(", ")));
+            }
+            text
         }
         "update_model" => {
             let changes: Vec<&str> = ["display_name", "notes", "tags"].into_iter().filter(|k| args.get(*k).is_some()).collect();
@@ -250,7 +380,26 @@ pub fn describe(name: &str, args: &Value) -> Option<String> {
                     format!(", {}", parts.join(" "))
                 })
                 .unwrap_or_default();
-            format!("Train {} on {source}{hyper}", s("algorithm"))
+            let algorithm = match args.get("algorithm").and_then(|v| v.as_str()) {
+                Some("custom") => format!(
+                    "custom estimator {} (runs its Python)",
+                    args.get("estimator_file").and_then(|v| v.as_str()).unwrap_or("?")
+                ),
+                Some(a) => a.to_string(),
+                None => "?".to_string(),
+            };
+            let mut extras: Vec<String> = Vec::new();
+            if let Some(mode) = args.get("trade_mode").and_then(|v| v.as_str()) {
+                extras.push(mode.to_string());
+            }
+            if let Some(h) = args.get("holdout_pct").and_then(|v| v.as_f64()).filter(|h| *h > 0.0) {
+                extras.push(format!("{h}% hold-out"));
+            }
+            if let Some(seed) = args.get("random_state").and_then(|v| v.as_i64()) {
+                extras.push(format!("seed {seed}"));
+            }
+            let extras = if extras.is_empty() { String::new() } else { format!(" [{}]", extras.join(", ")) };
+            format!("Train {algorithm} on {source}{hyper}{extras}")
         }
         _ => return None,
     })
@@ -543,6 +692,7 @@ fn dataset_json(info: &DatasetInfoDto) -> Value {
         "name": info.name, "dataset": info.name, "path": info.path, "rows": info.rows,
         "symbols": info.symbols, "timeframe": info.timeframe, "features": info.features,
         "label": info.label, "class_counts": info.class_counts,
+        "custom_features": info.custom_features, "context_symbols": info.context_symbols, "fee_pct": info.fee_pct,
         "first_time": info.first_time, "last_time": info.last_time,
         "created_at": info.created_at, "source": info.source,
     })
@@ -615,6 +765,27 @@ pub fn key_results(d: &ModelDetailDto) -> serde_json::Map<String, Value> {
         }
         None => flags.push("no trading result (train from a dataset to get one)".into()),
     }
+    if !d.trade_mode.is_empty() {
+        out.insert("trade_mode".into(), json!(d.trade_mode));
+    }
+    if let Some(h) = &d.holdout {
+        // The hold-out is the final stretch of time that tuning never saw, so it is the number
+        // to trust over the cross-validated one.
+        out.insert("holdout".into(), json!(h));
+        if let Some(b) = h.baseline_accuracy {
+            if h.accuracy <= b + 0.01 {
+                flags.push(format!("hold-out accuracy {:.1}% does not beat its baseline {:.1}%", h.accuracy * 100.0, b * 100.0));
+            }
+        }
+        if let Some(t) = &h.trading {
+            if t.strategy_return_pct <= t.buy_hold_return_pct {
+                flags.push(format!(
+                    "hold-out strategy return {:.2}% does not beat buy and hold {:.2}%",
+                    t.strategy_return_pct, t.buy_hold_return_pct
+                ));
+            }
+        }
+    }
     out.insert("flags".into(), json!(flags));
     out
 }
@@ -658,6 +829,10 @@ pub fn model_summary(d: &ModelDetailDto) -> Value {
         ("n_splits", json!(d.n_splits)),
         ("lag_periods", json!(d.lag_periods)),
         ("hyperparams", json!(d.hyperparams)),
+        ("custom_features", json!(d.custom_features)),
+        ("context_symbols", json!(d.context_symbols)),
+        ("fee_pct", json!(d.fee_pct)),
+        ("estimator_file", json!(d.estimator_file)),
         ("feature_count", json!(d.feature_names.len())),
         ("folds", json!(folds)),
         ("top_importances", json!(importances)),
@@ -734,8 +909,114 @@ pub async fn exec_ml(
             Err(e) => Err(e),
         },
         "update_model" => update_model(args, state, models_dir),
+        "check_expression" => check_expression(args, state).await,
+        "list_symbol_data" => list_symbol_data(args, state).await,
+        "fetch_symbol_history" => fetch_history(args, state).await,
+        "list_algorithms" => list_algorithms(paths).await,
+        "list_estimator_files" => list_estimators(args, state, paths),
+        "save_estimator_file" => save_estimator(args, state, paths),
+        "delete_estimator_file" => delete_estimator(args, state, paths),
         _ => return None,
     })
+}
+
+fn timeframe_arg(args: &Value) -> &str {
+    args.get("timeframe").and_then(|v| v.as_str()).map(str::trim).filter(|t| !t.is_empty()).unwrap_or("1d")
+}
+
+async fn check_expression(args: &Value, state: &AppState) -> Result<Value, String> {
+    let expr = req_str(args, "expr")?;
+    let symbol = req_str(args, "symbol")?;
+    let check = ml_datasets::check_expression_core(&state.storage, expr, symbol, timeframe_arg(args)).await?;
+    to_value(&check)
+}
+
+async fn list_symbol_data(args: &Value, state: &AppState) -> Result<Value, String> {
+    let symbols = symbols_arg(args)?;
+    let rows = ml_datasets::list_symbol_data_core(&state.storage, &symbols, timeframe_arg(args)).await?;
+    Ok(json!({
+        "timeframe": timeframe_arg(args),
+        "symbols": rows,
+        "note": "bars = 0 means nothing is stored yet: call fetch_symbol_history.",
+    }))
+}
+
+async fn fetch_history(args: &Value, state: &AppState) -> Result<Value, String> {
+    let symbol = req_str(args, "symbol")?;
+    let bars = match args.get("bars") {
+        None | Some(Value::Null) => DEFAULT_DATASET_BARS,
+        Some(v) => v.as_u64().ok_or("`bars` must be a positive integer")? as usize,
+    };
+    let stored = ml_datasets::fetch_symbol_history_inner(state, symbol, timeframe_arg(args), bars, "copilot").await?;
+    to_value(&stored)
+}
+
+/// The catalog trimmed for the model's context: id, label, description and each parameter's
+/// name with its default. Ranges and help text stay in the UI.
+pub fn algorithm_summary(algorithms: &[crate::dto::AlgorithmDto]) -> Value {
+    let list: Vec<Value> = algorithms
+        .iter()
+        .map(|a| {
+            let params: serde_json::Map<String, Value> = a.params.iter().map(|p| (p.key.clone(), p.default.clone())).collect();
+            let mut entry = json!({"id": a.id, "label": a.label, "description": a.description, "params": params});
+            if a.id == "custom" {
+                entry["needs"] = json!("estimator_file: save one with save_estimator_file; training with it needs the user's approval");
+            }
+            entry
+        })
+        .collect();
+    json!({"algorithms": list, "note": "Pass hyperparameters to train_ml_model as {hyperparams: {name: value}}. null or an omitted name means the algorithm's default."})
+}
+
+async fn list_algorithms(paths: &RuntimePaths) -> Result<Value, String> {
+    let algorithms = ml_estimators::fetch_algorithms(paths).await?;
+    Ok(algorithm_summary(&algorithms))
+}
+
+fn list_estimators(args: &Value, state: &AppState, paths: &RuntimePaths) -> Result<Value, String> {
+    let root = paths.work_root();
+    let files = ml_estimators::list_files(root);
+    let summary = |f: &crate::dto::EstimatorFileDto| {
+        json!({
+            "name": f.name, "bytes": f.content.len(), "hash": copilot_tools::content_hash(&f.content),
+            "updated_at": f.updated_at, "approved_for_training": !ml_estimators::needs_approval(state, root, &f.name),
+        })
+    };
+    if let Some(name) = args.get("name").and_then(|v| v.as_str()).map(str::trim).filter(|n| !n.is_empty()) {
+        let file = files.iter().find(|f| f.name == name).ok_or_else(|| format!("no estimator file `{name}`; see list_estimator_files"))?;
+        let total = file.content.chars().count();
+        let mut out = summary(file);
+        out["content"] = json!(file.content.chars().take(MAX_ESTIMATOR_CHARS_SHOWN).collect::<String>());
+        out["truncated"] = json!(total > MAX_ESTIMATOR_CHARS_SHOWN);
+        return Ok(out);
+    }
+    Ok(json!({"count": files.len(), "files": files.iter().map(summary).collect::<Vec<_>>()}))
+}
+
+/// Source shown for one estimator file; the rest would only burn context.
+const MAX_ESTIMATOR_CHARS_SHOWN: usize = 12_000;
+
+fn save_estimator(args: &Value, state: &AppState, paths: &RuntimePaths) -> Result<Value, String> {
+    let name = req_str(args, "name")?;
+    // Not trimmed: the content is saved exactly as sent, and the hash covers exactly that.
+    let content = args.get("content").and_then(|v| v.as_str()).ok_or("missing `content`")?;
+    let saved = ml_estimators::save_inner(state, paths.work_root(), name, content, "copilot")?;
+    copilot_tools::note_estimator_authored(state, &saved.name, content);
+    Ok(json!({
+        "name": saved.name, "saved": true, "hash": copilot_tools::content_hash(content),
+        "approved_for_training": false,
+        "note": "Training with algorithm `custom` and this estimator_file will ask the user to approve this exact content.",
+    }))
+}
+
+fn delete_estimator(args: &Value, state: &AppState, paths: &RuntimePaths) -> Result<Value, String> {
+    let name = req_str(args, "name")?;
+    if ml_estimators::delete_inner(state, paths.work_root(), name, "copilot")? {
+        copilot_tools::forget_estimator(state, name);
+        Ok(json!({"deleted": name}))
+    } else {
+        Err(format!("no estimator file `{name}`; see list_estimator_files"))
+    }
 }
 
 fn update_model(args: &Value, state: &AppState, models_dir: &Path) -> Result<Value, String> {
@@ -843,7 +1124,7 @@ mod tests {
             source: "copilot".into(), hyperparams: [("max_depth".to_string(), json!(4))].into_iter().collect(),
             n_splits: 3, lag_periods: vec![], dataset: Some("ds".into()), symbols: vec!["SPY".into()],
             timeframe: Some("1d".into()),
-            label: Some(LabelSpecDto { horizon_bars: 5, kind: "direction".into(), threshold_pct: 0.0 }),
+            label: Some(LabelSpecDto { horizon_bars: 5, kind: "direction".into(), threshold_pct: 0.0, ..Default::default() }),
             rows: Some(2000), duration_secs: Some(2.0), artifact_bytes: Some(10),
             library_versions: Default::default(),
             cv_folds: vec![fold(1, 0.6), fold(2, 0.62), fold(3, 0.58)],
@@ -851,6 +1132,7 @@ mod tests {
             trading: Some(TradingSummaryDto { strategy_return_pct: 8.0, buy_hold_return_pct: 5.0, hit_rate: 0.55, trades: 60, max_drawdown_pct: -4.0, sharpe: 1.1 }),
             log_tail: "LOG".repeat(1000),
             used_by: vec![ModelUsageDto { kind: "automation".into(), id: "a1".into(), name: "Auto".into(), enabled: true, symbol: "SPY".into() }],
+            ..Default::default()
         }
     }
 
@@ -978,8 +1260,9 @@ mod tests {
         let info = DatasetInfoDto {
             name: "spy_5d".into(), path: "data/datasets/spy_5d.csv".into(), rows: 900, symbols: vec!["SPY".into()],
             timeframe: "1d".into(), features: vec!["ret_1".into()],
-            label: LabelSpecDto { horizon_bars: 5, kind: "direction".into(), threshold_pct: 0.0 },
+            label: LabelSpecDto { horizon_bars: 5, kind: "direction".into(), threshold_pct: 0.0, ..Default::default() },
             class_counts: Default::default(), created_at: "now".into(), first_time: None, last_time: None, source: "copilot".into(),
+            ..Default::default()
         };
         let v = dataset_json(&info);
         assert_eq!(v["name"], "spy_5d");
@@ -1004,5 +1287,99 @@ mod tests {
         assert!(describe("run_notebook_cell", &json!({"path": "a.apexnb.json", "cell_id": "c1"})).unwrap().contains("Python"));
         assert!(describe("set_symbol_provider", &json!({"symbol": "TCS.NS"})).unwrap().contains("automatic"));
         assert!(describe("get_quote", &json!({})).is_none());
+    }
+
+    #[test]
+    fn new_tool_descriptions_name_what_will_happen() {
+        let d = |name: &str, args: Value| describe(name, &args).unwrap_or_else(|| panic!("{name} has no description"));
+        assert!(d("check_expression", json!({"expr": "sma(close, 5)", "symbol": "spy"})).contains("sma(close, 5)"));
+        assert!(d("check_expression", json!({"expr": "x".repeat(400), "symbol": "spy"})).len() < 200, "long formulas are cut");
+        assert_eq!(d("list_symbol_data", json!({"symbols": ["SPY", "QQQ"], "timeframe": "1h"})), "List stored 1h bars for SPY, QQQ");
+        let fetch = d("fetch_symbol_history", json!({"symbol": "spy", "bars": 2000}));
+        assert!(fetch.contains("SPY") && fetch.contains("2000") && fetch.contains("Download"), "{fetch}");
+        assert!(d("list_algorithms", json!({})).contains("algorithms"));
+        assert_eq!(d("list_estimator_files", json!({})), "List custom estimator files");
+        assert_eq!(d("list_estimator_files", json!({"name": "a.py"})), "Read estimator file a.py");
+        let save = d("save_estimator_file", json!({"name": "mine.py", "content": "def make_estimator(params):\n    return None\n"}));
+        assert!(save.contains("mine.py") && save.contains("hash ") && save.contains("make_estimator") && save.contains("runs on your machine"), "{save}");
+        assert!(d("delete_estimator_file", json!({"name": "mine.py"})).contains("mine.py"));
+    }
+
+    #[test]
+    fn extended_build_and_train_cards_show_what_changes_the_result() {
+        let build = describe("build_dataset", &json!({"name": "d", "symbols": ["SPY"], "features": ["ret_1"], "label": {"horizon_bars": 5},
+            "custom_features": [{"name": "a", "expr": "close"}, {"name": "b", "expr": "open"}], "context_symbols": ["QQQ"],
+            "from": "2024-01-01", "fee_pct": 0.1})).unwrap();
+        for needle in ["2 custom formula(s)", "context QQQ", "dates 2024-01-01 to latest", "fee 0.1%"] {
+            assert!(build.contains(needle), "{build}");
+        }
+        let custom = describe("train_ml_model", &json!({"algorithm": "custom", "estimator_file": "mine.py", "dataset": "d",
+            "trade_mode": "long_short", "holdout_pct": 20, "random_state": 7})).unwrap();
+        assert_eq!(custom, "Train custom estimator mine.py (runs its Python) on dataset d [long_short, 20% hold-out, seed 7]");
+        // Plain training keeps its short card.
+        let plain = describe("train_ml_model", &json!({"algorithm": "extra_trees", "dataset": "d", "holdout_pct": 0})).unwrap();
+        assert_eq!(plain, "Train extra_trees on dataset d");
+    }
+
+    #[test]
+    fn the_algorithm_catalog_is_trimmed_to_names_and_defaults() {
+        use crate::dto::{AlgorithmDto, ParamDefDto};
+        let param = |key: &str, default: Value| ParamDefDto {
+            key: key.into(), label: "Long label".into(), kind: "int".into(), default, min: Some(1.0), max: Some(9.0),
+            choices: None, help: "A long help text that the model does not need".into(),
+        };
+        let catalog = vec![
+            AlgorithmDto { id: "random_forest".into(), label: "Random forest".into(), description: "Trees".into(),
+                params: vec![param("n_estimators", json!(100)), param("max_depth", Value::Null)], accepts_extra_params: true },
+            AlgorithmDto { id: "custom".into(), label: "Custom".into(), description: "Your file".into(), params: vec![], accepts_extra_params: true },
+        ];
+        let v = algorithm_summary(&catalog);
+        let first = &v["algorithms"][0];
+        assert_eq!(first["id"], "random_forest");
+        assert_eq!(first["params"]["n_estimators"], 100);
+        assert!(first["params"]["max_depth"].is_null() && first["params"].as_object().unwrap().contains_key("max_depth"));
+        let text = v.to_string();
+        assert!(!text.contains("Long label") && !text.contains("help text"), "labels and help stay in the UI");
+        assert!(v["algorithms"][1]["needs"].as_str().unwrap().contains("approval"));
+        assert!(first.get("needs").is_none());
+    }
+
+    #[test]
+    fn a_holdout_that_does_not_beat_its_baseline_is_flagged() {
+        let mut d = detail();
+        assert!(key_results(&d).get("holdout").is_none());
+        d.trade_mode = "long_short".into();
+        d.holdout = Some(crate::dto::HoldoutDto {
+            rows: 100, accuracy: 0.5, baseline_accuracy: Some(0.52),
+            trading: Some(TradingSummaryDto { strategy_return_pct: -1.0, buy_hold_return_pct: 2.0, hit_rate: 0.4, trades: 20, max_drawdown_pct: -5.0, sharpe: -0.2 }),
+        });
+        let out = key_results(&d);
+        assert_eq!(out["trade_mode"], "long_short");
+        assert_eq!(out["holdout"]["rows"], 100);
+        let raised = flags(&d);
+        assert!(raised.iter().any(|f| f.starts_with("hold-out accuracy 50.0% does not beat its baseline 52.0%")), "{raised:?}");
+        assert!(raised.iter().any(|f| f.starts_with("hold-out strategy return -1.00% does not beat buy and hold 2.00%")), "{raised:?}");
+        // A good hold-out raises nothing.
+        d.holdout = Some(crate::dto::HoldoutDto {
+            rows: 100, accuracy: 0.6, baseline_accuracy: Some(0.5),
+            trading: Some(TradingSummaryDto { strategy_return_pct: 4.0, buy_hold_return_pct: 2.0, hit_rate: 0.6, trades: 20, max_drawdown_pct: -2.0, sharpe: 1.0 }),
+        });
+        assert!(flags_of_holdout(&flags(&d)).is_empty());
+    }
+
+    fn flags_of_holdout(all: &[String]) -> Vec<&String> {
+        all.iter().filter(|f| f.starts_with("hold-out")).collect()
+    }
+
+    #[test]
+    fn the_model_summary_carries_the_data_choices() {
+        let mut d = detail();
+        d.custom_features = vec![crate::dto::CustomFeatureDto { name: "gap".into(), expr: "open/shift(close,1)-1".into() }];
+        d.context_symbols = vec!["QQQ".into()];
+        d.fee_pct = 0.1;
+        d.estimator_file = Some("mine.py".into());
+        let v = model_summary(&d);
+        assert_eq!(v["custom_features"][0]["name"], "gap");
+        assert_eq!((v["context_symbols"][0].as_str(), v["fee_pct"].as_f64(), v["estimator_file"].as_str()), (Some("QQQ"), Some(0.1), Some("mine.py")));
     }
 }

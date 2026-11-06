@@ -463,6 +463,38 @@ pub struct MLTrainingRequestDto {
     /// Column holding each row's forward return, used to score trading performance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_column: Option<String>,
+    /// How the evaluation trades the predictions: "long_flat" (default) or "long_short".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_mode: Option<String>,
+    /// Share (0 to 40) of the final time steps kept out of cross-validation and scored once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_pct: Option<f64>,
+    /// Required when `algorithm` is "custom": a file saved with `save_estimator_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimator_file: Option<String>,
+    /// Seed for estimators that take one. Omitted: a fixed default, so runs repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub random_state: Option<i64>,
+}
+
+impl Default for MLTrainingRequestDto {
+    fn default() -> Self {
+        Self {
+            algorithm: String::new(),
+            data_path: String::new(),
+            target_column: String::new(),
+            feature_columns: Vec::new(),
+            hyperparams: Default::default(),
+            n_splits: default_n_splits(),
+            lag_periods: Vec::new(),
+            dataset: None,
+            return_column: None,
+            trade_mode: None,
+            holdout_pct: None,
+            estimator_file: None,
+            random_state: None,
+        }
+    }
 }
 
 fn default_n_splits() -> usize {
@@ -494,16 +526,29 @@ pub struct FeatureDefDto {
     pub warmup_bars: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LabelSpecDto {
     pub horizon_bars: usize,
     /// "direction" | "return_threshold"
     pub kind: String,
     #[serde(default)]
     pub threshold_pct: f64,
+    /// return_threshold only: separate up/down thresholds (percent); fall back to `threshold_pct`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_threshold_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub down_threshold_pct: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A user-defined feature: a formula over bars (see `commands::ml_expr`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CustomFeatureDto {
+    /// `[a-z][a-z0-9_]{0,40}`, not a catalog feature id.
+    pub name: String,
+    pub expr: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BuildDatasetRequestDto {
     pub name: String,
     pub symbols: Vec<String>,
@@ -511,9 +556,51 @@ pub struct BuildDatasetRequestDto {
     pub bars: usize,
     pub features: Vec<String>,
     pub label: LabelSpecDto,
+    /// Inclusive ISO dates (YYYY-MM-DD) bounding the bars; otherwise the latest `bars`.
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub custom_features: Vec<CustomFeatureDto>,
+    /// Extra symbols custom formulas may read with `other("SYMBOL", "field")`; not dataset rows.
+    #[serde(default)]
+    pub context_symbols: Vec<String>,
+    /// Round-trip cost in percent, subtracted from every forward return before labelling.
+    #[serde(default)]
+    pub fee_pct: f64,
+}
+
+/// One sample value of a formula check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpressionSampleDto {
+    pub time: String,
+    /// null = not yet defined at that bar.
+    pub value: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpressionCheckDto {
+    pub ok: bool,
+    pub error: Option<String>,
+    /// 0-based character offset of the error in the formula.
+    pub error_pos: Option<usize>,
+    pub warmup_bars: usize,
+    /// The last few computed values for the chosen symbol.
+    pub sample: Vec<ExpressionSampleDto>,
+}
+
+/// How much stored data exists for a symbol and timeframe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolDataDto {
+    pub symbol: String,
+    pub timeframe: String,
+    pub bars: usize,
+    pub first_time: Option<String>,
+    pub last_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DatasetInfoDto {
     pub name: String,
     /// Path usable as `data_path` when training (relative to the work root).
@@ -529,6 +616,12 @@ pub struct DatasetInfoDto {
     pub last_time: Option<String>,
     /// "user" | "copilot"
     pub source: String,
+    #[serde(default)]
+    pub custom_features: Vec<CustomFeatureDto>,
+    #[serde(default)]
+    pub context_symbols: Vec<String>,
+    #[serde(default)]
+    pub fee_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,8 +677,23 @@ pub struct ModelUsageDto {
     pub symbol: String,
 }
 
+/// Result on the final period that cross-validation never saw.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HoldoutDto {
+    pub rows: usize,
+    pub accuracy: f64,
+    #[serde(default)]
+    pub baseline_accuracy: Option<f64>,
+    #[serde(default)]
+    pub trading: Option<TradingSummaryDto>,
+}
+
+fn default_trade_mode() -> String {
+    "long_flat".to_string()
+}
+
 /// Everything the workbench shows about one model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelDetailDto {
     pub model_id: String,
     pub algorithm: String,
@@ -616,6 +724,58 @@ pub struct ModelDetailDto {
     pub trading: Option<TradingSummaryDto>,
     pub log_tail: String,
     pub used_by: Vec<ModelUsageDto>,
+    /// "long_flat" | "long_short": how the evaluation traded the predictions.
+    #[serde(default = "default_trade_mode")]
+    pub trade_mode: String,
+    pub holdout: Option<HoldoutDto>,
+    #[serde(default)]
+    pub custom_features: Vec<CustomFeatureDto>,
+    #[serde(default)]
+    pub context_symbols: Vec<String>,
+    #[serde(default)]
+    pub fee_pct: f64,
+    /// Name of the custom estimator file when `algorithm` is "custom".
+    pub estimator_file: Option<String>,
+}
+
+// ── Algorithm catalog and custom estimators ──────────────────────────
+
+/// One tunable constructor parameter of an algorithm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParamDefDto {
+    pub key: String,
+    pub label: String,
+    /// "int" | "float" | "bool" | "choice" | "text"
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub default: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices: Option<Vec<String>>,
+    #[serde(default)]
+    pub help: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlgorithmDto {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub params: Vec<ParamDefDto>,
+    pub accepts_extra_params: bool,
+}
+
+/// A custom estimator file under `<work root>/estimators/`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EstimatorFileDto {
+    pub name: String,
+    /// Relative to the work root, e.g. `estimators/my_model.py`.
+    pub path: String,
+    pub content: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -667,6 +827,10 @@ pub struct BrokerConnectionDto {
     pub market_data_available: bool,
     pub token_field_label: String,
     pub message: String,
+    /// Whether an automation may short through this broker: paper always; a live broker only
+    /// when `[automations] allow_live_shorting` is on and its adapter supports shorting.
+    #[serde(default)]
+    pub can_short: bool,
 }
 
 /// One point of an indicator/quant series, aligned to a bar time (RFC3339).
@@ -847,9 +1011,11 @@ mod tests {
             market_data_available: false,
             token_field_label: String::new(),
             message: "Paper trading is available".into(),
+            can_short: true,
         };
 
         let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains("\"can_short\":true"));
         assert!(json.contains("Paper Trading"));
         assert!(json.contains("ready"));
     }

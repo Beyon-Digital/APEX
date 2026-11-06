@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import joblib
+
+from ml.estimators import estimator_module_name, import_estimator_file
 
 
 def _parse_args() -> argparse.Namespace:
@@ -37,6 +40,24 @@ def _parse_args() -> argparse.Namespace:
         help="JSON array of rows, each a list of values in metadata feature order (batch mode)",
     )
     return parser.parse_args()
+
+
+def _load_model(model_path: Path, meta: dict):
+    """Load the joblib artifact, first making a custom estimator's code importable.
+
+    A model trained with a custom estimator pickles instances of classes defined in the user's
+    file. The copy saved next to the model is imported by file location under the module name
+    the pickle refers to, so it resolves even if the original file was edited or deleted.
+    """
+    copy = meta.get("estimator_copy")
+    if copy:
+        copy_path = model_path.parent / str(copy)
+        if Path(str(copy)).name != str(copy) or not copy_path.is_file():
+            raise FileNotFoundError(f"this model's estimator file is missing: {copy}")
+        sys.path.insert(0, str(model_path.parent))
+        module_name = meta.get("estimator_module") or estimator_module_name(str(meta.get("estimator_sha256") or ""))
+        import_estimator_file(copy_path, module_name)
+    return joblib.load(model_path)
 
 
 def _probabilities(model, rows) -> list[float | None]:
@@ -83,12 +104,13 @@ def main() -> int:
     metadata_path = model_path.with_suffix(".json")
 
     feature_order: list[str] = []
+    meta: dict = {}
     if metadata_path.exists():
         meta = json.loads(metadata_path.read_text())
         feature_order = list(meta.get("feature_names") or [])
 
     if args.features_matrix_json is not None:
-        return _predict_batch(joblib.load(model_path), model_path, feature_order, args.features_matrix_json)
+        return _predict_batch(_load_model(model_path, meta), model_path, feature_order, args.features_matrix_json)
 
     raw = json.loads(args.features_json)
     if isinstance(raw, dict):
@@ -103,7 +125,7 @@ def main() -> int:
     else:
         row = [[float(v) for v in raw]]
 
-    model = joblib.load(model_path)
+    model = _load_model(model_path, meta)
     pred = model.predict(row)[0]
 
     probability = _probabilities(model, row)[0]
