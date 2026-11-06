@@ -236,6 +236,15 @@ fn resolve_notebook_path(
         );
     }
 
+    // Listing, creating and saving return paths relative to the work root
+    // ("notebooks/research.apexnb.json"), while callers may also pass a path relative to the
+    // notebooks directory ("research.apexnb.json"). Accept both instead of nesting
+    // "notebooks/notebooks/...".
+    let relative = match relative.strip_prefix("notebooks") {
+        Ok(rest) if !rest.as_os_str().is_empty() => rest.to_path_buf(),
+        _ => relative,
+    };
+
     let with_extension = if is_notebook_path(&relative) {
         relative
     } else {
@@ -306,4 +315,68 @@ fn notebook_display_name(path: &Path) -> String {
         .map(|name| name.trim_end_matches(".apexnb.json").replace('_', " "))
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_NOTEBOOK_TITLE.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("apex-notebook-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn work_root_relative_and_notebooks_relative_paths_resolve_to_the_same_file() {
+        let root = temp_root("paths");
+        let paths = RuntimePaths::for_test(&root);
+        let expected = root.join("notebooks").join("research.apexnb.json");
+
+        for input in [
+            "notebooks/research.apexnb.json",
+            "research.apexnb.json",
+            "research",
+            "",
+        ] {
+            let resolved = resolve_notebook_path(&paths, input).unwrap();
+            assert_eq!(resolved, expected, "input {input:?}");
+        }
+        assert!(!root.join("notebooks").join("notebooks").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn subfolders_and_traversal_are_handled() {
+        let root = temp_root("sub");
+        let paths = RuntimePaths::for_test(&root);
+
+        let nested = resolve_notebook_path(&paths, "notebooks/ideas/a.apexnb.json").unwrap();
+        assert_eq!(nested, root.join("notebooks").join("ideas").join("a.apexnb.json"));
+        assert!(resolve_notebook_path(&paths, "../escape.apexnb.json").is_err());
+        assert!(resolve_notebook_path(&paths, "notebooks/../escape.apexnb.json").is_err());
+        assert!(resolve_notebook_path(&paths, "/etc/x.apexnb.json").is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_path_returned_by_read_loads_back() {
+        let root = temp_root("roundtrip");
+        let paths = RuntimePaths::for_test(&root);
+        let file = resolve_notebook_path(&paths, "research.apexnb.json").unwrap();
+        let doc = NotebookDocumentDto {
+            title: "research".into(),
+            path: String::new(),
+            cells: vec![],
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        save_notebook_to_path(&file, &doc, paths.work_root()).unwrap();
+
+        let listed = read_notebook(&file, paths.work_root()).unwrap().path;
+        assert_eq!(listed, "notebooks/research.apexnb.json");
+        let again = resolve_notebook_path(&paths, &listed).unwrap();
+        assert!(read_notebook(&again, paths.work_root()).is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
 }
