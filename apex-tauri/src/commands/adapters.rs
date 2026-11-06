@@ -118,7 +118,18 @@ fn llm_schema(provider_id: &str, name: &str) -> AdapterSchemaDto {
     }
 }
 
+/// Every LLM provider takes exactly one API key. This does not depend on the provider being in
+/// the list loaded at startup, or a provider added in Settings could not get a key until a restart.
+fn llm_provider_fields(adapter_id: &str) -> Option<Vec<AdapterFieldDto>> {
+    adapter_id
+        .strip_prefix("llm:")
+        .map(|provider_id| llm_schema(provider_id, provider_id).fields)
+}
+
 fn allowed_fields(state: &AppState, adapter_id: &str) -> Vec<AdapterFieldDto> {
+    if let Some(fields) = llm_provider_fields(adapter_id) {
+        return fields;
+    }
     adapter_schemas(state)
         .into_iter()
         .find(|s| s.adapter_id == adapter_id)
@@ -341,4 +352,18 @@ pub async fn test_adapter_connection(
         connection.authenticated,
         connection.message,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn any_llm_provider_id_accepts_an_api_key_but_brokers_do_not_match() {
+        let fields = llm_provider_fields("llm:brand-new-provider").expect("llm ids take a key");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].key, "api_key");
+        assert_eq!(fields[0].kind, "secret");
+        assert!(llm_provider_fields("zerodha").is_none());
+    }
 }

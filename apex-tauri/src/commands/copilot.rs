@@ -2,6 +2,7 @@ use crate::commands::ml::ModelRegistry;
 use crate::commands::python_runtime;
 use crate::commands::scanner::ScanCriterionDto;
 use crate::commands::strategy::StrategyBacktestRequestDto;
+use crate::commands::copilot_mode::{self, ChatMode};
 use crate::commands::{automation, copilot_tools, data, ml, quant, scanner, strategy};
 use crate::dto::MLTrainingRequestDto;
 use crate::state::AppState;
@@ -44,6 +45,8 @@ pub struct CopilotReply {
     pub reply: String,
     pub model: String,
     pub provider: String,
+    /// The mode the reply was produced under: "ask", "review" or "agent".
+    pub mode: String,
     pub tool_calls: Vec<ToolCallTrace>,
     pub pending_approvals: Vec<PendingApprovalDto>,
 }
@@ -51,7 +54,7 @@ pub struct CopilotReply {
 /// Write-class tools — mutate state or touch the filesystem. When
 /// `[copilot] require_approval` is set they pause until the user approves
 /// the exact call (name + canonical args).
-const WRITE_TOOLS: &[&str] = &[
+pub(super) const WRITE_TOOLS: &[&str] = &[
     "place_order",
     "cancel_order",
     "create_automation",
@@ -101,13 +104,24 @@ async fn dispatch_tool(
     state: &AppState,
     models: &ModelRegistry,
     runtime_paths: &python_runtime::RuntimePaths,
+    mode: ChatMode,
     trace: &mut Vec<ToolCallTrace>,
     pending: &mut Vec<PendingApprovalDto>,
 ) -> Option<Value> {
     let detail = trace_detail(name, args);
-    let gated = state.copilot.require_approval
-        && (WRITE_TOOLS.contains(&name)
-            || copilot_tools::needs_approval(name, args, state, runtime_paths));
+    // Ask mode is read-only. The model is not offered write tools, but a call that arrives
+    // anyway (a stale tool list, a hallucinated name) is refused here, not executed.
+    if mode == ChatMode::Ask && copilot_mode::refused_in_ask(name, args, state, runtime_paths) {
+        trace.push(ToolCallTrace {
+            name: name.to_string(),
+            detail: format!("{detail} — blocked in Ask mode"),
+            ok: false,
+        });
+        return Some(json!({
+            "error": "Ask mode is read-only, so this was not done. Tell the user what you would do and that they can switch to Review or Agent mode."
+        }));
+    }
+    let gated = copilot_mode::requires_approval(mode, name, args, state, runtime_paths);
 
     let result = if gated {
         let key = tool_approval_key(name, args);
@@ -1112,7 +1126,22 @@ async fn responses_round(
         .map_err(|e| format!("failed to parse {} response: {e}", provider.id))
 }
 
-const MAX_AGENT_ROUNDS: usize = 10;
+
+/// The text shown for a finished turn. A turn that ran out of rounds says so, because a long
+/// Agent task that just stops looks like a hang.
+fn final_text(reply_text: String, awaiting_approval: bool, finished: bool, mode: ChatMode) -> String {
+    if awaiting_approval {
+        return "Paused — approve the pending tool call(s) to continue.".into();
+    }
+    if finished {
+        return if reply_text.is_empty() { "(empty response)".into() } else { reply_text };
+    }
+    let note = format!(
+        "Stopped after {} steps. Send \"continue\" and I will pick up where I left off.",
+        mode.max_rounds()
+    );
+    if reply_text.is_empty() { note } else { format!("{reply_text}\n\n({note})") }
+}
 
 /// Chat with the AI copilot. Resolves the configured provider
 /// ([[llm.providers]] or legacy [copilot]), then runs an agentic
@@ -1124,6 +1153,7 @@ pub async fn copilot_chat(
     message: String,
     history: Option<Vec<CopilotMessage>>,
     turn_id: Option<String>,
+    mode: Option<String>,
     state: State<'_, AppState>,
     models: State<'_, ModelRegistry>,
     runtime_paths: State<'_, python_runtime::RuntimePaths>,
@@ -1140,6 +1170,7 @@ pub async fn copilot_chat(
             state.copilot_approvals.lock().unwrap().clear();
         }
     }
+    let mode = ChatMode::resolve(mode.as_deref(), state.copilot.require_approval)?;
     let provider = resolve_provider(&state)?;
 
     // ACP providers hand the prompt to an external agent process.
@@ -1154,12 +1185,13 @@ pub async fn copilot_chat(
             reply,
             model: provider.model,
             provider: provider.id,
+            mode: mode.as_str().to_string(),
             tool_calls: vec![],
             pending_approvals: vec![],
         });
     }
 
-    let system_prompt = copilot_tools::system_prompt(&state, &runtime_paths);
+    let system_prompt = copilot_tools::system_prompt(&state, &runtime_paths, mode);
 
     let mut trace: Vec<ToolCallTrace> = Vec::new();
     let state_ref = state.inner();
@@ -1168,7 +1200,7 @@ pub async fn copilot_chat(
 
     match provider.api_kind.as_str() {
         "responses" | "chatgpt" => {
-            let tools = chat_tools_to_responses(&tool_schemas());
+            let tools = chat_tools_to_responses(&copilot_mode::tools_for_mode(tool_schemas(), mode));
             let mut input: Vec<Value> = vec![json!({
                 "role": "developer",
                 "content": [{"type": "input_text", "text": system_prompt}],
@@ -1195,7 +1227,8 @@ pub async fn copilot_chat(
             let mut reply_text = String::new();
             let mut model_name = provider.model.clone();
             let mut pending_approvals: Vec<PendingApprovalDto> = Vec::new();
-            'rounds: for _ in 0..MAX_AGENT_ROUNDS {
+            let mut finished = false;
+            'rounds: for _ in 0..mode.max_rounds() {
                 let resp = if provider.api_kind == "chatgpt" {
                     crate::chatgpt_auth::responses_round(&state, &provider.model, &input, &tools).await?
                 } else {
@@ -1226,6 +1259,7 @@ pub async fn copilot_chat(
                     }
                 }
                 if calls.is_empty() {
+                    finished = true;
                     break;
                 }
                 let mut awaiting = false;
@@ -1248,6 +1282,7 @@ pub async fn copilot_chat(
                         state_ref,
                         models_ref,
                         paths_ref,
+                        mode,
                         &mut trace,
                         &mut pending_approvals,
                     )
@@ -1269,22 +1304,17 @@ pub async fn copilot_chat(
                 }
             }
             Ok(CopilotReply {
-                reply: if !pending_approvals.is_empty() {
-                    "Paused — approve the pending tool call(s) to continue.".into()
-                } else if reply_text.is_empty() {
-                    "(empty response)".into()
-                } else {
-                    reply_text
-                },
+                reply: final_text(reply_text, !pending_approvals.is_empty(), finished, mode),
                 model: model_name,
                 provider: provider.id,
+                mode: mode.as_str().to_string(),
                 tool_calls: trace,
                 pending_approvals,
             })
         }
         _ => {
             // OpenAI chat/completions loop (default + "chat").
-            let tools = tool_schemas();
+            let tools = copilot_mode::tools_for_mode(tool_schemas(), mode);
             let mut messages = vec![json!({"role": "system", "content": system_prompt})];
             if let Some(history) = &history {
                 for m in history.iter().rev().take(16).rev() {
@@ -1301,7 +1331,8 @@ pub async fn copilot_chat(
             let mut reply_text = String::new();
             let mut model_name = provider.model.clone();
             let mut pending_approvals: Vec<PendingApprovalDto> = Vec::new();
-            'rounds: for _ in 0..MAX_AGENT_ROUNDS {
+            let mut finished = false;
+            'rounds: for _ in 0..mode.max_rounds() {
                 let resp = chat_round(&state.http, &provider, &messages, &tools).await?;
                 if let Some(m) = resp.get("model").and_then(|v| v.as_str()) {
                     model_name = m.to_string();
@@ -1322,6 +1353,7 @@ pub async fn copilot_chat(
                     .cloned()
                     .unwrap_or_default();
                 if calls.is_empty() {
+                    finished = true;
                     break;
                 }
                 messages.push(msg);
@@ -1349,6 +1381,7 @@ pub async fn copilot_chat(
                         state_ref,
                         models_ref,
                         paths_ref,
+                        mode,
                         &mut trace,
                         &mut pending_approvals,
                     )
@@ -1369,19 +1402,34 @@ pub async fn copilot_chat(
                 }
             }
             Ok(CopilotReply {
-                reply: if !pending_approvals.is_empty() {
-                    "Paused — approve the pending tool call(s) to continue.".into()
-                } else if reply_text.is_empty() {
-                    "(empty response)".into()
-                } else {
-                    reply_text
-                },
+                reply: final_text(reply_text, !pending_approvals.is_empty(), finished, mode),
                 model: model_name,
                 provider: provider.id,
+                mode: mode.as_str().to_string(),
                 tool_calls: trace,
                 pending_approvals,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod mode_reply_tests {
+    use super::*;
+
+    #[test]
+    fn a_turn_that_ran_out_of_steps_says_so() {
+        let text = final_text(String::new(), false, false, ChatMode::Agent);
+        assert!(text.contains("Stopped after 25 steps") && text.contains("continue"), "{text}");
+        let partial = final_text("Half done.".into(), false, false, ChatMode::Review);
+        assert!(partial.starts_with("Half done.") && partial.contains("Stopped after 10 steps"), "{partial}");
+    }
+
+    #[test]
+    fn finished_and_paused_turns_are_unchanged() {
+        assert_eq!(final_text("Done.".into(), false, true, ChatMode::Agent), "Done.");
+        assert_eq!(final_text(String::new(), false, true, ChatMode::Ask), "(empty response)");
+        assert!(final_text("x".into(), true, false, ChatMode::Review).starts_with("Paused"));
     }
 }
 
