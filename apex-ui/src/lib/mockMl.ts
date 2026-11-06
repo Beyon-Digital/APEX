@@ -513,6 +513,8 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
       const kind = args?.kind as VersionedKind;
       const id = String(args?.id);
       const version = Number(args?.version);
+      // The ledger holds settings with secrets redacted: writing an old version back would erase the real secrets.
+      if (kind === 'settings') throw new Error('settings history is view-only; redacted values cannot be restored');
       const { record, text } = ledgerRestoreVersion(kind, id, version, 'user');
       applyToWorkingCopy(kind, id, text);
       recordMockActivity('user', `${kind}.restore`, ledgerActivityKind(kind), id, `Restored version ${version} of ${id} as version ${record.version}`);

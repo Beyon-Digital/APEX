@@ -7,7 +7,7 @@ import { ProviderKeyField } from '../settings/ProviderKeyField';
 import { SymbolField } from '../common/SymbolField';
 import { DataFeedsOverview } from '../settings/DataFeedsOverview';
 import { useLiveStore } from '../../stores/liveStore';
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Watchlist } from '../trading/Watchlist';
 import { DataBrowser } from '../trading/DataBrowser';
 import { OrderEntry } from '../trading/OrderEntry';
@@ -28,9 +28,12 @@ import { BacktestPanel } from '../strategy/BacktestPanel';
 import { ErrorBoundary } from '../common/ErrorBoundary';
 import { addAlert, clearBrokerSession, getAlertRules, getAppSettings, listBrokerConnections, removeAlert, saveAppSettings, setBrokerSession, subscribeSymbols, zerodhaLogin } from '../../lib/tauri';
 import { applyAppearance } from '../../lib/appearance';
+import { DeletedObjects } from '../audit/DeletedObjects';
+import { VersionHistory } from '../audit/VersionHistory';
 import type { AlertRuleDto, AppSettingsDto, AppSettingsUpdateDto, BrokerConnectionDto, LlmProviderWriteDto } from '../../lib/types';
 import { useMarketStore } from '../../stores/marketStore';
 import { useBrokerStore } from '../../stores/brokerStore';
+import { useArtifactStore } from '../../stores/artifactStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { VALID_TABS, type CenterTab } from './workspaceTabs';
 import { TiledWorkspace } from './TiledWorkspace';
@@ -1125,6 +1128,10 @@ export const Workspace: React.FC = () => {
                         {appSettings.runtime_storage_notice}
                       </div>
                     )}
+                    <div className="flex flex-wrap items-center gap-2 border border-[var(--border-color)] bg-surface-0 px-3 py-2 text-xs text-text-muted" data-testid="settings-history-section">
+                      <span className="min-w-0 flex-1">Every settings save is kept as a version. Values of keys named like a secret (password, token, api_key) and the password in a URL are stored as &lt;redacted&gt;; every other value is kept as written, so do not put a credential in an ordinary field.</span>
+                      <VersionHistory kind="settings" id="config/apex.toml" buttonLabel="Settings history" testId="settings-history-open" />
+                    </div>
                     <details className="border border-[var(--border-color)] bg-surface-0 p-3" data-testid="runtime-settings-section">
                       <summary className="cursor-pointer text-xs font-medium text-text-secondary">Storage &amp; runtime (advanced)</summary>
                       <div className="mt-2 flex items-start justify-between gap-4">
@@ -1455,6 +1462,19 @@ const AlertConsole: React.FC = () => {
     void refreshRules();
   }, [refreshRules]);
 
+  // Something else changed the rules (Copilot added, deleted or restored one): the activity counter moves,
+  // so reload quietly, without the loading state, and keep what is shown if the reload fails.
+  const activityVersion = useArtifactStore((s) => s.activityVersion);
+  const firstActivityVersion = useRef(activityVersion);
+  useEffect(() => {
+    if (activityVersion === firstActivityVersion.current) return;
+    let stale = false;
+    getAlertRules()
+      .then((next) => { if (!stale && Array.isArray(next)) setRules(next); })
+      .catch(() => { /* the list shown stays; the next change or a manual action reloads it */ });
+    return () => { stale = true; };
+  }, [activityVersion]);
+
   const handleCreateAlert = useCallback(async () => {
     const symbol = alertSymbol.trim().toUpperCase();
 
@@ -1497,6 +1517,8 @@ const AlertConsole: React.FC = () => {
     <div className="h-full flex flex-col">
       <div className="flex items-center justify-between mb-2">
         <span className="text-sm font-medium text-text-secondary">Alerts</span>
+        <div className="flex items-center gap-1">
+        <DeletedObjects kind="alert" onRestored={() => void refreshRules()} className="text-[11px]" />
         <button
           onClick={() => setShowCreateAlert(!showCreateAlert)}
           className="text-xs px-2 py-0.5 bg-primary-500 hover:bg-primary-600 text-white rounded"
@@ -1504,6 +1526,7 @@ const AlertConsole: React.FC = () => {
         >
           +
         </button>
+        </div>
       </div>
 
       {showCreateAlert && (
@@ -1548,7 +1571,7 @@ const AlertConsole: React.FC = () => {
         ) : isLoading ? (
           <p>Loading alerts…</p>
         ) : rules.length === 0 ? (
-          <p>No active alerts.</p>
+          <p>No active alerts. A deleted alert keeps its history; use Show deleted to restore it.</p>
         ) : (
           rules.map((rule) => (
             <div key={rule.id} className="mb-2 flex items-start justify-between gap-2" data-testid="alert-item">
@@ -1556,14 +1579,18 @@ const AlertConsole: React.FC = () => {
                 <div className="truncate">{formatAlertRule(rule.rule)}</div>
                 <div className="text-[10px] text-text-muted/70">{rule.id}</div>
               </div>
-              <button
-                type="button"
-                onClick={() => void handleRemoveAlert(rule.id)}
-                className="text-[10px] text-bear hover:brightness-125"
-                data-testid={`alert-remove-${rule.id}`}
-              >
-                Remove
-              </button>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <VersionHistory kind="alert" id={rule.id} testId={`alert-history-${rule.id}`} onRestored={() => void refreshRules()} />
+                <button
+                  type="button"
+                  onClick={() => void handleRemoveAlert(rule.id)}
+                  className="text-[10px] text-bear hover:brightness-125"
+                  title="Deleting an alert stops it. Its history is kept and you can restore it from Show deleted."
+                  data-testid={`alert-remove-${rule.id}`}
+                >
+                  Delete
+                </button>
+              </div>
             </div>
           ))
         )}

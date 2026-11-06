@@ -3,10 +3,10 @@ import { listActivity } from '../../lib/tauri';
 import { useArtifactStore } from '../../stores/artifactStore';
 import { openItem, useNavStore } from '../../stores/navStore';
 import type { NavKind } from '../../stores/navStore';
-import type { ActivityActor, ActivityDto } from '../../lib/types';
+import type { ActivityDto } from '../../lib/types';
 import { LedgerBadge, IntegrityView } from '../audit/LedgerBadge';
 import { OrderTimeline } from '../audit/OrderTimeline';
-import { FETCH_LIMIT, ACTOR_LABEL, ACTOR_TONE, actionLabel, activityToCsv, formatDetails } from './activityUtils';
+import { FETCH_LIMIT, ACTOR_LABEL, type ActivityRowActor, ACTOR_TONE, CONTROL_ALL, CONTROL_GROUPS, actionLabel, activityToCsv, formatDetails, inControlGroup, maskSecrets } from './activityUtils';
 
 const NAV_KINDS: Record<string, NavKind> = { strategy: 'strategy', model: 'model', automation: 'automation', dataset: 'dataset' };
 
@@ -39,6 +39,7 @@ export const ActivityPanel: React.FC = () => {
   const [kind, setKind] = useState('');
   const [actor, setActor] = useState('');
   const [status, setStatus] = useState('');
+  const [group, setGroup] = useState('');
   const [query, setQuery] = useState('');
   const [preset, setPreset] = useState('all');
   const [targetFilter, setTargetFilter] = useState('');
@@ -75,13 +76,14 @@ export const ActivityPanel: React.FC = () => {
       (!kind || a.kind === kind)
       && (!actor || a.actor === actor)
       && (!status || (status === 'ok' ? a.ok : !a.ok))
+      && inControlGroup(a.action, group)
       && (!targetFilter || a.target_id === targetFilter)
       && (!cutoff || Date.parse(a.ts) >= cutoff)
       && (!q || `${a.summary} ${a.action} ${a.target_id} ${a.details ?? ''}`.toLowerCase().includes(q)));
-  }, [entries, kind, actor, status, query, preset, targetFilter]);
+  }, [entries, kind, actor, status, group, query, preset, targetFilter]);
 
-  const filtersActive = Boolean(kind || actor || status || query || targetFilter || preset !== 'all');
-  const clearFilters = () => { setKind(''); setActor(''); setStatus(''); setQuery(''); setPreset('all'); setTargetFilter(''); };
+  const filtersActive = Boolean(kind || actor || status || group || query || targetFilter || preset !== 'all');
+  const clearFilters = () => { setKind(''); setActor(''); setStatus(''); setGroup(''); setQuery(''); setPreset('all'); setTargetFilter(''); };
   const flash = (msg: string) => { setNotice(msg); window.setTimeout(() => setNotice(null), 4000); };
 
   const exportCsv = () => {
@@ -99,7 +101,7 @@ export const ActivityPanel: React.FC = () => {
 
   const copyJson = async () => {
     try {
-      await navigator.clipboard.writeText(JSON.stringify(filtered, null, 2));
+      await navigator.clipboard.writeText(JSON.stringify(filtered.map((a) => ({ ...a, summary: maskSecrets(a.summary), details: a.details === null ? null : maskSecrets(a.details) })), null, 2));
       flash(`Copied ${filtered.length} entr${filtered.length === 1 ? 'y' : 'ies'} as JSON.`);
     } catch {
       flash('Could not copy: the clipboard is not available.');
@@ -131,9 +133,14 @@ export const ActivityPanel: React.FC = () => {
           <option value="">All kinds</option>
           {['strategy', 'model', 'dataset', 'automation', 'order', 'system'].map((k) => <option key={k} value={k}>{k}</option>)}
         </select>
+        <select className={selectCls} value={group} onChange={(e) => setGroup(e.target.value)} aria-label="Filter by change type" title="Control: changes to limits, credentials, the vault, brokers and live trading" data-testid="activity-filter-group">
+          <option value="">All changes</option>
+          <option value={CONTROL_ALL}>Control (all)</option>
+          {CONTROL_GROUPS.map((g) => <option key={g.id} value={g.id}>Control: {g.label}</option>)}
+        </select>
         <select className={selectCls} value={actor} onChange={(e) => setActor(e.target.value)} aria-label="Filter by actor" data-testid="activity-filter-actor">
           <option value="">All actors</option>
-          {(Object.keys(ACTOR_LABEL) as ActivityActor[]).map((a) => <option key={a} value={a}>{ACTOR_LABEL[a]}</option>)}
+          {(Object.keys(ACTOR_LABEL) as ActivityRowActor[]).map((a) => <option key={a} value={a}>{ACTOR_LABEL[a]}</option>)}
         </select>
         <select className={selectCls} value={status} onChange={(e) => setStatus(e.target.value)} aria-label="Filter by status" data-testid="activity-filter-status">
           <option value="">Any status</option>
@@ -196,9 +203,10 @@ export const ActivityPanel: React.FC = () => {
                     <div className="flex flex-wrap items-center gap-x-2">
                       <span className="font-mono text-[10px] uppercase text-text-secondary" data-testid="activity-action">{actionLabel(a.action)}</span>
                       <span className={`font-mono text-[10px] uppercase ${a.ok ? 'text-bull' : 'font-semibold text-bear'}`} data-testid="activity-status">{a.ok ? 'ok' : 'failed'}</span>
+                      {!a.ok && <span className="border border-bear bg-bear/20 px-1.5 py-px font-mono text-[10px] font-semibold uppercase text-bear" title="This attempt did not succeed" data-testid="activity-failed-badge">failed attempt</span>}
                     </div>
-                    <div className="break-words text-text-primary" data-testid="activity-summary">{a.summary}</div>
-                    {!a.ok && a.details && <div className="mt-0.5 break-words font-mono text-[10px] text-bear" data-testid="activity-error-preview">{a.details.split('\n')[0].slice(0, 240)}</div>}
+                    <div className={`break-words ${a.ok ? 'text-text-primary' : 'text-bear'}`} data-testid="activity-summary">{maskSecrets(a.summary)}</div>
+                    {!a.ok && a.details && <div className="mt-0.5 break-words font-mono text-[10px] text-bear" data-testid="activity-error-preview">{maskSecrets(a.details.split('\n')[0]).slice(0, 240)}</div>}
                     <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[10px]">
                       {nav && a.target_id ? (
                         <button type="button" className="max-w-full truncate font-mono text-accent hover:underline" title={`Open ${a.kind}`} onClick={() => openItem(nav, a.target_id)} data-testid="activity-target">{a.kind}: {a.target_id}</button>

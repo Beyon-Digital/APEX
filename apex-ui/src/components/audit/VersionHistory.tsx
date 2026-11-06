@@ -5,7 +5,7 @@ import type { ArtifactKind, VersionContentDto, VersionDto, VersionedKind } from 
 import { useArtifactStore } from '../../stores/artifactStore';
 import { exactTime, relativeTime } from '../ml/modelUtils';
 import {
-  ACTION_TONE, ACTOR_LABELS, ACTOR_TONES, KIND_LABEL, formatSize, latestRestorable, restoreBlockedReason, shortHash,
+  ACTION_TONE, ACTOR_LABELS, ACTOR_TONES, KIND_LABEL, SETTINGS_REDACTION_NOTE, formatSize, latestRestorable, restoreBlockedReason, shortHash,
 } from './auditUtils';
 import { useVersionHistory } from './useLedger';
 import { VersionDiff } from './VersionDiff';
@@ -147,7 +147,7 @@ const HistoryPanel: React.FC<PanelProps> = ({ kind, id, onClose, onRestored, ini
       >
         <div className="flex items-start gap-2 border-b border-[var(--border-color)] px-3 py-2">
           <div className="min-w-0 flex-1">
-            <div className="text-[10px] font-semibold uppercase tracking-wider text-text-muted">Version history of this {KIND_LABEL[kind]}</div>
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-text-muted">{kind === 'settings' ? 'Version history of the settings file' : `Version history of this ${KIND_LABEL[kind]}`}</div>
             <div className="truncate font-mono text-sm" title={id} data-testid="audit-history-title">{id}</div>
           </div>
           <button type="button" className={btnCls} onClick={reload} data-testid="audit-history-refresh">Refresh</button>
@@ -157,6 +157,12 @@ const HistoryPanel: React.FC<PanelProps> = ({ kind, id, onClose, onRestored, ini
         <div className="border-b border-[var(--border-color)] px-3 py-1.5 text-[11px] text-text-muted" data-testid="audit-history-note">
           This history is append-only. Every save, delete and restore adds a version; no version is edited or removed, and restoring never overwrites anything.
         </div>
+
+        {kind === 'settings' && (
+          <div className="border-b border-warning/40 bg-warning/10 px-3 py-1.5 text-[11px] text-warning" data-testid="audit-history-redaction-note">
+            {SETTINGS_REDACTION_NOTE}
+          </div>
+        )}
 
         {deleted && head && (
           <div className="flex flex-wrap items-center gap-2 border-b border-bear/40 bg-bear/10 px-3 py-2 text-bear" data-testid="audit-history-deleted-banner">

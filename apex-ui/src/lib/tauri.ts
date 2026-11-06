@@ -1,6 +1,6 @@
 import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, StrategySessionInfoDto, ChatGptStatusDto, ChatGptModelDto, SymbolFeedDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto, ActivityDto, BuildDatasetRequestDto, DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, ModelDetailDto, ModelSignalHistoryDto, ExpressionCheckDto, SymbolDataDto, AlgorithmDto, EstimatorFileDto, RecipeDto, RecipeCheckDto, BuildingBlocksDto, VersionedKind, VersionDto, VersionContentDto, VersionedObjectDto, LedgerVerifyDto, LedgerStatusDto, OrderEventDto, OrderSourceDto } from './types';
 import { handleMlMock, recordMockActivity } from './mockMl';
-import { ledgerHead, ledgerOrderEvent, ledgerPut, ledgerTombstone, registerLedgerApplier } from './mockLedger';
+import { isSecretKey, ledgerHead, ledgerOrderEvent, ledgerPut, ledgerTombstone, redactConfig, redactUserinfo, REDACTED, registerLedgerApplier } from './mockLedger';
 
 const IS_TAURI = typeof window !== 'undefined' && '__TAURI__' in window;
 
@@ -248,6 +248,74 @@ function cloneMockSettings(): AppSettingsDto {
   return JSON.parse(JSON.stringify(mockAppSettings)) as AppSettingsDto;
 }
 
+// Settings file (mock): the ledger keeps a REDACTED copy of config/apex.toml, as the real one does.
+const SETTINGS_OBJECT_ID = 'config/apex.toml';
+const tomlValue = (v: unknown): string => (typeof v === 'string' ? JSON.stringify(v) : String(v));
+function settingsFileText(s: AppSettingsDto): string {
+  const section = (name: string, entries: [string, unknown][]) => [`[${name}]`, ...entries.map(([k, v]) => `${k} = ${tomlValue(v)}`), ''].join('\n');
+  return [
+    section('general', [['data_dir', s.general.data_dir]]),
+    section('market_data', [['adapter', s.market_data.adapter]]),
+    section('execution', [['adapter', s.execution.adapter]]),
+    section('risk', [['max_daily_loss', s.risk.max_daily_loss], ['max_order_value', s.risk.max_order_value]]),
+    section('storage', [['backend', s.storage.backend], ['sqlite_path', s.storage.sqlite_path], ['postgres_url', s.storage.postgres_url], ['wal_mode', s.storage.wal_mode], ['pool_size', s.storage.pool_size]]),
+    section('appearance', [['theme', s.appearance.theme], ['density', s.appearance.density]]),
+    section('llm', [['active', s.llm.active]]),
+    ...s.llm.providers.map((p) => section(`llm.providers.${p.id}`, [['base_url', p.base_url], ['model', p.model], ['api_kind', p.api_kind]])),
+    section('acp', [['command', s.acp.command], ['cwd', s.acp.cwd]]),
+  ].join('\n');
+}
+/** Only the redacted text ever reaches the ledger. */
+const recordSettingsVersion = (s: AppSettingsDto, summary: string) =>
+  ledgerPut('settings', SETTINGS_OBJECT_ID, redactConfig(settingsFileText(s)), 'user', summary);
+/** Flatten the settings file to "section.key" pairs, to say what a save changed. */
+function settingsPairs(s: AppSettingsDto): Map<string, string> {
+  const pairs = new Map<string, string>();
+  let section = '';
+  for (const line of settingsFileText(s).split('\n')) {
+    const head = /^\[(.+)\]$/.exec(line);
+    if (head) section = head[1];
+    else if (line.includes(' = ')) pairs.set(`${section}.${line.slice(0, line.indexOf(' = '))}`, line.slice(line.indexOf(' = ') + 3));
+  }
+  return pairs;
+}
+/** "risk.max_daily_loss: 50000 -> 60000". Secret values are never written: they are redacted or, for URLs, only their password. */
+function describeSettingsChange(before: AppSettingsDto, after: AppSettingsDto): string[] {
+  const a = settingsPairs(before);
+  const changes: string[] = [];
+  settingsPairs(after).forEach((value, key) => {
+    const old = a.get(key);
+    if (old === value) return;
+    const shown = (v: string | undefined) => (v === undefined ? '(unset)' : isSecretKey(key) ? REDACTED : redactUserinfo(v));
+    changes.push(`${key}: ${shown(old)} -> ${shown(value)}`);
+  });
+  return changes;
+}
+// The settings file that exists when the app starts is version 1 (the real app registers it on startup).
+recordSettingsVersion(mockAppSettings, 'Existing file registered');
+
+// Alerts: the ledger keeps the rule JSON, one object per rule id.
+const alertRuleText = (rule: string): string => {
+  try { return JSON.stringify(JSON.parse(rule), null, 2); } catch { return rule; }
+};
+const describeAlert = (rule: string): string => {
+  try {
+    const parsed = JSON.parse(rule) as Record<string, { symbol?: string; threshold?: number }>;
+    const [kind] = Object.keys(parsed);
+    const body = parsed[kind] ?? {};
+    return `${body.symbol ?? ''} ${kind.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()}${body.threshold !== undefined ? ` ${body.threshold}` : ''}`.trim();
+  } catch { return 'rule'; }
+};
+registerLedgerApplier('alert', (id, text) => {
+  const next: AlertRuleDto = { id, rule: JSON.stringify(JSON.parse(text)), enabled: true };
+  mockAlertRules = mockAlertRules.some((r) => r.id === id) ? mockAlertRules.map((r) => (r.id === id ? next : r)) : [...mockAlertRules, next];
+});
+
+/** Control-plane activity (web mock): who changed a limit, a credential, the vault or a broker. Never contains secret values. */
+const recordControl = (action: string, targetId: string, summary: string, ok = true, details: string | null = null) =>
+  recordMockActivity('user', action, 'system', targetId, summary, ok, details);
+let failNextVaultUnlock = false;
+
 function buildMockHealthAdapters(): AdapterHealthDto[] {
   const now = new Date().toISOString();
   const adapters: AdapterHealthDto[] = [
@@ -483,10 +551,12 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   if (cmd === 'chatgpt_sign_in') {
     mockChatGpt = { ...mockChatGpt, state: 'waiting', message: 'Waiting for you to finish signing in in the browser…' };
     setTimeout(() => { mockChatGpt = { ...mockChatGpt, state: 'connected', email: 'demo@example.com', plan_usage: true, message: null }; }, 700);
+    recordControl('chatgpt.sign_in', 'chatgpt', 'Started ChatGPT sign-in');
     return 'https://auth.openai.com/api/accounts/authorize?client_id=dynamic_agent_client' as any;
   }
   if (cmd === 'chatgpt_sign_out') {
     mockChatGpt = { state: 'signed_out', email: null, plan_usage: false, message: null, use_for_copilot: false, model: null };
+    recordControl('chatgpt.sign_out', 'chatgpt', 'Signed out of ChatGPT');
     return 'Signed out.' as any;
   }
   if (cmd === 'chatgpt_list_models') return [{ slug: 'gpt-demo', name: 'GPT Demo' }, { slug: 'gpt-demo-mini', name: 'GPT Demo Mini' }] as any;
@@ -501,9 +571,31 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   }
   if (cmd === 'open_external_url') return undefined as any;
   if (cmd === 'vault_status') return { status: mockVaultStatus } as any;
-  if (cmd === 'vault_init' || cmd === 'vault_unlock') { mockVaultStatus = 'unlocked'; return { status: mockVaultStatus } as any; }
-  if (cmd === 'vault_lock') { mockVaultStatus = 'locked'; return { status: mockVaultStatus } as any; }
-  if (cmd === 'vault_change_passphrase') return { status: mockVaultStatus } as any;
+  if (cmd === 'vault_init') {
+    mockVaultStatus = 'unlocked';
+    recordControl('vault.init', 'vault', 'Created the vault');
+    return { status: mockVaultStatus } as any;
+  }
+  if (cmd === 'vault_unlock') {
+    // The passphrase is never recorded, only whether it worked.
+    if (failNextVaultUnlock || args?.passphrase === 'wrong-passphrase') {
+      failNextVaultUnlock = false;
+      recordControl('vault.unlock', 'vault', 'Failed to unlock the vault', false, 'Wrong passphrase');
+      throw new Error('Wrong passphrase');
+    }
+    mockVaultStatus = 'unlocked';
+    recordControl('vault.unlock', 'vault', 'Unlocked the vault');
+    return { status: mockVaultStatus } as any;
+  }
+  if (cmd === 'vault_lock') {
+    mockVaultStatus = 'locked';
+    recordControl('vault.lock', 'vault', 'Locked the vault');
+    return { status: mockVaultStatus } as any;
+  }
+  if (cmd === 'vault_change_passphrase') {
+    recordControl('vault.change_passphrase', 'vault', 'Changed the vault passphrase');
+    return { status: mockVaultStatus } as any;
+  }
   if (cmd === 'import_env_credentials') return { source: '.env', imported: [] } as any;
   if (cmd === 'list_adapter_schemas') return MOCK_ADAPTER_SCHEMAS as any;
   if (cmd === 'get_adapter_configs') {
@@ -518,6 +610,9 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     request.clear_secrets.forEach((key) => secrets.delete(key));
     const saved: AdapterConfigDto = { adapter_id: request.adapter_id, enabled: request.enabled, settings: { ...(previous?.settings ?? {}), ...request.settings }, secrets_configured: [...secrets].sort() };
     mockAdapterConfigs.set(request.adapter_id, saved);
+    // Field names only, never values.
+    const fields = [...Object.keys(request.settings), ...Object.entries(request.secrets).filter(([, v]) => v.trim()).map(([k]) => k)];
+    recordControl('adapter.save', request.adapter_id, `Saved ${request.adapter_id} settings${fields.length > 0 ? ` (${fields.join(', ')})` : ''}`);
     return saved as any;
   }
   if (cmd === 'set_adapter_enabled') {
@@ -525,9 +620,14 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     const current = mockAdapterConfigs.get(id) ?? { adapter_id: id, enabled: true, settings: {}, secrets_configured: [] };
     const updated = { ...current, enabled: Boolean(args?.enabled) };
     mockAdapterConfigs.set(id, updated);
+    recordControl('adapter.enable', id, `Adapter ${id} ${updated.enabled ? 'enabled' : 'disabled'}`, true, `enabled=${updated.enabled}`);
     return updated as any;
   }
-  if (cmd === 'delete_adapter_config') { mockAdapterConfigs.delete(args?.adapterId as string); return undefined as any; }
+  if (cmd === 'delete_adapter_config') {
+    mockAdapterConfigs.delete(args?.adapterId as string);
+    recordControl('adapter.delete', String(args?.adapterId), `Deleted the stored credentials of ${String(args?.adapterId)}`);
+    return undefined as any;
+  }
   if (cmd === 'test_adapter_connection') {
     const id = args?.adapterId as string;
     const configured = (mockAdapterConfigs.get(id)?.secrets_configured.length ?? 0) > 0;
@@ -537,6 +637,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   if (cmd === 'get_live_status') return { ...mockLive } as any;
   if (cmd === 'set_live_armed') {
     mockLive.armed = Boolean(args?.armed);
+    recordControl(mockLive.armed ? 'live.arm' : 'live.disarm', 'live', mockLive.armed ? 'Armed live trading' : 'Disarmed live trading');
     ledgerOrderEvent('', '', mockLive.armed ? 'live_armed' : 'live_disarmed', 'user', { kind: 'manual', id: '', version: null, hash: null });
     return { ...mockLive } as any;
   }
@@ -655,6 +756,11 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 
     return balance as any;
   }
+  if (cmd === 'reset_halt') {
+    mockLive.halted = false;
+    recordControl('risk.reset_halt', 'risk', 'Reset the trading halt');
+    return undefined as any;
+  }
   if (cmd === 'get_risk_status') return { session_pnl: mockPositions.reduce((a,b)=>a+b.pnl, 0), is_halted: false, max_daily_loss: 50000 } as any;
   if (cmd === 'get_historical_data') {
     const symbol = (args?.symbol as string) || 'RELIANCE.NS';
@@ -671,6 +777,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   }
   if (cmd === 'save_app_settings') {
     const request = args?.request as AppSettingsUpdateDto;
+    const previousSettings = mockAppSettings;
     mockAppSettings = {
       ...mockAppSettings,
       general: { ...request.general },
@@ -688,6 +795,11 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
         available_backends: [...mockAppSettings.storage.available_backends],
       },
     };
+    const changes = describeSettingsChange(previousSettings, mockAppSettings);
+    // As the backend writes them: the version and the activity summary name the keys, the values are in the details.
+    const keys = changes.map((c) => c.slice(0, c.indexOf(':')));
+    recordSettingsVersion(mockAppSettings, keys.length > 0 ? `Changed ${keys.join(', ')}` : 'Settings saved (only formatting or hidden values changed)');
+    recordControl('settings.save', SETTINGS_OBJECT_ID, keys.length > 0 ? `Settings saved: changed ${keys.join(', ')}` : 'Settings saved (no values changed)', true, changes.length > 0 ? changes.join('; ') : null);
 
     return cloneMockSettings() as any;
   }
@@ -817,12 +929,19 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
       ...mockAlertRules.filter((existing) => existing.id !== id),
       { id, rule, enabled: true },
     ];
+    ledgerPut('alert', id, alertRuleText(rule), 'user', `Created alert ${describeAlert(rule)}`);
+    recordControl('alert.create', id, `Created alert ${describeAlert(rule)}`);
     return undefined as any;
   }
   if (cmd === 'remove_alert') {
     const ruleId = args?.ruleId as string;
     const before = mockAlertRules.length;
+    const removedRule = mockAlertRules.find((rule) => rule.id === ruleId);
     mockAlertRules = mockAlertRules.filter((rule) => rule.id !== ruleId);
+    if (mockAlertRules.length < before && removedRule) {
+      ledgerTombstone('alert', ruleId, 'user', `Deleted alert ${describeAlert(removedRule.rule)}`);
+      recordControl('alert.delete', ruleId, `Deleted alert ${describeAlert(removedRule.rule)}`);
+    }
     return (mockAlertRules.length < before) as any;
   }
   if (cmd === 'get_alert_rules') return [...mockAlertRules] as any;
@@ -834,6 +953,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     const sessionToken = (args?.sessionToken as string | undefined)?.trim();
 
     if (!sessionToken) {
+      recordControl('broker.session', brokerId, `Failed to set the ${brokerId} session`, false, 'Session token must not be empty');
       throw new Error('Session token must not be empty');
     }
 
@@ -854,10 +974,25 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     });
 
     if (!updated) {
+      recordControl('broker.session', brokerId, `Failed to set the ${brokerId} session`, false, `Unknown broker: ${brokerId}`);
       throw new Error(`Unknown broker: ${brokerId}`);
     }
 
+    // The token itself is never recorded.
+    recordControl('broker.session', brokerId, `Set the ${brokerId} session`);
     return updated as any;
+  }
+  if (cmd === 'zerodha_login') {
+    const requestToken = String(args?.requestToken ?? '').trim();
+    if (!requestToken) {
+      recordControl('broker.login', 'zerodha', 'Failed to log in to zerodha', false, 'Request token must not be empty');
+      throw new Error('Request token must not be empty');
+    }
+    mockBrokerConnections = mockBrokerConnections.map((c) => (c.broker_id === 'zerodha'
+      ? { ...c, authenticated: true, status: 'connected', message: `${c.display_name} is authenticated and ready for safe live data and account checks.` }
+      : c));
+    recordControl('broker.login', 'zerodha', 'Logged in to zerodha');
+    return mockBrokerConnections.find((c) => c.broker_id === 'zerodha') as any;
   }
   if (cmd === 'clear_broker_session') {
     const brokerId = args?.brokerId as string;
@@ -883,9 +1018,11 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     });
 
     if (!updated) {
+      recordControl('broker.logout', brokerId, `Failed to clear the ${brokerId} session`, false, `Unknown broker: ${brokerId}`);
       throw new Error(`Unknown broker: ${brokerId}`);
     }
 
+    recordControl('broker.logout', brokerId, `Cleared the ${brokerId} session`);
     return updated as any;
   }
   if (cmd === 'get_system_health') {
@@ -1279,6 +1416,8 @@ export async function setSymbolProvider(symbol: string, adapterId: string | null
 // Web-mode test hook: lets a spec act "as the Copilot" and watch the open panels refresh.
 if (typeof window !== 'undefined') {
   const hooks = ((window as unknown as { __apexMock?: Record<string, unknown> }).__apexMock ??= {});
+  // Make the next vault unlock fail (the failure is recorded as an ok=false activity entry). The passphrase "wrong-passphrase" also fails.
+  hooks.failNextVaultUnlock = () => { failNextVaultUnlock = true; };
   hooks.createStrategyAsCopilot = (name = 'copilot_strategy.py') => {
     const path = `strategies/${name}`;
     mockStrategyFiles = [...mockStrategyFiles.filter((f) => f.path !== path), { name, path, content: DEFAULT_STRATEGY_TEMPLATE }];

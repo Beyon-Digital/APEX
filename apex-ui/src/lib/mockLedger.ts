@@ -165,6 +165,27 @@ export function ledgerObjectList(kind: VersionedKind, includeDeleted: boolean): 
   return out.sort((a, b) => a.object_id.localeCompare(b.object_id));
 }
 
+/* ----- settings redaction (the Rust side is redact_config in apex-tauri) ----- */
+
+const SECRET_KEY = /password|secret|token|api_key|key_material/i;
+export const REDACTED = '<redacted>';
+export const isSecretKey = (key: string): boolean => SECRET_KEY.test(key);
+/** scheme://user:password@host becomes scheme://user:<redacted>@host. */
+export const redactUserinfo = (text: string): string => text.replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@"']+:)[^\s@/"']*(@)/gi, `$1${REDACTED}$2`);
+
+/**
+ * Settings text as kept in the ledger: the password of any URL and the value of any key whose name
+ * contains password, secret, token, api_key or key_material is replaced by "<redacted>". Everything
+ * else, including comments, spacing and line order, is kept byte for byte.
+ */
+export function redactConfig(text: string): string {
+  const lines = text.split('\n').map((line) => {
+    const m = /^(\s*"?([^\s="]+)"?\s*=\s*)("(?:[^"\\]|\\.)*"|'[^']*'|[^\s#]+)(.*)$/.exec(line);
+    return m && isSecretKey(m[2]) ? `${m[1]}"${REDACTED}"${m[4]}` : line;
+  });
+  return redactUserinfo(lines.join('\n'));
+}
+
 /* ----- event streams ----- */
 
 export function ledgerAppendEvent(stream: StreamName, value: Record<string, unknown>): StreamEvent {

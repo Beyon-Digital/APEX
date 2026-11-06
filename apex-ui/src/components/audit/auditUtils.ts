@@ -4,7 +4,12 @@ import type { OrderEventDto, OrderSourceDto, VersionDto, VersionedKind } from '.
 
 export const KIND_LABEL: Record<VersionedKind, string> = {
   strategy: 'strategy', estimator: 'estimator', recipe: 'algorithm recipe', dataset: 'dataset', model: 'model', automation: 'automation', notebook: 'notebook',
+  settings: 'Settings', alert: 'Alert',
 };
+
+/** Settings history is view-only: the ledger holds the settings with secrets replaced by "<redacted>", so an old version cannot be written back. */
+export const SETTINGS_RESTORE_REASON = 'Settings history is view-only: secrets are redacted in the history and cannot be restored';
+export const SETTINGS_REDACTION_NOTE = 'Values of keys named like a secret (password, token, api_key, ...) and the password in a URL are replaced by <redacted> in this history. Every other value is kept as written, so do not put a credential in an ordinary field.';
 
 export const ACTION_TONE: Record<VersionDto['action'], string> = {
   create: 'border-bull/40 bg-bull/10 text-bull',
@@ -38,6 +43,7 @@ export function latestRestorable(versions: VersionDto[]): VersionDto | null {
 
 /** Why Restore is unavailable for this version, or null when it can be restored. */
 export function restoreBlockedReason(v: VersionDto, head: VersionDto | null): string | null {
+  if (v.kind === 'settings') return SETTINGS_RESTORE_REASON;
   if (v.action === 'delete') return 'This is a delete marker. It has no content to restore.';
   if (!v.retained) return 'The ledger keeps only the hash of this version (the original file is write-once), so it cannot be restored from here.';
   if (head && head.version === v.version && head.action !== 'delete') return 'This is already the current version.';

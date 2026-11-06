@@ -745,7 +745,8 @@ export interface ArtifactEventDto {
 export interface ActivityDto {
   id: string;
   ts: string;
-  actor: ActivityActor;
+  /** "external": the settings file was edited outside APEX and picked up as a new version. */
+  actor: ActivityActor | 'external';
   action: string;
   kind: ArtifactKind | 'order' | 'system';
   target_id: string;
@@ -954,7 +955,12 @@ export interface AlgorithmDto {
 // ── Immutable audit ledger: every change is a new version ─────────────
 
 /** Things that keep a full version history. Nothing here is ever overwritten or erased. */
-export type VersionedKind = 'strategy' | 'estimator' | 'recipe' | 'dataset' | 'model' | 'automation' | 'notebook';
+export type VersionedKind =
+  | 'strategy' | 'estimator' | 'recipe' | 'dataset' | 'model' | 'automation' | 'notebook'
+  /** The settings file (risk limits, live-trading caps, storage, ...). Secrets are replaced by "<redacted>" in the history. */
+  | 'settings'
+  /** Price alert rules. */
+  | 'alert';
 
 export interface VersionDto {
   /** Position in the global ledger (1, 2, 3...). */
