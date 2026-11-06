@@ -62,6 +62,10 @@ pub enum Kind {
     Model,
     Automation,
     Notebook,
+    /// The settings file (`config/apex.toml`), stored with secrets redacted. View-only: never restored.
+    Settings,
+    /// One alert rule (object id = rule id), canonical JSON of the stored rule.
+    Alert,
 }
 
 impl Kind {
@@ -74,6 +78,8 @@ impl Kind {
             Kind::Model => "model",
             Kind::Automation => "automation",
             Kind::Notebook => "notebook",
+            Kind::Settings => "settings",
+            Kind::Alert => "alert",
         }
     }
 }
@@ -89,6 +95,8 @@ impl FromStr for Kind {
             "model" => Kind::Model,
             "automation" => Kind::Automation,
             "notebook" => Kind::Notebook,
+            "settings" => Kind::Settings,
+            "alert" => Kind::Alert,
             other => return Err(format!("unknown ledger kind '{other}'")),
         })
     }
@@ -2137,10 +2145,26 @@ mod tests {
 
     #[test]
     fn kinds_round_trip() {
-        for k in [Kind::Strategy, Kind::Estimator, Kind::Recipe, Kind::Dataset, Kind::Model, Kind::Automation, Kind::Notebook] {
+        for k in [Kind::Strategy, Kind::Estimator, Kind::Recipe, Kind::Dataset, Kind::Model, Kind::Automation, Kind::Notebook, Kind::Settings, Kind::Alert] {
             assert_eq!(k.as_str().parse::<Kind>().unwrap(), k);
             assert_eq!(serde_json::to_string(&k).unwrap(), format!("\"{}\"", k.as_str()));
         }
         assert!("nonsense".parse::<Kind>().is_err());
+        assert_eq!(serde_json::from_str::<Kind>("\"settings\"").unwrap(), Kind::Settings);
+        assert_eq!(serde_json::from_str::<Kind>("\"alert\"").unwrap(), Kind::Alert);
+    }
+
+    #[test]
+    fn settings_and_alert_objects_are_versioned_like_any_other() {
+        let dir = tmp("kinds-settings-alert");
+        let l = open(&dir);
+        l.put(Kind::Settings, "config/apex.toml", b"[risk]\nmax_daily_loss = 1\n", "system", "register").unwrap();
+        l.put(Kind::Settings, "config/apex.toml", b"[risk]\nmax_daily_loss = 2\n", "user", "raise").unwrap();
+        l.put(Kind::Alert, "rule-1", b"{\"id\":\"rule-1\"}", "user", "create").unwrap();
+        l.tombstone(Kind::Alert, "rule-1", "user", "delete").unwrap();
+        assert_eq!(l.history(Kind::Settings, "config/apex.toml").len(), 2);
+        assert_eq!(l.history(Kind::Alert, "rule-1").len(), 2);
+        assert!(l.history(Kind::Strategy, "rule-1").is_empty(), "kinds do not share ids");
+        assert!(l.verify().ok);
     }
 }

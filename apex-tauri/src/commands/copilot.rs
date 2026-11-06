@@ -404,7 +404,7 @@ fn tool_schemas() -> Value {
                 "quantity": {"type": "number", "default": 10},
                 "initial_capital": {"type": "number", "default": 100000} },
             "required": ["path", "symbol"] })),
-        ("export_bars_csv", "Export historical bars (time, open, high, low, close, volume only) to a CSV under data/exports and return its path relative to the app folder. The file has no label or feature columns, so it cannot be trained on directly: use build_dataset for training", json!({
+        ("export_bars_csv", "Export historical bars (time, open, high, low, close, volume only) to a CSV under data/exports and return its path relative to the app folder and its sha256. The file name carries the first 12 hex characters of the sha256; an export is never overwritten (the same bars reuse the same read-only file, different bars make a new file). The file has no label or feature columns, so it cannot be trained on directly: use build_dataset for training", json!({
             "type": "object", "properties": {
                 "symbol": {"type": "string"},
                 "timeframe": {"type": "string", "default": "d1"},
@@ -516,6 +516,77 @@ fn parse_timeframe(s: &str) -> Timeframe {
         "4h" | "h4" => Timeframe::H4,
         "1w" | "w1" => Timeframe::W1,
         _ => Timeframe::D1,
+    }
+}
+
+/// An export written by [`write_export`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExportFile {
+    pub path: std::path::PathBuf,
+    /// SHA-256 of the file content, 64 hex characters.
+    pub sha256: String,
+    /// The same content was already there, so nothing was written.
+    pub reused: bool,
+}
+
+fn export_part(text: &str) -> String {
+    let cleaned: String = text.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).take(64).collect();
+    // A name made only of dots would be `.` or `..` once joined.
+    if cleaned.chars().all(|c| c == '.') {
+        "_".repeat(cleaned.len().max(1))
+    } else {
+        cleaned
+    }
+}
+
+/// Write `content` to `<dir>/<symbol>_<timeframe>_<first 12 hex of sha256>.csv`, never replacing a file.
+/// Identical content reuses the existing file. A file of that name with different content is an
+/// error (a 48-bit prefix collision), never an overwrite. The file is made read-only (0444). The
+/// content is written to a temporary file and linked into place, so a reader never sees a partial file.
+pub(crate) fn write_export(dir: &std::path::Path, symbol: &str, timeframe: &str, content: &str) -> Result<ExportFile, String> {
+    let sha256 = crate::ledger::Ledger::sha256_hex(content.as_bytes());
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create the exports folder: {e}"))?;
+    let path = dir.join(format!("{}_{}_{}.csv", export_part(symbol), export_part(timeframe), &sha256[..12]));
+    let same_content = |path: &std::path::Path| -> Result<bool, String> {
+        std::fs::read(path).map(|existing| existing == content.as_bytes()).map_err(|e| format!("could not read the existing export {}: {e}", path.display()))
+    };
+    let read_only = |path: &std::path::Path| {
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(path, perms)
+    };
+    let reuse = |path: &std::path::Path| -> Result<ExportFile, String> {
+        if !same_content(path)? {
+            return Err(format!(
+                "{} already exists with different content (a hash-prefix collision); it was not overwritten. Export with a different limit or timeframe.",
+                path.display()
+            ));
+        }
+        let _ = read_only(path);
+        Ok(ExportFile { path: path.to_path_buf(), sha256: sha256.clone(), reused: true })
+    };
+    if path.exists() {
+        return reuse(&path);
+    }
+    let tmp = dir.join(format!(".export-{}.tmp", uuid::Uuid::new_v4()));
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        read_only(&tmp)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("could not write the export: {e}"));
+    }
+    // `hard_link` fails when the name exists, so a file that appeared meanwhile is never replaced.
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(ExportFile { path, sha256, reused: false }),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => reuse(&path),
+        Err(e) => Err(format!("could not store the export {}: {e}", path.display())),
     }
 }
 
@@ -781,9 +852,6 @@ async fn exec_tool(
                 return Err(format!("no bars for {sym}"));
             }
             let dir = runtime_paths.data_dir().join("exports");
-            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let safe = sym.replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '-', "_");
-            let path = dir.join(format!("{safe}_{tf}.csv"));
             let mut out = String::from("time,open,high,low,close,volume\n");
             for b in &bars {
                 out.push_str(&format!(
@@ -796,10 +864,12 @@ async fn exec_tool(
                     b.volume
                 ));
             }
-            std::fs::write(&path, &out).map_err(|e| e.to_string())?;
+            // Content-addressed and write-once: a model that trained on an earlier export keeps the
+            // exact file it saw. The same bars reuse the same file.
+            let file = write_export(&dir, sym, tf, &out)?;
             // Relative to the work root, the base the trainer and strategy files resolve against.
-            let rel = runtime_paths.to_user_relative_path(&path);
-            Ok(json!({"path": rel, "bars": bars.len()}))
+            let rel = runtime_paths.to_user_relative_path(&file.path);
+            Ok(json!({"path": rel, "sha256": file.sha256, "bars": bars.len(), "reused_existing_file": file.reused}))
         }
         "list_ml_models" => {
             let models = ml::load_registered_models(&models.models_dir)?;
@@ -1123,14 +1193,19 @@ async fn exec_tool(
                 other => return Err(format!("invalid condition `{other}`")),
             };
             let id = uuid::Uuid::new_v4().to_string();
+            // The same audited path as the UI: versioned in the ledger first, actor "copilot".
+            // The activity entry for this call is written by the tool-call logger (`alert.create`).
             state
                 .alert_store
-                .add(StoredAlert {
-                    id: id.clone(),
-                    rule,
-                    delivery: vec![AlertDelivery::InApp],
-                    enabled: true,
-                })
+                .add(
+                    StoredAlert {
+                        id: id.clone(),
+                        rule,
+                        delivery: vec![AlertDelivery::InApp],
+                        enabled: true,
+                    },
+                    "copilot",
+                )
                 .await?;
             Ok(json!({"alert_id": id, "symbol": symbol}))
         }
@@ -1145,7 +1220,8 @@ async fn exec_tool(
         }
         "remove_alert" => {
             let id = arg_str(args, "id")?;
-            if !state.alert_store.remove(id).await? {
+            // A delete marker in the ledger (actor "copilot"); the tool-call logger writes `alert.delete`.
+            if !state.alert_store.remove(id, "copilot").await? {
                 return Err(format!("no alert `{id}`"));
             }
             Ok(json!({"removed": id}))
@@ -2250,6 +2326,27 @@ mod ledger_flow_tests {
     }
 
     #[tokio::test]
+    async fn the_copilots_remove_alert_tool_deletes_through_the_ledger_as_the_copilot() {
+        use apex_core::application::alert_engine::{AlertDelivery, AlertRule, StoredAlert};
+        let (state, paths) = test_state("ledger-flow-alert").await;
+        let ledger = crate::commands::versioned_files::ledger().unwrap();
+        let id = "copilot-flow-alert-1";
+        let rule = StoredAlert { id: id.into(), rule: AlertRule::DailyPnl { threshold: -50.0 }, delivery: vec![AlertDelivery::InApp], enabled: true };
+        state.alert_store.add(rule, "user").await.unwrap();
+        let (out, trace, _) = run(&state, &paths, ChatMode::Agent, "remove_alert", json!({"id": id})).await;
+        assert_eq!(out.unwrap()["removed"], id);
+        assert_eq!(
+            versions(&ledger, Kind::Alert, id),
+            vec![(1, "create".to_string(), "user".to_string()), (2, "delete".to_string(), "copilot".to_string())]
+        );
+        // The tool-call log entry names the deletion like the UI path does.
+        assert!(trace.iter().any(|t| t.name == "remove_alert"));
+        let (gone, _, _) = run(&state, &paths, ChatMode::Agent, "remove_alert", json!({"id": id})).await;
+        assert!(gone.unwrap()["error"].as_str().unwrap().contains("no alert"));
+        assert_eq!(ledger.history(Kind::Alert, id).len(), 2, "a refused delete adds no version");
+    }
+
+    #[tokio::test]
     async fn the_copilots_delete_tools_leave_a_tombstone_and_the_history() {
         let (state, paths) = test_state("ledger-flow-delete").await;
         let ledger = crate::commands::versioned_files::ledger().unwrap();
@@ -2485,5 +2582,100 @@ mod ledger_flow_tests {
         assert!(ledger.verify().ok);
         let _ = std::fs::remove_dir_all(dir);
         let _ = write_estimator; // shared helper import used by sibling modules
+    }
+}
+
+/// `export_bars_csv` writes content-addressed, write-once, read-only files.
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("apex-export-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn csv(close: f64) -> String {
+        format!("time,open,high,low,close,volume\n2026-01-02T00:00:00Z,1,2,0.5,{close},100\n")
+    }
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn different_bars_make_different_files_and_the_first_file_never_changes() {
+        let d = dir("two");
+        let (a, b) = (csv(1.5), csv(1.6));
+        let first = write_export(&d, "AAPL", "d1", &a).unwrap();
+        let first_bytes = std::fs::read(&first.path).unwrap();
+        let second = write_export(&d, "AAPL", "d1", &b).unwrap();
+        assert_ne!(first.path, second.path);
+        assert_eq!((first.reused, second.reused), (false, false));
+        assert_eq!(std::fs::read(&first.path).unwrap(), first_bytes, "the earlier export is byte for byte what it was");
+        assert_eq!(std::fs::read(&first.path).unwrap(), a.as_bytes());
+        assert_eq!(std::fs::read(&second.path).unwrap(), b.as_bytes());
+        assert_eq!(first.sha256, crate::ledger::Ledger::sha256_hex(a.as_bytes()));
+        let name = first.path.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(name, format!("AAPL_d1_{}.csv", &first.sha256[..12]));
+        assert_eq!(names(&d).len(), 2, "no temporary files are left behind");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn the_same_bars_reuse_one_file_and_files_are_read_only() {
+        let d = dir("same");
+        let a = csv(2.5);
+        let first = write_export(&d, "MSFT", "h1", &a).unwrap();
+        let again = write_export(&d, "MSFT", "h1", &a).unwrap();
+        assert_eq!((first.path.clone(), first.reused, again.reused), (again.path.clone(), false, true));
+        assert_eq!(first.sha256, again.sha256);
+        assert_eq!(names(&d).len(), 1);
+        assert_eq!(std::fs::metadata(&first.path).unwrap().permissions().mode() & 0o777, 0o444);
+        // Someone made it writable: reusing it puts the protection back, content untouched.
+        std::fs::set_permissions(&first.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_export(&d, "MSFT", "h1", &a).unwrap();
+        assert_eq!(std::fs::metadata(&first.path).unwrap().permissions().mode() & 0o777, 0o444);
+        assert!(std::fs::OpenOptions::new().write(true).open(&first.path).is_err() || std::fs::metadata(&first.path).unwrap().permissions().readonly());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_name_clash_with_different_content_is_an_error_and_nothing_is_overwritten() {
+        let d = dir("clash");
+        let a = csv(3.5);
+        let sha = crate::ledger::Ledger::sha256_hex(a.as_bytes());
+        let clashing = d.join(format!("AAPL_d1_{}.csv", &sha[..12]));
+        std::fs::write(&clashing, b"someone else's data").unwrap();
+        let error = write_export(&d, "AAPL", "d1", &a).unwrap_err();
+        assert!(error.contains("different content") && error.contains("not overwritten"), "{error}");
+        assert_eq!(std::fs::read(&clashing).unwrap(), b"someone else's data");
+        assert_eq!(names(&d).len(), 1, "no temporary file is left");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn older_fixed_name_exports_stay_where_they_are() {
+        let d = dir("legacy");
+        let legacy = d.join("AAPL_d1.csv");
+        std::fs::write(&legacy, b"old export").unwrap();
+        let file = write_export(&d, "AAPL", "d1", &csv(4.5)).unwrap();
+        assert_ne!(file.path, legacy);
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"old export");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn symbol_and_timeframe_cannot_leave_the_exports_folder() {
+        let d = dir("names");
+        for (symbol, tf) in [("../../etc/passwd", "d1"), ("..", ".."), ("AAPL", "../x"), ("a/b\\c", "d 1")] {
+            let file = write_export(&d, symbol, tf, &csv(5.5)).unwrap();
+            assert_eq!(file.path.parent().unwrap(), d.as_path(), "{symbol} {tf}");
+        }
+        let _ = std::fs::remove_dir_all(d);
     }
 }

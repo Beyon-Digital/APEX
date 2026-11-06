@@ -765,7 +765,7 @@ pub mod audit {
             "cancel_order" => class("order", "order.cancel", Always, false),
             "modify_order" => class("order", "order.modify", Always, false),
             "create_alert" => class("system", "alert.create", Always, false),
-            "remove_alert" => class("system", "alert.remove", Always, false),
+            "remove_alert" => class("system", "alert.delete", Always, false),
             "export_bars_csv" => class("system", "data.export", Always, false),
             "add_to_watchlist" => class("system", "watchlist.add", Always, false),
             "remove_from_watchlist" => class("system", "watchlist.remove", Always, false),

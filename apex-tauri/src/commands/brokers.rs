@@ -13,6 +13,26 @@ pub async fn list_broker_connections(
     Ok(state.broker_connections())
 }
 
+/// Record a broker action. The entry names the broker and nothing else: no token, no key, no
+/// request token. Error texts have the given secrets and URL credentials removed.
+fn record_broker(state: &AppState, actor: &str, action: &str, broker_id: &str, done: &str, failed: &str, result: &Result<BrokerConnectionDto, String>, secrets: &[&str]) {
+    // The id is user supplied for failures (it may be invalid), so it is clipped like any text.
+    let target: String = broker_id.chars().take(64).collect();
+    match result {
+        Ok(_) => crate::activity::record(state, actor, action, "system", &target, &format!("{done} {target}"), true, None),
+        Err(error) => crate::activity::record(
+            state,
+            actor,
+            action,
+            "system",
+            &target,
+            &format!("{failed} {target}"),
+            false,
+            Some(crate::commands::settings::scrub_error(error, secrets)),
+        ),
+    }
+}
+
 /// Set or update a live broker session token/JWT at runtime.
 #[tauri::command]
 pub async fn set_broker_session(
@@ -20,6 +40,22 @@ pub async fn set_broker_session(
     session_token: String,
     state: State<'_, AppState>,
 ) -> Result<BrokerConnectionDto, String> {
+    set_broker_session_as(&state, broker_id, session_token, "user").await
+}
+
+pub(crate) async fn set_broker_session_as(
+    state: &AppState,
+    broker_id: String,
+    session_token: String,
+    actor: &str,
+) -> Result<BrokerConnectionDto, String> {
+    let result = set_broker_session_inner(state, &broker_id, &session_token).await;
+    record_broker(state, actor, "broker.session", &broker_id, "Session token set for", "Could not set the session token for", &result, &[session_token.trim()]);
+    result
+}
+
+async fn set_broker_session_inner(state: &AppState, broker_id: &str, session_token: &str) -> Result<BrokerConnectionDto, String> {
+    let (broker_id, session_token) = (broker_id.to_string(), session_token.to_string());
     validation::validate_broker_id(&broker_id)?;
     validation::validate_session_token(&session_token)?;
 
@@ -49,6 +85,17 @@ pub async fn zerodha_login(
     request_token: String,
     state: State<'_, AppState>,
 ) -> Result<BrokerConnectionDto, String> {
+    zerodha_login_as(&state, request_token, "user").await
+}
+
+pub(crate) async fn zerodha_login_as(state: &AppState, request_token: String, actor: &str) -> Result<BrokerConnectionDto, String> {
+    let bare = extract_request_token(&request_token);
+    let result = zerodha_login_inner(state, request_token.clone()).await;
+    record_broker(state, actor, "broker.login", "zerodha", "Logged in to", "Login failed for", &result, &[bare.as_str(), request_token.trim()]);
+    result
+}
+
+async fn zerodha_login_inner(state: &AppState, request_token: String) -> Result<BrokerConnectionDto, String> {
     let request_token = extract_request_token(&request_token);
     let request_token = request_token.as_str();
     if request_token.is_empty() || request_token.len() > 256 {
@@ -135,17 +182,27 @@ pub async fn clear_broker_session(
     broker_id: String,
     state: State<'_, AppState>,
 ) -> Result<BrokerConnectionDto, String> {
-    validation::validate_broker_id(&broker_id)?;
+    clear_broker_session_as(&state, broker_id, "user").await
+}
+
+pub(crate) async fn clear_broker_session_as(state: &AppState, broker_id: String, actor: &str) -> Result<BrokerConnectionDto, String> {
+    let result = clear_broker_session_inner(state, &broker_id);
+    record_broker(state, actor, "broker.logout", &broker_id, "Logged out of", "Could not log out of", &result, &[]);
+    result
+}
+
+fn clear_broker_session_inner(state: &AppState, broker_id: &str) -> Result<BrokerConnectionDto, String> {
+    validation::validate_broker_id(broker_id)?;
 
     state
-        .clear_broker_session(&broker_id)
+        .clear_broker_session(broker_id)
         .map_err(|err| err.to_string())?;
     state
-        .forget_session_token(&broker_id)
+        .forget_session_token(broker_id)
         .map_err(|err| err.to_string())?;
 
     state
-        .broker_connection(&broker_id)
+        .broker_connection(broker_id)
         .ok_or_else(|| format!("Unknown broker: {}", broker_id))
 }
 

@@ -15,7 +15,7 @@
 
 use super::automation as automation_cmds;
 use super::python_runtime::RuntimePaths;
-use super::{ml, ml_datasets, ml_estimators, ml_recipes, notebook, strategy, versioned_files};
+use super::{ml, ml_datasets, ml_estimators, ml_recipes, notebook, settings, strategy, versioned_files};
 use crate::dto::DatasetInfoDto;
 use crate::ledger::{self, Kind, Ledger, LedgerStatus, ObjectSummary, VerifyReport, VersionRecord};
 use crate::state::AppState;
@@ -129,6 +129,9 @@ pub fn restore_dataset(ledger: &Ledger, paths: &RuntimePaths, name: &str, versio
     ledger.restore(Kind::Dataset, name, version, actor).map(|(record, _)| record)
 }
 
+/// Why a settings version cannot be restored.
+pub const SETTINGS_VIEW_ONLY: &str = "settings history is view-only; redacted values cannot be restored";
+
 /// Restore `version` of an object as a new version and put the working copy back. Dispatches to the
 /// per-kind restore of the module that owns the kind. Does not write an activity entry.
 pub fn restore_dispatch(
@@ -155,6 +158,10 @@ pub fn restore_dispatch(
                 .head(Kind::Automation, id)
                 .ok_or_else(|| format!("automation {id} has no record after the restore"))
         }
+        Kind::Settings => Err(SETTINGS_VIEW_ONLY.to_string()),
+        // An alert is restored into the running alert store, which only the app state holds
+        // (see `restore_and_record`).
+        Kind::Alert => Err("alerts are restored through the running alert store (restore_and_record)".to_string()),
     }
 }
 
@@ -166,7 +173,7 @@ fn activity_kind(kind: Kind) -> &'static str {
         Kind::Model => "model",
         Kind::Automation => "automation",
         Kind::Dataset => "dataset",
-        Kind::Estimator | Kind::Recipe | Kind::Notebook => "system",
+        Kind::Estimator | Kind::Recipe | Kind::Notebook | Kind::Settings | Kind::Alert => "system",
     }
 }
 
@@ -181,13 +188,20 @@ pub async fn restore_and_record(
     actor: &str,
 ) -> Result<VersionRecord, String> {
     let ledger = app_ledger()?;
-    let (engine, paths_owned, id_owned, actor_owned) = (state.automations.clone(), paths.clone(), id.to_string(), actor.to_string());
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        restore_dispatch(&ledger, &engine, &paths_owned, kind, &id_owned, version, &actor_owned)
-    })
-    .await
-    .map_err(|e| format!("the restore task failed: {e}"))
-    .and_then(|r| r);
+    let result = match kind {
+        // Refused before anything is touched; recorded below like any other failed restore.
+        Kind::Settings => Err(SETTINGS_VIEW_ONLY.to_string()),
+        Kind::Alert => state.alert_store.restore(&ledger, id, version, actor).await,
+        _ => {
+            let (engine, paths_owned, id_owned, actor_owned) = (state.automations.clone(), paths.clone(), id.to_string(), actor.to_string());
+            tauri::async_runtime::spawn_blocking(move || {
+                restore_dispatch(&ledger, &engine, &paths_owned, kind, &id_owned, version, &actor_owned)
+            })
+            .await
+            .map_err(|e| format!("the restore task failed: {e}"))
+            .and_then(|r| r)
+        }
+    };
     let action = format!("{}.restore", kind.as_str());
     match &result {
         Ok(record) => crate::activity::record(
@@ -303,6 +317,8 @@ pub struct StartupReconcile {
     pub files: versioned_files::ReconcileSummary,
     pub datasets: usize,
     pub models: usize,
+    /// The settings file was registered (first run) or found changed outside APEX and recorded.
+    pub settings_recorded: bool,
     pub errors: Vec<String>,
 }
 
@@ -320,6 +336,20 @@ impl StartupReconcile {
 pub fn startup_reconcile(ledger: &Ledger, paths: &RuntimePaths) -> StartupReconcile {
     let mut out = StartupReconcile { files: versioned_files::reconcile_all(ledger, paths), ..Default::default() };
     out.errors.extend(out.files.errors.iter().cloned());
+    // The settings file: version 1 on the first run, an `external` version when it changed while
+    // APEX was not running. An out-of-app edit also gets an activity entry (nothing else would show it).
+    match settings::reconcile_settings(ledger, paths.config_file()) {
+        Ok(Some(found)) => {
+            out.settings_recorded = true;
+            if found.record.actor == "external" {
+                if let Err(error) = crate::activity::append_to(ledger, &settings::external_edit_entry(&found)) {
+                    out.errors.push(format!("settings: could not record the outside edit: {error}"));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => out.errors.push(format!("settings: {error}")),
+    }
     match ml_datasets::list_datasets_checked(&ml_datasets::datasets_dir(paths)) {
         Ok(list) => out.datasets = list.len(),
         Err(error) => out.errors.push(format!("datasets: {error}")),
@@ -342,7 +372,7 @@ pub const READ_TOOLS: &[&str] = &["ledger_history", "ledger_version", "ledger_ve
 /// The Copilot's ledger tool that changes state: it appends a new version.
 pub const WRITE_TOOLS: &[&str] = &["ledger_restore"];
 
-const KINDS: [&str; 7] = ["strategy", "estimator", "recipe", "dataset", "model", "automation", "notebook"];
+const KINDS: [&str; 9] = ["strategy", "estimator", "recipe", "dataset", "model", "automation", "notebook", "settings", "alert"];
 
 fn tool(name: &str, description: &str, parameters: Value) -> Value {
     json!({"type": "function", "function": {"name": name, "description": description, "parameters": parameters}})
@@ -351,7 +381,7 @@ fn tool(name: &str, description: &str, parameters: Value) -> Value {
 /// OpenAI function-calling definitions for the ledger tools.
 pub fn tool_schemas() -> Vec<Value> {
     let kind = json!({"type": "string", "enum": KINDS, "description": "what kind of object"});
-    let id = json!({"type": "string", "description": "strategy path (strategies/x.py), estimator file name, recipe name, dataset name, model id, automation id or notebook path"});
+    let id = json!({"type": "string", "description": "strategy path (strategies/x.py), estimator file name, recipe name, dataset name, model id, automation id, notebook path, alert rule id, or config/apex.toml for the settings (secrets are redacted and settings cannot be restored)"});
     vec![
         tool(
             "ledger_history",
@@ -819,6 +849,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restoring_settings_is_refused_with_a_clear_message_and_nothing_changes() {
+        let (state, paths, ledger) = fixture("lc-r-settings").await;
+        ledger.put(Kind::Settings, "config/apex.toml", b"[risk]\nmax_daily_loss = 1.0\n", "system", "v1").unwrap();
+        ledger.put(Kind::Settings, "config/apex.toml", b"[risk]\nmax_daily_loss = 2.0\n", "user", "v2").unwrap();
+        let error = restore(&state, &ledger, &paths, Kind::Settings, "config/apex.toml", 1).unwrap_err();
+        assert_eq!(error, "settings history is view-only; redacted values cannot be restored");
+        assert_eq!(ledger.history(Kind::Settings, "config/apex.toml").len(), 2);
+        // Viewing an old version still works.
+        let v1 = version_inner(&ledger, Kind::Settings, "config/apex.toml", 1).unwrap();
+        assert_eq!(v1.text.as_deref(), Some("[risk]\nmax_daily_loss = 1.0\n"));
+        // An alert needs the running alert store, so the plain dispatch says so instead of guessing.
+        assert!(restore(&state, &ledger, &paths, Kind::Alert, "a", 1).unwrap_err().contains("alert store"));
+    }
+
+    #[tokio::test]
     async fn restoring_a_strategy_appends_a_version_and_rewrites_the_file() {
         let (state, paths, ledger) = fixture("lc-r-strategy").await;
         let id = "strategies/restore_me.py";
@@ -1036,5 +1081,262 @@ mod tests {
         assert!(!again.recorded_changes(), "{again:?}");
         assert_eq!(actions(&ledger, Kind::Estimator, "e.py").len(), 2);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// The control plane (settings, credentials, vault, brokers, risk, live arming, alerts, ChatGPT) is in
+/// the audit trail, and no secret reaches any ledger file, activity entry or log line.
+#[cfg(test)]
+mod control_plane_audit_tests {
+    use super::*;
+    use crate::activity::ActivityDto;
+    use crate::commands::copilot_tools::test_support;
+    use crate::commands::{adapters, alerts, brokers, chatgpt, live, risk, vault as vault_cmds};
+    use crate::dto::{AppSettingsUpdateDto, SaveAdapterConfigRequest};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    const PASSPHRASE: &str = "CANARY-passphrase-one";
+    const NEW_PASSPHRASE: &str = "CANARY-passphrase-two";
+    const WRONG_PASSPHRASE: &str = "CANARY-wrong-passphrase";
+    const API_KEY: &str = "CANARY-api-key-0001";
+    const CLIENT_SECRET: &str = "CANARY-client-secret-0002";
+    const ACCESS_TOKEN: &str = "CANARY-access-token-0003";
+    const REQUEST_TOKEN: &str = "CANARY-request-token-0004";
+    const PG_PASSWORD: &str = "CANARY-pg-password-0005";
+    const URL_PASSWORD: &str = "CANARY-url-password-0006";
+    const QUERY_KEY: &str = "CANARY-query-key-0007";
+    const OAUTH_CODE: &str = "CANARY-oauth-code-0008";
+    const EMAIL_LOCAL: &str = "canary.person.0009";
+    const ALL: [&str; 11] = [
+        PASSPHRASE, NEW_PASSPHRASE, WRONG_PASSPHRASE, API_KEY, CLIENT_SECRET, ACCESS_TOKEN, REQUEST_TOKEN, PG_PASSWORD, URL_PASSWORD, QUERY_KEY, OAUTH_CODE,
+    ];
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Capture {
+            self.clone()
+        }
+    }
+
+    fn files_text(dir: &std::path::Path, out: &mut String) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files_text(&path, out);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+    }
+
+    fn entries(paths: &RuntimePaths) -> Vec<ActivityDto> {
+        crate::activity::read_from(ledger::global(), paths.data_dir(), 1000, None, None)
+    }
+
+    fn found<'a>(all: &'a [ActivityDto], action: &str, ok: bool) -> Vec<&'a ActivityDto> {
+        all.iter().filter(|e| e.action == action && e.ok == ok).collect()
+    }
+
+    fn settings_request(paths: &RuntimePaths, edit: impl FnOnce(&mut serde_json::Value)) -> AppSettingsUpdateDto {
+        let cfg = crate::config::AppConfig::load(paths).unwrap();
+        let mut value = serde_json::json!({
+            "general": { "data_dir": cfg.general.data_dir },
+            "market_data": { "adapter": cfg.market_data.adapter },
+            "execution": { "adapter": cfg.execution.adapter },
+            "risk": { "max_daily_loss": cfg.risk.max_daily_loss, "max_order_value": cfg.risk.max_order_value },
+            "storage": {
+                "backend": "sqlite", "sqlite_path": cfg.storage.sqlite_path, "postgres_url": cfg.storage.postgres_url.clone().unwrap_or_default(),
+                "wal_mode": cfg.storage.wal_mode, "pool_size": cfg.storage.pool_size,
+            },
+        });
+        edit(&mut value);
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn adapter_request(settings: &[(&str, &str)], secrets: &[(&str, &str)], clear: &[&str]) -> SaveAdapterConfigRequest {
+        let map = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>();
+        SaveAdapterConfigRequest {
+            adapter_id: "binance".into(),
+            enabled: true,
+            settings: map(settings),
+            secrets: map(secrets),
+            clear_secrets: clear.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_control_plane_action_is_recorded_and_no_secret_reaches_any_ledger_file_or_log() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt().with_writer(capture.clone()).with_max_level(tracing::Level::TRACE).with_ansi(false).finish();
+        let _logs = tracing::subscriber::set_default(subscriber);
+
+        let (state, paths) = test_support::state("cp-canary").await;
+        let ledger = ledger::global().expect("the test state installs the process-wide ledger").clone();
+        // Never reach the network from a test: sign-out talks to a closed local port.
+        state.chatgpt.set_endpoints(crate::chatgpt_auth::AuthEndpoints {
+            issuer: "http://127.0.0.1:1".into(),
+            authorize: "http://127.0.0.1:1/a".into(),
+            token: "http://127.0.0.1:1/t".into(),
+            discovery: "http://127.0.0.1:1/d".into(),
+        });
+
+        // Vault: a failed unlock before it exists, create it, lock, two failures, unlock, change.
+        assert!(vault_cmds::vault_unlock_as(&state, WRONG_PASSPHRASE, "user").await.is_err());
+        vault_cmds::vault_init_as(&state, PASSPHRASE, "user").await.unwrap();
+        vault_cmds::vault_lock_as(&state, "user").await.unwrap();
+        assert!(vault_cmds::vault_unlock_as(&state, WRONG_PASSPHRASE, "user").await.is_err());
+        assert!(vault_cmds::vault_unlock_as(&state, WRONG_PASSPHRASE, "user").await.is_err());
+        // Locked: the Zerodha login is refused before any network call.
+        assert!(brokers::zerodha_login_as(&state, REQUEST_TOKEN.to_string(), "user").await.is_err());
+        vault_cmds::vault_unlock_as(&state, PASSPHRASE, "user").await.unwrap();
+        assert!(vault_cmds::vault_change_passphrase_as(&state, WRONG_PASSPHRASE, NEW_PASSPHRASE, "user").await.is_err());
+        vault_cmds::vault_change_passphrase_as(&state, PASSPHRASE, NEW_PASSPHRASE, "user").await.unwrap();
+
+        // Adapters: save with secrets, a refused save, disable, delete.
+        adapters::save_adapter_config_as(&state, adapter_request(&[("testnet", "true")], &[("api_key", API_KEY), ("api_secret", CLIENT_SECRET)], &[]), "user").await.unwrap();
+        assert!(adapters::save_adapter_config_as(&state, adapter_request(&[], &[("not_a_field", API_KEY)], &[]), "user").await.is_err());
+        adapters::save_adapter_config_as(&state, adapter_request(&[], &[], &["api_secret"]), "user").await.unwrap();
+        adapters::set_adapter_enabled_as(&state, "binance".into(), false, "user").await.unwrap();
+        adapters::delete_adapter_config_as(&state, "binance".into(), "user").await.unwrap();
+
+        // Brokers: no API key stored for Zerodha, so the login stops before the network.
+        let _ = brokers::set_broker_session_as(&state, "zerodha".into(), ACCESS_TOKEN.into(), "user").await;
+        assert!(brokers::zerodha_login_as(&state, format!("http://127.0.0.1/?request_token={REQUEST_TOKEN}&action=login"), "user").await.is_err());
+        let _ = brokers::clear_broker_session_as(&state, "zerodha".into(), "user").await;
+
+        // Settings: a save with a database password and an API key in a URL query, and two refusals.
+        let saved = crate::commands::settings::save_settings_audited(
+            &state,
+            &paths,
+            settings_request(&paths, |v| {
+                v["risk"]["max_daily_loss"] = serde_json::json!(12345.0);
+                v["storage"]["postgres_url"] = serde_json::json!(format!("postgresql://apex:{PG_PASSWORD}@db.example.com:5432/apex"));
+                v["llm"] = serde_json::json!({"active": "canary", "providers": [{
+                    "id": "canary", "name": "Canary", "base_url": format!("https://llm.example/v1?api_key={QUERY_KEY}"),
+                    "model": "m", "api_kind": "chat", "api_key_env": "CANARY_ENV", "max_tokens": 77 }]});
+            }),
+            "user",
+        );
+        saved.unwrap();
+        let refused = crate::commands::settings::save_settings_audited(
+            &state,
+            &paths,
+            settings_request(&paths, |v| {
+                v["llm"] = serde_json::json!({"active": "", "providers": [{"id": "bad", "base_url": format!("http://apex:{URL_PASSWORD}@[bad"), "model": "m", "api_kind": "chat"}]});
+            }),
+            "user",
+        );
+        assert!(refused.is_err());
+        assert!(crate::commands::settings::save_settings_audited(&state, &paths, settings_request(&paths, |v| v["risk"]["max_daily_loss"] = serde_json::json!(0.0)), "user").is_err());
+
+        // Risk and live arming.
+        risk::reset_halt_as(&state, "user");
+        live::set_live_armed_as(&state, true, "user").unwrap();
+        live::set_live_armed_as(&state, false, "user").unwrap();
+
+        // Alerts, and a refused restore of a settings version.
+        let rule = r#"{"DailyPnl":{"threshold":-100.0}}"#;
+        alerts::add_alert_as(&state, "cp-canary-alert".into(), rule.into(), "user").await.unwrap();
+        assert!(alerts::add_alert_as(&state, "cp-canary-alert-2".into(), "{not json".into(), "user").await.is_err());
+        assert!(alerts::remove_alert_as(&state, "cp-canary-alert", "user").await.unwrap());
+        restore_and_record(&state, &paths, Kind::Alert, "cp-canary-alert", 1, "user").await.unwrap();
+        let view_only = restore_and_record(&state, &paths, Kind::Settings, "config/apex.toml", 1, "user").await.unwrap_err();
+        assert_eq!(view_only, "settings history is view-only; redacted values cannot be restored");
+
+        // ChatGPT: a stored account, sign-out, and the background sign-in outcomes.
+        crate::chatgpt_auth::save_signed_in(
+            &state.vault,
+            "client",
+            &crate::chatgpt_auth::IdentityClaims { sub: "sub".into(), email: Some(format!("{EMAIL_LOCAL}@Canary-Domain.example")) },
+            &crate::chatgpt_auth::TokenSet { access_token: ACCESS_TOKEN.into(), refresh_token: Some(API_KEY.into()), id_token: None, expires_in: Some(3600), scope: None },
+        )
+        .unwrap();
+        chatgpt::sign_out_audited(&state, "user").await.unwrap();
+        let status = |state: &str, email: Option<&str>, message: Option<String>| crate::chatgpt_auth::ChatGptStatus { state: state.into(), email: email.map(String::from), plan_usage: true, message };
+        chatgpt::SIGN_IN_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+        chatgpt::note_sign_in_outcome(&state, &status("connected", Some(&format!("{EMAIL_LOCAL}@Canary-Domain.example")), None));
+        chatgpt::SIGN_IN_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+        chatgpt::note_sign_in_outcome(&state, &status("error", None, Some(format!("exchange failed: https://auth.openai.com/cb?code={OAUTH_CODE}&state=s"))));
+
+        // ── What the trail says ──
+        let all = entries(&paths);
+        let one = |action: &str, ok: bool| {
+            let list = found(&all, action, ok);
+            assert!(!list.is_empty(), "no {action} entry with ok={ok}");
+            list[0].clone()
+        };
+        for action in [
+            "vault.init", "vault.lock", "vault.unlock", "vault.change_passphrase", "adapter.save", "adapter.enable", "adapter.delete", "settings.save", "risk.reset_halt",
+            "live.arm", "live.disarm", "alert.create", "alert.delete", "alert.restore", "chatgpt.sign_out", "chatgpt.sign_in",
+        ] {
+            let e = one(action, true);
+            assert_eq!(e.actor, "user", "{action}");
+            assert_eq!(e.kind, "system", "{action}");
+        }
+        for action in ["vault.unlock", "vault.change_passphrase", "adapter.save", "settings.save", "alert.create", "settings.restore", "broker.login", "chatgpt.sign_in"] {
+            one(action, false);
+        }
+        // Failed unlocks carry a count and nothing else.
+        let failed_unlocks: Vec<&ActivityDto> = found(&all, "vault.unlock", false);
+        assert!(failed_unlocks.len() >= 3);
+        for e in &failed_unlocks {
+            assert!(e.details.as_deref().unwrap_or("").starts_with("failed_attempts="), "{e:?}");
+        }
+        assert!(failed_unlocks.iter().any(|e| e.details.as_deref() == Some("failed_attempts=3")), "the count goes up with each failure in a row");
+        assert_eq!(one("vault.unlock", true).details.as_deref(), Some("failed_attempts_before=3"));
+        // Adapter entries name fields, not values.
+        let saved_adapter = found(&all, "adapter.save", true).into_iter().find(|e| e.details.as_deref().unwrap_or("").contains("secrets_set=api_key,api_secret")).expect("field names are listed");
+        assert_eq!(saved_adapter.target_id, "binance");
+        assert!(saved_adapter.details.as_deref().unwrap().contains("settings_set=testnet"));
+        assert!(found(&all, "adapter.save", true).iter().any(|e| e.details.as_deref().unwrap_or("").contains("secrets_cleared=api_secret")));
+        assert!(one("adapter.delete", true).details.unwrap().contains("secrets_removed=api_key"));
+        // The settings entry lists the changed keys and old -> new for plain values, never a secret.
+        let settings_entry = found(&all, "settings.save", true).into_iter().find(|e| e.summary.contains("risk.max_daily_loss")).expect("settings entry");
+        assert!(settings_entry.summary.contains("storage.postgres_url"), "{}", settings_entry.summary);
+        let details = settings_entry.details.clone().unwrap();
+        assert!(details.contains("risk.max_daily_loss: 50000.0 -> 12345.0"), "{details}");
+        assert!(details.contains("storage.postgres_url: (empty) -> postgresql://apex:<redacted>@db.example.com:5432/apex"), "{details}");
+        assert!(details.contains("llm.providers[canary].max_tokens: added 77"), "{details}");
+        assert!(details.contains("?<query omitted>"), "{details}");
+        // The settings object in the ledger is redacted.
+        let head = ledger.head(Kind::Settings, "config/apex.toml").expect("settings are versioned");
+        let head_text = String::from_utf8(ledger.content(Kind::Settings, "config/apex.toml", head.version).unwrap()).unwrap();
+        assert!(head_text.contains("postgresql://apex:<redacted>@db.example.com:5432/apex") && head_text.contains("max_daily_loss = 12345.0"), "{head_text}");
+        // The ChatGPT entries show the domain and not the person.
+        let sign_in = found(&all, "chatgpt.sign_in", true).into_iter().find(|e| e.summary.contains("completed")).unwrap();
+        assert!(sign_in.summary.contains("canary-domain.example") && !sign_in.summary.contains(EMAIL_LOCAL), "{}", sign_in.summary);
+        assert!(one("chatgpt.sign_out", true).summary.contains("canary-domain.example"));
+        // Alerts are objects with history.
+        let versions: Vec<(u32, String)> = ledger.history(Kind::Alert, "cp-canary-alert").into_iter().map(|r| (r.version, r.action)).collect();
+        assert_eq!(versions, [(1, "create".to_string()), (2, "delete".to_string()), (3, "restore".to_string())]);
+
+        // ── No secret anywhere ──
+        let mut everything = String::new();
+        files_text(ledger.dir(), &mut everything);
+        let logs = String::from_utf8_lossy(&capture.0.lock().unwrap()).to_string();
+        assert!(!logs.is_empty(), "the log capture must be working for this check to mean anything");
+        for canary in ALL {
+            assert!(!everything.contains(canary), "{canary} reached a ledger file");
+            assert!(!logs.contains(canary), "{canary} reached the log");
+        }
+        assert!(!everything.contains(EMAIL_LOCAL) && !logs.contains(EMAIL_LOCAL), "the account name reached the trail");
+        let entries_text = serde_json::to_string(&all).unwrap();
+        for canary in ALL {
+            assert!(!entries_text.contains(canary), "{canary} reached an activity entry");
+        }
+        assert!(ledger.verify().ok, "the chain is still intact");
     }
 }

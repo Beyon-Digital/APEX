@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::dto::EnvImportResultDto;
 use crate::state::AppState;
@@ -22,15 +23,49 @@ pub async fn vault_status(state: State<'_, AppState>) -> Result<VaultStatusDto, 
     Ok(status_dto(&state))
 }
 
+/// Failed attempts in a row since the last success, per action. Only these counts are ever logged:
+/// never a passphrase, a length or a hint.
+static FAILED_INIT: AtomicU32 = AtomicU32::new(0);
+static FAILED_UNLOCK: AtomicU32 = AtomicU32::new(0);
+static FAILED_CHANGE: AtomicU32 = AtomicU32::new(0);
+
+/// One finished vault action as an activity entry. A failure records `ok=false` and the running count,
+/// with no details (an error text could hint at the passphrase).
+fn record_attempt(state: &AppState, actor: &str, action: &str, label: &str, counter: &AtomicU32, ok: bool) {
+    if ok {
+        let before = counter.swap(0, Ordering::SeqCst);
+        let details = (before > 0).then(|| format!("failed_attempts_before={before}"));
+        crate::activity::record(state, actor, action, "system", "vault", &format!("Vault {label}"), true, details);
+    } else {
+        let n = counter.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        crate::activity::record(
+            state,
+            actor,
+            action,
+            "system",
+            "vault",
+            &format!("Vault {label} failed (failed attempt {n} in a row)"),
+            false,
+            Some(format!("failed_attempts={n}")),
+        );
+    }
+}
+
 /// Create the vault with a new passphrase and leave it unlocked.
 #[tauri::command]
 pub async fn vault_init(
     passphrase: String,
     state: State<'_, AppState>,
 ) -> Result<VaultStatusDto, String> {
-    state.vault.init(&passphrase)?;
+    vault_init_as(&state, &passphrase, "user").await
+}
+
+pub(crate) async fn vault_init_as(state: &AppState, passphrase: &str, actor: &str) -> Result<VaultStatusDto, String> {
+    let result = state.vault.init(passphrase);
+    record_attempt(state, actor, "vault.init", "created", &FAILED_INIT, result.is_ok());
+    result?;
     state.apply_all_brokers().await;
-    Ok(status_dto(&state))
+    Ok(status_dto(state))
 }
 
 /// Unlock the vault and bring every stored adapter online.
@@ -39,16 +74,27 @@ pub async fn vault_unlock(
     passphrase: String,
     state: State<'_, AppState>,
 ) -> Result<VaultStatusDto, String> {
-    state.vault.unlock(&passphrase)?;
+    vault_unlock_as(&state, &passphrase, "user").await
+}
+
+pub(crate) async fn vault_unlock_as(state: &AppState, passphrase: &str, actor: &str) -> Result<VaultStatusDto, String> {
+    let result = state.vault.unlock(passphrase);
+    record_attempt(state, actor, "vault.unlock", "unlocked", &FAILED_UNLOCK, result.is_ok());
+    result?;
     state.apply_all_brokers().await;
-    Ok(status_dto(&state))
+    Ok(status_dto(state))
 }
 
 /// Lock the vault and drop every in-memory credential and live adapter.
 #[tauri::command]
 pub async fn vault_lock(state: State<'_, AppState>) -> Result<VaultStatusDto, String> {
+    vault_lock_as(&state, "user").await
+}
+
+pub(crate) async fn vault_lock_as(state: &AppState, actor: &str) -> Result<VaultStatusDto, String> {
     state.lock_vault().await;
-    Ok(status_dto(&state))
+    crate::activity::record(state, actor, "vault.lock", "system", "vault", "Vault locked", true, None);
+    Ok(status_dto(state))
 }
 
 #[tauri::command]
@@ -57,13 +103,22 @@ pub async fn vault_change_passphrase(
     new_passphrase: String,
     state: State<'_, AppState>,
 ) -> Result<VaultStatusDto, String> {
-    state
-        .vault
-        .change_passphrase(&old_passphrase, &new_passphrase)?;
+    vault_change_passphrase_as(&state, &old_passphrase, &new_passphrase, "user").await
+}
+
+pub(crate) async fn vault_change_passphrase_as(
+    state: &AppState,
+    old_passphrase: &str,
+    new_passphrase: &str,
+    actor: &str,
+) -> Result<VaultStatusDto, String> {
+    let result = state.vault.change_passphrase(old_passphrase, new_passphrase);
+    record_attempt(state, actor, "vault.change_passphrase", "passphrase changed", &FAILED_CHANGE, result.is_ok());
+    result?;
     // Changing the passphrase leaves the vault unlocked. If it was locked before,
     // bring the adapters online like a normal unlock would.
     state.apply_all_brokers().await;
-    Ok(status_dto(&state))
+    Ok(status_dto(state))
 }
 
 /// `.env` variable -> (adapter id, field, is_secret)
@@ -160,6 +215,17 @@ pub async fn import_env_credentials(
                 .map_err(|e| e.to_string())?;
         }
     }
+    // The names of the variables, never their values.
+    crate::activity::record(
+        &state,
+        "user",
+        "adapter.import_env",
+        "system",
+        "vault",
+        &format!("Imported {} credential(s) from a .env file into the vault", imported.len()),
+        true,
+        Some(format!("variables={}", imported.join(","))),
+    );
     Ok(EnvImportResultDto {
         source: env_path.display().to_string(),
         imported,

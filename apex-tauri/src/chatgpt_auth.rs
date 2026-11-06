@@ -673,6 +673,16 @@ impl Runtime {
     }
 }
 
+/// The message of a browser sign-in that failed, if the last one did. `status` hides it while a
+/// refresh token from an earlier sign-in is still stored (the account stays usable), so the audit
+/// of a sign-in outcome reads it here.
+pub fn sign_in_error(state: &AppState) -> Option<String> {
+    match state.chatgpt.transient.lock().unwrap().as_ref() {
+        Some((s, message)) if s == "error" => Some(message.clone()),
+        _ => None,
+    }
+}
+
 pub fn status(state: &AppState) -> ChatGptStatus {
     if !state.vault.is_unlocked() {
         return ChatGptStatus { state: "locked".into(), email: None, plan_usage: false, message: Some("Unlock the vault to use ChatGPT sign-in.".into()) };

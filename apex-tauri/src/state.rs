@@ -297,6 +297,12 @@ impl AppState {
             aggregator.clone(),
             resolved_data_dir.join("alerts.json"),
         ).await);
+        // Alert rules that predate the audit ledger become version 1 of their ledger object.
+        match alert_store.register_existing().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(registered = n, "recorded existing alert rules in the audit ledger"),
+            Err(error) => tracing::warn!(%error, "could not register existing alert rules in the audit ledger"),
+        }
         alerts.start();
 
         // Evaluate DailyPnl alert rules against the live session P&L whenever a

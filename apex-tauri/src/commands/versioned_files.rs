@@ -98,6 +98,25 @@ pub(crate) fn describe_change(name: &str, old: Option<&[u8]>, new: &[u8]) -> Str
     format!("Saved {name} ({delta})")
 }
 
+/// Canonical JSON text: object keys sorted, no insignificant whitespace. The same value always gives
+/// the same bytes, so an unchanged object never looks like a new version.
+pub(crate) fn canonical_json(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), canonical_json(&map[k])))
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
+        Value::Array(items) => format!("[{}]", items.iter().map(canonical_json).collect::<Vec<_>>().join(",")),
+        other => other.to_string(),
+    }
+}
+
 fn display_name(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
 }
@@ -512,6 +531,14 @@ mod tests {
 
     fn sha(bytes: &[u8]) -> String {
         Ledger::sha256_hex(bytes)
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_at_every_level() {
+        let a = serde_json::json!({"b": 1, "a": {"y": [3, {"q": 1, "p": 2}], "x": null}});
+        let b = serde_json::json!({"a": {"x": null, "y": [3, {"p": 2, "q": 1}]}, "b": 1});
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+        assert_eq!(canonical_json(&a), r#"{"a":{"x":null,"y":[3,{"p":2,"q":1}]},"b":1}"#);
     }
 
     #[test]
