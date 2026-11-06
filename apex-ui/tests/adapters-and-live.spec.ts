@@ -42,12 +42,30 @@ test.describe('Adapter manager', () => {
     await expect(page.getByTestId('adapter-field-binance-api_key')).toHaveAttribute('placeholder', /Required/);
   });
 
-  test('locking the vault disables editing', async ({ page }) => {
+  test('a locked vault keeps credential fields focusable but read-only, and says how to unlock', async ({ page }) => {
     await openSettings(page);
     await page.getByTestId('adapter-expand-zerodha').click();
     await page.getByTestId('vault-lock').click();
     await expect(page.getByTestId('vault-state')).toContainText('locked');
-    await expect(page.getByTestId('adapter-field-zerodha-api_key')).toBeDisabled();
+    await page.getByTestId('vault-skip').click();
+
+    const field = page.getByTestId('adapter-field-zerodha-api_key');
+    // A disabled input cannot be focused, which made the form look broken.
+    await expect(field).not.toBeDisabled();
+    await field.click();
+    await expect(field).toBeFocused();
+    await field.pressSequentially('abc');
+    await expect(field).toHaveValue('');
+    await expect(page.getByTestId('adapter-save-zerodha')).toBeDisabled();
+    await expect(page.getByTestId('adapter-locked-zerodha')).toBeVisible();
+
+    await page.getByTestId('adapter-unlock-zerodha').click();
+    await page.getByTestId('vault-passphrase-input').fill('correct horse battery');
+    await page.getByTestId('vault-submit').click();
+    await expect(page.getByTestId('adapter-locked-zerodha')).toHaveCount(0);
+    await field.click();
+    await field.pressSequentially('abc');
+    await expect(field).toHaveValue('abc');
   });
 });
 
@@ -242,5 +260,53 @@ test.describe('Live safeguards in the real layout', () => {
       return log.filter((entry) => entry.cmd === 'place_order').pop()?.args.request;
     });
     expect(request).toMatchObject({ symbol: 'AAPL', side: 'Sell', order_type: 'Stop', quantity: 5, price: null, stop_price: 300 });
+  });
+});
+
+test.describe('AI provider API keys', () => {
+  test('each provider card has its own key field, and saving a key keeps unsaved edits', async ({ page }) => {
+    await page.goto('/');
+    await page.getByTestId('open-settings').click();
+    await page.getByTestId('settings-tab-ai').click();
+
+    // Add a provider that exists only in the draft: it must still be able to take a key.
+    await page.getByTestId('llm-add-provider').click();
+    const draftName = page.getByTestId('llm-name-provider-2');
+    await draftName.fill('My new provider');
+
+    const key = page.getByTestId('llm-key-input-provider-2');
+    await key.click();
+    await expect(key).toBeFocused();
+    await key.pressSequentially('sk-test-123');
+    await page.getByTestId('llm-key-save-provider-2').click();
+    await expect(page.getByTestId('llm-key-notice-provider-2')).toContainText('saved');
+
+    // The unsaved provider and its edited name survive the key save.
+    await expect(draftName).toHaveValue('My new provider');
+    await expect(key).toHaveValue('');
+    await expect(key).toHaveAttribute('placeholder', /saved/);
+    await expect(page.getByTestId('llm-key-remove-provider-2')).toBeVisible();
+
+    // The existing provider has a key field too.
+    await expect(page.getByTestId('llm-key-input-openrouter')).toBeVisible();
+  });
+
+  test('with a locked vault the key field is focusable, read-only, and offers unlock', async ({ page }) => {
+    await page.goto('/');
+    await page.getByTestId('open-settings').click();
+    await page.getByTestId('settings-tab-accounts').click();
+    await page.getByTestId('vault-lock').click();
+    await page.getByTestId('vault-skip').click();
+    await page.getByTestId('settings-tab-ai').click();
+
+    const key = page.getByTestId('llm-key-input-openrouter');
+    await expect(key).not.toBeDisabled();
+    await key.click();
+    await expect(key).toBeFocused();
+    await key.pressSequentially('nope');
+    await expect(key).toHaveValue('');
+    await expect(page.getByTestId('llm-key-save-openrouter')).toBeDisabled();
+    await page.getByTestId('llm-key-unlock-openrouter').click();
+    await expect(page.getByTestId('vault-gate')).toBeVisible();
   });
 });

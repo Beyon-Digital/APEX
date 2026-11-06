@@ -501,6 +501,8 @@ export interface CopilotReplyDto {
   provider: string;
   tool_calls: ToolCallTraceDto[];
   pending_approvals: PendingApprovalDto[];
+  /** Mode the backend actually used: ask | review | agent. */
+  mode?: string;
 }
 
 // Quant / indicators (OpenBB-style analytics)

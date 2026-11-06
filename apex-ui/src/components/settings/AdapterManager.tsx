@@ -126,6 +126,13 @@ const AdapterCard: React.FC<CardProps> = ({ schema, config, connection, vaultUnl
       </div>
 
       {expanded && (<div id={`adapter-body-${id}`}>
+      {!vaultUnlocked && (
+        <div className="mt-3 flex items-center justify-between gap-3 border border-warning/50 bg-surface-1 px-2 py-1.5 text-[11px] text-warning" data-testid={`adapter-locked-${id}`}>
+          <span>The credential vault is locked, so these fields are read-only.</span>
+          <button type="button" onClick={() => useVaultStore.setState({ dismissed: false })} data-testid={`adapter-unlock-${id}`}
+            className="shrink-0 border border-accent px-2 py-0.5 text-accent hover:bg-accent/10">Unlock vault…</button>
+        </div>
+      )}
       <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2">
         {schema.fields.map((field) => {
           const testId = `adapter-field-${id}-${field.key}`;
@@ -150,11 +157,17 @@ const AdapterCard: React.FC<CardProps> = ({ schema, config, connection, vaultUnl
                 value={isSecret ? secrets[field.key] ?? '' : settings[field.key] ?? ''}
                 placeholder={stored ? '•••••••• saved' : field.help || field.label}
                 data-testid={testId}
-                disabled={!vaultUnlocked}
-                onChange={(e) => (isSecret
-                  ? setSecrets({ ...secrets, [field.key]: e.target.value })
-                  : setSettings({ ...settings, [field.key]: e.target.value }))}
-                className="mt-1 w-full min-w-0 border border-[var(--border-color)] bg-surface-1 px-2 py-1 font-mono text-xs text-text-primary focus:border-accent focus:outline-none disabled:opacity-50"
+                // readOnly, not disabled: a disabled input cannot be focused, so a locked vault
+                // looked like a broken form. Read-only fields still take focus and show why.
+                readOnly={!vaultUnlocked}
+                aria-readonly={!vaultUnlocked}
+                title={vaultUnlocked ? undefined : 'Unlock the vault to edit credentials'}
+                onChange={(e) => {
+                  if (!vaultUnlocked) return;
+                  if (isSecret) setSecrets({ ...secrets, [field.key]: e.target.value });
+                  else setSettings({ ...settings, [field.key]: e.target.value });
+                }}
+                className="mt-1 w-full min-w-0 border border-[var(--border-color)] bg-surface-1 px-2 py-1 font-mono text-xs text-text-primary focus:border-accent focus:outline-none read-only:opacity-60"
               />
               {stored && (
                 <button type="button" className="mt-0.5 text-[10px] text-text-muted underline hover:text-bear"

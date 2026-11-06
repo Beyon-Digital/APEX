@@ -1,6 +1,8 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { useCopilotSessions } from '../../stores/copilotSessions';
 import { CopilotPanel } from './CopilotPanel';
+import { CopilotSessionList } from './CopilotSessionList';
 
 /**
  * LinkedIn-chats style docked chat: collapsed shows a pill in the bottom-right
@@ -10,6 +12,10 @@ import { CopilotPanel } from './CopilotPanel';
 export const CopilotDock: React.FC = () => {
   const open = useWorkspaceStore((s) => s.copilotOpen);
   const setOpen = useWorkspaceStore((s) => s.setCopilotOpen);
+  const [sessionsOpen, setSessionsOpen] = useState(false);
+  const title = useCopilotSessions((s) => s.sessions.find((x) => x.id === s.activeId)?.title ?? 'New chat');
+  const newChat = useCopilotSessions((s) => s.newChat);
+  const btn = 'h-6 px-1.5 flex items-center justify-center rounded text-[11px] font-mono text-text-muted hover:text-text-primary hover:bg-surface-3';
 
   return (
     <div className="fixed bottom-0 right-4 z-50 flex flex-col items-end pointer-events-none" data-testid="copilot-dock">
@@ -23,9 +29,28 @@ export const CopilotDock: React.FC = () => {
           <div className="flex items-center gap-2 min-w-0">
             <span className="w-2 h-2 rounded-full bg-accent shrink-0" />
             <span className="text-sm font-semibold text-text-primary truncate">Copilot</span>
-            <span className="text-[10px] text-text-muted font-mono truncate">agentic · live data</span>
+            <span className="text-[10px] text-text-muted font-mono truncate" title={title} data-testid="copilot-session-title">{title}</span>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => setSessionsOpen((v) => !v)}
+              aria-expanded={sessionsOpen}
+              className={`${btn} ${sessionsOpen ? 'text-accent' : ''}`}
+              title="Chat history"
+              data-testid="copilot-sessions-toggle"
+            >
+              History
+            </button>
+            <button
+              type="button"
+              onClick={() => { newChat(); setSessionsOpen(false); }}
+              className={btn}
+              title="New chat"
+              data-testid="copilot-new-chat"
+            >
+              + New
+            </button>
             <button
               type="button"
               onClick={() => setOpen(false)}
@@ -50,7 +75,8 @@ export const CopilotDock: React.FC = () => {
             </button>
           </div>
         </div>
-        <div className="flex-1 min-h-0">
+        <div className="relative flex-1 min-h-0">
+          {sessionsOpen && <CopilotSessionList onClose={() => setSessionsOpen(false)} />}
           <CopilotPanel />
         </div>
       </div>

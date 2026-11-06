@@ -18,6 +18,9 @@ class MyStrategy(Strategy):
         self.log("Strategy stopped")
 `;
 
+/** Turn ids the web mock has already paused for approval (see copilot_chat). */
+const mockApprovalPaused = new Set<string>();
+
 const mockPositions: PositionDto[] = [];
 const mockOrders: OrderDto[] = [];
 let mockModels: MLModelDto[] = [];
@@ -549,7 +552,13 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     const limit = Number(args?.limit ?? 100);
     return buildMockHistoricalData(symbol, timeframe, limit) as any;
   }
-  if (cmd === 'get_app_settings') return cloneMockSettings() as any;
+  if (cmd === 'get_app_settings') {
+    const settings = cloneMockSettings();
+    settings.llm.providers.forEach((p) => {
+      p.key_configured = mockAdapterConfigs.get(`llm:${p.id}`)?.secrets_configured.includes('api_key') ?? false;
+    });
+    return settings as any;
+  }
   if (cmd === 'save_app_settings') {
     const request = args?.request as AppSettingsUpdateDto;
     mockAppSettings = {
@@ -831,10 +840,28 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     } as ScanOutputDto as any;
   }
   if (cmd === 'copilot_chat') {
+    // Test hooks: "SLOWREPLY" delays the answer; "LIVEORDER" (outside ask mode)
+    // pauses once per turn id for approval, then answers on the replay.
+    const message = String(args?.message ?? '');
+    const mode = typeof args?.mode === 'string' ? args.mode : 'review';
+    const turnId = String(args?.turnId ?? '');
+    if (message.includes('SLOWREPLY')) await new Promise((r) => setTimeout(r, 800));
+    if (message.includes('LIVEORDER') && mode !== 'ask' && !mockApprovalPaused.has(turnId)) {
+      mockApprovalPaused.add(turnId);
+      return {
+        reply: `[mock] mode=${mode}: paused for approval`,
+        model: 'mock',
+        provider: 'mock',
+        mode,
+        tool_calls: [],
+        pending_approvals: [{ key: `mock-${turnId}`, name: 'place_order', detail: '[LIVE zerodha] BUY 1 RELIANCE.NS' }],
+      } as CopilotReplyDto as any;
+    }
     return {
-      reply: '[web-only mode] Copilot needs the desktop app + OPEN_ROUTER key. In-browser responses are stubbed.',
+      reply: `[mock] mode=${mode}: ${message}`,
       model: 'mock',
       provider: 'mock',
+      mode,
       tool_calls: [],
       pending_approvals: [],
     } as CopilotReplyDto as any;
@@ -997,8 +1024,10 @@ export async function runScan(request: ScanRequestDto): Promise<ScanOutputDto> {
 
 // AI Copilot (OpenRouter — desktop only)
 /** `turnId` identifies one user turn; re-send the same id when replaying after an approval. */
-export async function copilotChat(message: string, history?: CopilotMessageDto[], turnId?: string): Promise<CopilotReplyDto> {
-  return invoke<CopilotReplyDto>('copilot_chat', { message, history, turnId });
+export type CopilotMode = 'ask' | 'review' | 'agent';
+
+export async function copilotChat(message: string, history?: CopilotMessageDto[], turnId?: string, mode?: CopilotMode): Promise<CopilotReplyDto> {
+  return invoke<CopilotReplyDto>('copilot_chat', { message, history, turnId, mode });
 }
 
 export async function approveCopilotTools(keys: string[]): Promise<number> {

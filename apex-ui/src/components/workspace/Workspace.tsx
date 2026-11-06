@@ -1,5 +1,6 @@
 import { AdapterManager } from '../settings/AdapterManager';
 import { ChatGptCard } from '../settings/ChatGptCard';
+import { ProviderKeyField } from '../settings/ProviderKeyField';
 import { SymbolField } from '../common/SymbolField';
 import { DataFeedsOverview } from '../settings/DataFeedsOverview';
 import { useLiveStore } from '../../stores/liveStore';
@@ -267,6 +268,16 @@ export const Workspace: React.FC = () => {
       setSettingsError(null);
     } catch (err) {
       setSettingsError(err instanceof Error ? err.message : 'Unable to load application settings');
+    }
+  }, []);
+
+  // Refresh only the saved state (e.g. "key set" badges). Unlike refreshAppSettings this keeps
+  // the draft, so saving an API key never throws away unsaved edits or a provider just added.
+  const refreshSavedSettings = useCallback(async () => {
+    try {
+      setAppSettings(await getAppSettings());
+    } catch {
+      /* the badge simply stays as it was */
     }
   }, []);
 
@@ -795,7 +806,7 @@ export const Workspace: React.FC = () => {
                     <div>
                       <h4 className="text-xs font-medium text-text-secondary">AI Providers</h4>
                       <p className="mt-0.5 text-[11px] text-text-muted">
-                        OpenAI-compatible endpoints for the Copilot. Keys are stored encrypted: save the provider here, then add its API key under Accounts.
+                        OpenAI-compatible endpoints for the Copilot. Each provider has its own API key field below; keys are stored encrypted in the credential vault.
                       </p>
                       <p className="mt-0.5 text-[11px] text-warning">
                         Copilot prompts and tool results (quotes, positions, orders) are sent to the active provider's endpoint. Only configure providers you trust with your trading data.
@@ -888,9 +899,7 @@ export const Workspace: React.FC = () => {
                               className="px-2 py-1 text-xs bg-surface-1 border border-[var(--border-color)] rounded font-mono"
                               data-testid={`llm-model-${p.id}`}
                             />
-                            <div className="flex items-center text-[11px] text-text-muted" data-testid={`llm-key-hint-${p.id}`}>
-                              {persisted?.key_configured ? 'API key stored (manage under Accounts).' : 'No API key yet. Save, then add it under Accounts.'}
-                            </div>
+                            <ProviderKeyField providerId={p.id} stored={Boolean(persisted?.key_configured)} onChanged={refreshSavedSettings} />
                             <label className="flex items-center gap-2 text-[11px] text-text-muted">Max tokens
                               <input
                               type="number"

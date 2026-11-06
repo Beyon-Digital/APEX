@@ -1,20 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { approveCopilotTools, copilotChat } from '../../lib/tauri';
-import type { CopilotMessageDto, PendingApprovalDto, ToolCallTraceDto } from '../../lib/types';
-
-interface ChatEntry extends CopilotMessageDto {
-  id: number;
-  model?: string;
-  provider?: string;
-  toolCalls?: ToolCallTraceDto[];
-  pendingApprovals?: PendingApprovalDto[];
-  approvalState?: 'pending' | 'approved' | 'denied';
-  /** The user message that produced this pending turn (for resend-on-approve). */
-  prompt?: string;
-  /** Turn id of that message; re-sent on approve so the backend treats it as the same turn. */
-  turnId?: string;
-  error?: boolean;
-}
+import { approveCopilotTools, copilotChat, type CopilotMode } from '../../lib/tauri';
+import type { CopilotMessageDto, ToolCallTraceDto } from '../../lib/types';
+import { useCopilotMode, useCopilotSessions, type ChatEntry } from '../../stores/copilotSessions';
 
 const SUGGESTIONS = [
   'Summarize my open positions and session P&L',
@@ -67,21 +54,25 @@ const TOOL_LABELS: Record<string, string> = {
   stop_strategy: 'Stop strategy',
   modify_order: 'Modify order',
   kill_switch: 'KILL SWITCH',
+  web_fetch: 'Web page',
+  compute_indicator: 'Indicator',
+  get_order_book: 'Order book',
+  get_correlations: 'Correlations',
+  search_news: 'News search',
+  get_system_health: 'System health',
+  get_symbol_feeds: 'Data feeds',
+  set_symbol_provider: 'Pin data feed',
+  list_notebooks: 'Notebooks',
+  read_notebook: 'Read notebook',
+  write_notebook: 'Write notebook',
+  run_notebook_cell: 'Run cell',
 };
 
-const HISTORY_KEY = 'apex.copilot.history';
-const HISTORY_LIMIT = 100;
-
-function loadHistory(): ChatEntry[] {
-  try {
-    const raw = localStorage.getItem(HISTORY_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as ChatEntry[];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
+const MODES: { id: CopilotMode; label: string; description: string }[] = [
+  { id: 'ask', label: 'Ask', description: 'Read-only: answers from data, changes nothing' },
+  { id: 'review', label: 'Review', description: 'Asks before each change' },
+  { id: 'agent', label: 'Agent', description: 'Acts on its own; live-broker actions still ask you' },
+];
 
 const ApprovalCard: React.FC<{
   entry: ChatEntry;
@@ -145,39 +136,64 @@ const ToolTrace: React.FC<{ calls: ToolCallTraceDto[] }> = ({ calls }) => (
   </div>
 );
 
+const EMPTY: ChatEntry[] = [];
+
+const ModeSwitch: React.FC = () => {
+  const mode = useCopilotMode((s) => s.mode);
+  const setMode = useCopilotMode((s) => s.setMode);
+  const active = MODES.find((m) => m.id === mode) ?? MODES[0];
+  return (
+    <div className="px-3 pt-2 border-t border-[var(--border-color)]">
+      <div className="flex border border-[var(--border-color)] rounded overflow-hidden" role="group" aria-label="Copilot mode">
+        {MODES.map((m) => (
+          <button
+            key={m.id}
+            type="button"
+            onClick={() => setMode(m.id)}
+            aria-pressed={mode === m.id}
+            title={m.description}
+            className={`flex-1 px-2 py-1 text-[11px] font-mono uppercase tracking-wide border-r last:border-r-0 border-[var(--border-color)] ${
+              mode === m.id ? 'bg-accent/20 text-accent' : 'text-text-muted hover:bg-surface-3'
+            }`}
+            data-testid={`copilot-mode-${m.id}`}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+      <p className="mt-1 text-[10px] text-text-muted" data-testid="copilot-mode-desc">{active.description}</p>
+    </div>
+  );
+};
+
 export const CopilotPanel: React.FC = () => {
-  const [entries, setEntries] = useState<ChatEntry[]>(loadHistory);
+  const activeId = useCopilotSessions((s) => s.activeId);
+  const entries = useCopilotSessions((s) => s.sessions.find((x) => x.id === s.activeId)?.entries ?? EMPTY);
+  const busy = useCopilotSessions((s) => !!s.busy[s.activeId]);
   const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
-  const nextId = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // nextId stays ahead of the largest persisted id after reload.
   useEffect(() => {
-    nextId.current = entries.reduce((m, e) => Math.max(m, e.id), 0) + 1;
-  }, [entries]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(entries.slice(-HISTORY_LIMIT)));
-    } catch {
-      /* storage full or unavailable — chat still works in-memory */
-    }
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [entries, busy]);
+  }, [entries, busy, activeId]);
 
-  const send = useCallback(async (text: string, replay: boolean, replayTurnId?: string) => {
+  // Always targets an explicit session: the reply is appended to the session that
+  // asked, even if the user switches or starts another chat while it is in flight.
+  const send = useCallback(async (sessionId: string, text: string, replay: boolean, replayTurnId?: string) => {
     const message = text.trim();
-    if (!message || busy) return;
+    const store = useCopilotSessions.getState();
+    const session = store.sessions.find((s) => s.id === sessionId);
+    if (!message || !session || store.busy[sessionId]) return;
+    const mode = useCopilotMode.getState().mode;
 
     // History is prior turns only: the backend appends `message` itself. When
     // replaying after an approval, the message and its "Paused" reply are already
     // in the list, so cut them off or the model sees the request twice.
-    let prior = entries;
+    let prior = session.entries;
     if (replay) {
       let lastUser = -1;
-      entries.forEach((e, i) => { if (e.role === 'user') lastUser = i; });
-      prior = lastUser >= 0 ? entries.slice(0, lastUser) : entries;
+      prior.forEach((e, i) => { if (e.role === 'user') lastUser = i; });
+      prior = lastUser >= 0 ? prior.slice(0, lastUser) : prior;
     }
     const history: CopilotMessageDto[] = prior
       .filter((e) => !e.error)
@@ -187,55 +203,45 @@ export const CopilotPanel: React.FC = () => {
     const turnId = replay && replayTurnId ? replayTurnId : crypto.randomUUID();
 
     if (!replay) {
-      const userEntry: ChatEntry = { id: nextId.current++, role: 'user', content: message };
-      setEntries((current) => [...current, userEntry]);
+      store.append(sessionId, { role: 'user', content: message });
       setInput('');
     }
-    setBusy(true);
+    store.setBusy(sessionId, true);
     try {
-      const reply = await copilotChat(message, history, turnId);
-      setEntries((current) => [
-        ...current,
-        {
-          id: nextId.current++,
-          role: 'assistant',
-          content: reply.reply,
-          model: reply.model,
-          provider: reply.provider,
-          toolCalls: reply.tool_calls,
-          pendingApprovals: reply.pending_approvals,
-          approvalState:
-            reply.pending_approvals.length > 0 ? 'pending' : undefined,
-          prompt: message,
-          turnId,
-        },
-      ]);
+      const reply = await copilotChat(message, history, turnId, mode);
+      store.append(sessionId, {
+        role: 'assistant',
+        content: reply.reply,
+        model: reply.model,
+        provider: reply.provider,
+        toolCalls: reply.tool_calls,
+        pendingApprovals: reply.pending_approvals,
+        approvalState: reply.pending_approvals.length > 0 ? 'pending' : undefined,
+        usedMode: reply.mode && reply.mode !== mode ? reply.mode : undefined,
+        prompt: message,
+        turnId,
+      });
     } catch (err) {
-      setEntries((current) => [
-        ...current,
-        {
-          id: nextId.current++,
-          role: 'assistant',
-          content: typeof err === 'string' ? err : err instanceof Error ? err.message : 'Copilot request failed',
-          error: true,
-        },
-      ]);
+      store.append(sessionId, {
+        role: 'assistant',
+        content: typeof err === 'string' ? err : err instanceof Error ? err.message : 'Copilot request failed',
+        error: true,
+      });
     } finally {
-      setBusy(false);
+      store.setBusy(sessionId, false);
     }
-  }, [busy, entries]);
+  }, []);
 
   const handleApprove = useCallback(
     (entry: ChatEntry) => {
+      const sessionId = useCopilotSessions.getState().activeId;
       const keys = (entry.pendingApprovals ?? []).map((a) => a.key);
       const prompt = entry.prompt ?? '';
       const turnId = entry.turnId;
-      setEntries((current) =>
-        current.map((e) => (e.id === entry.id ? { ...e, approvalState: 'approved' as const } : e)),
-      );
+      useCopilotSessions.getState().updateEntry(sessionId, entry.id, { approvalState: 'approved' });
       void approveCopilotTools(keys)
         .then(() => {
-          if (prompt) return send(prompt, true, turnId);
+          if (prompt) return send(sessionId, prompt, true, turnId);
         })
         .catch(() => undefined);
     },
@@ -243,9 +249,8 @@ export const CopilotPanel: React.FC = () => {
   );
 
   const handleDeny = useCallback((entry: ChatEntry) => {
-    setEntries((current) =>
-      current.map((e) => (e.id === entry.id ? { ...e, approvalState: 'denied' as const } : e)),
-    );
+    const store = useCopilotSessions.getState();
+    store.updateEntry(store.activeId, entry.id, { approvalState: 'denied' });
   }, []);
 
   return (
@@ -261,7 +266,7 @@ export const CopilotPanel: React.FC = () => {
             {SUGGESTIONS.map((s) => (
               <button
                 key={s}
-                onClick={() => void send(s, false)}
+                onClick={() => void send(activeId, s, false)}
                 className="block w-full text-left px-2 py-1.5 text-xs bg-surface-2 hover:bg-surface-3 border border-[var(--border-color)] rounded text-text-secondary"
                 data-testid="copilot-suggestion"
               >
@@ -292,6 +297,11 @@ export const CopilotPanel: React.FC = () => {
                   <ApprovalCard entry={entry} onApprove={handleApprove} onDeny={handleDeny} />
                 )}
                 {entry.content}
+                {entry.usedMode && (
+                  <div className="mt-1 text-[10px] text-warning font-mono" data-testid="copilot-used-mode">
+                    ran in {entry.usedMode} mode
+                  </div>
+                )}
                 {(entry.model || entry.provider) && entry.model !== 'mock' && (
                   <div className="mt-1 text-[10px] text-text-muted font-mono">
                     {entry.provider && entry.provider !== 'copilot' ? `${entry.provider} · ` : ''}
@@ -311,12 +321,13 @@ export const CopilotPanel: React.FC = () => {
         )}
       </div>
 
+      <ModeSwitch />
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          void send(input, false);
+          void send(activeId, input, false);
         }}
-        className="px-3 py-2 border-t border-[var(--border-color)] flex items-center gap-2"
+        className="px-3 py-2 flex items-center gap-2"
       >
         <input
           type="text"
