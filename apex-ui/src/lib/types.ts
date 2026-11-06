@@ -951,6 +951,112 @@ export interface AlgorithmDto {
   accepts_extra_params: boolean;
 }
 
+// ── Immutable audit ledger: every change is a new version ─────────────
+
+/** Things that keep a full version history. Nothing here is ever overwritten or erased. */
+export type VersionedKind = 'strategy' | 'estimator' | 'recipe' | 'dataset' | 'model' | 'automation' | 'notebook';
+
+export interface VersionDto {
+  /** Position in the global ledger (1, 2, 3...). */
+  seq: number;
+  kind: VersionedKind;
+  /** Strategy path, estimator/recipe/dataset name, model id, automation id, notebook path. */
+  object_id: string;
+  /** 1, 2, 3... within this object. */
+  version: number;
+  /** "external" = the file was changed outside APEX and was picked up as a new version. */
+  action: 'create' | 'update' | 'delete' | 'restore' | 'external';
+  actor: ActivityActor | 'external';
+  ts: string;
+  /** SHA-256 of the content; null for a delete marker. */
+  content_hash: string | null;
+  size: number;
+  /** True when the ledger holds the content itself. Very large files (datasets) keep only their hash, and the file on disk is write-once. */
+  retained: boolean;
+  parent_version: number | null;
+  /** Set for action "restore": the older version whose content was brought back as this new one. */
+  restored_from: number | null;
+  summary: string;
+  /** Hash of this record, which includes prev_hash: changing any earlier record breaks every later one. */
+  hash: string;
+  prev_hash: string;
+}
+
+export interface VersionContentDto {
+  record: VersionDto;
+  /** The content as text; null when it is binary or deleted. */
+  text: string | null;
+  /** True when the text was cut for display (the stored copy is complete). */
+  truncated: boolean;
+  binary: boolean;
+}
+
+export interface VersionedObjectDto {
+  kind: VersionedKind;
+  object_id: string;
+  head_version: number;
+  /** The current state is a delete marker. The history is still readable and the object can be restored. */
+  deleted: boolean;
+  versions: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LedgerProblemDto {
+  /** "record_hash" | "chain_link" | "blob_missing" | "blob_hash" | "stream_hash" | "stream_link" | "parse" */
+  kind: string;
+  where: string;
+  detail: string;
+}
+
+export interface LedgerVerifyDto {
+  ok: boolean;
+  checked_records: number;
+  checked_blobs: number;
+  checked_events: number;
+  problems: LedgerProblemDto[];
+  head_hash: string | null;
+  verified_at: string;
+}
+
+export interface LedgerStatusDto {
+  /** null = not verified since the app started. */
+  ok: boolean | null;
+  records: number;
+  objects: number;
+  head_hash: string | null;
+  last_verified_at: string | null;
+  /** Latest hash of each event stream ("activity", "orders"): copy these somewhere safe to detect later rewrites. */
+  stream_heads: Record<string, string | null>;
+}
+
+export interface OrderSourceDto {
+  /** "manual" | "copilot" | "automation" | "strategy" | "kill_switch" */
+  kind: string;
+  /** Automation id, strategy path, copilot turn id. */
+  id: string;
+  /** Exact version of the automation / strategy / model that produced the order. */
+  version: number | null;
+  /** Content hash of that version, so the exact code can be fetched from the ledger. */
+  hash: string | null;
+  /** Model version that produced the signal, when one did. */
+  model_id?: string | null;
+}
+
+export interface OrderEventDto {
+  seq: number;
+  ts: string;
+  order_id: string;
+  broker_id: string;
+  /** "submitted" | "risk_accepted" | "risk_rejected" | "broker_ack" | "status" | "fill" | "cancel_requested" | "cancelled" | "modified" | "rejected" | "kill_switch" | "live_armed" | "live_disarmed" */
+  event: string;
+  actor: string;
+  source: OrderSourceDto | null;
+  data: Record<string, unknown>;
+  hash: string;
+  prev_hash: string;
+}
+
 // ── Algorithm recipes: build an algorithm from parts, no code ─────────
 
 /** One preprocessing step, e.g. {kind: "standard_scaler", params: {}}. See recipeBuildingBlocks. */

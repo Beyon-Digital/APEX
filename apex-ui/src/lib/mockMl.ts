@@ -13,7 +13,12 @@ import type {
   DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, MLModelDto, MLTrainingRequestDto, ModelDetailDto,
   ModelSignalHistoryDto, AlgorithmDto, EstimatorFileDto, ExpressionCheckDto, ParamDefDto, SymbolDataDto,
   BuildingBlocksDto, RecipeCheckDto, RecipeDto, RecipeIssueDto, StepKindDto,
+  VersionedKind,
 } from './types';
+import {
+  applyToWorkingCopy, ledgerAppendEvent, ledgerContent, ledgerHistoryOf, ledgerHooks, ledgerListOrderEvents, ledgerObjectList,
+  ledgerPut, ledgerRestoreVersion, ledgerStatusNow, ledgerTombstone, ledgerVerifyNow, registerLedgerApplier,
+} from './mockLedger';
 
 export const ARTIFACT_EVENT = 'apex:artifacts-changed';
 export const ACTIVITY_EVENT = 'apex:activity-added';
@@ -35,6 +40,7 @@ export function recordMockActivity(
     target_id: targetId, summary, ok, details,
   };
   activity.unshift(entry);
+  ledgerAppendEvent('activity', { ...entry });
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent(ACTIVITY_EVENT, { detail: entry }));
     if (ok && (kind === 'strategy' || kind === 'model' || kind === 'automation' || kind === 'dataset')) {
@@ -43,6 +49,21 @@ export function recordMockActivity(
     }
   }
   return entry;
+}
+
+/* ----- immutable audit ledger: what each mock store records, and how a restore reaches it ----- */
+
+const withoutTimes = <T extends object>(o: T, keys: string[]): Record<string, unknown> =>
+  Object.fromEntries(Object.entries(o).filter(([k]) => !keys.includes(k)));
+/** Recipe text kept in the ledger. Timestamps are left out so saving an unchanged recipe is a no-op. */
+const recipeText = (r: RecipeDto) => JSON.stringify(withoutTimes(r, ['created_at', 'updated_at']), null, 2);
+const datasetText = (d: DatasetInfoDto) => JSON.stringify(withoutTimes(d, ['created_at']), null, 2);
+const modelText = (d: ModelDetailDto) => JSON.stringify(withoutTimes(d, ['used_by']), null, 2);
+const ledgerActivityKind = (kind: VersionedKind): ActivityDto['kind'] =>
+  (kind === 'strategy' || kind === 'model' || kind === 'automation' || kind === 'dataset') ? kind : 'system';
+
+export function recordModelVersion(d: ModelDetailDto, actor: ActivityActor, summary: string): void {
+  ledgerPut('model', d.model_id, modelText(d), actor, summary);
 }
 
 export const MOCK_FEATURES: FeatureDefDto[] = [
@@ -122,6 +143,7 @@ export function createMockModel(req: Partial<MLTrainingRequestDto>, actor: Activ
     recipe: req.algorithm === 'recipe' && req.recipe ? (recipes.get(req.recipe) ?? null) : null,
   };
   details.set(id, detail);
+  recordModelVersion(detail, actor, `Trained ${detail.algorithm}`);
   recordMockActivity(actor, 'model.train', 'model', id, `Trained ${detail.algorithm} on ${detail.dataset ?? detail.data_path}`);
   return detail;
 }
@@ -375,10 +397,15 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
       if (!content.includes('def make_estimator')) throw new Error('The file must define make_estimator(params) returning a scikit-learn style classifier');
       const file: EstimatorFileDto = { name, path: `estimators/${name}`, content, updated_at: new Date().toISOString() };
       estimators.set(name, file);
+      ledgerPut('estimator', name, content, 'user', `Saved estimator ${name}`);
       recordMockActivity('user', 'estimator.save', 'system', name, `Saved estimator ${name}`);
       return file;
     }
-    case 'delete_estimator_file': return estimators.delete(String(args?.name));
+    case 'delete_estimator_file': {
+      const had = estimators.delete(String(args?.name));
+      if (had) ledgerTombstone('estimator', String(args?.name), 'user', `Deleted estimator ${String(args?.name)}`);
+      return had;
+    }
     case 'recipe_building_blocks': return MOCK_BLOCKS;
     case 'list_recipes': return [...recipes.values()].sort((a, b) => a.name.localeCompare(b.name));
     case 'validate_recipe': return checkMockRecipe(args?.recipe as RecipeDto);
@@ -389,11 +416,13 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
       const now = new Date().toISOString();
       const saved: RecipeDto = { ...r, created_at: recipes.get(r.name)?.created_at ?? now, updated_at: now };
       recipes.set(r.name, saved);
+      ledgerPut('recipe', r.name, recipeText(saved), 'user', `Saved algorithm ${r.label || r.name}`);
       recordMockActivity('user', 'recipe.save', 'system', r.name, `Saved algorithm ${r.label || r.name}`);
       return saved;
     }
     case 'delete_recipe': {
       const had = recipes.delete(String(args?.name));
+      if (had) ledgerTombstone('recipe', String(args?.name), 'user', `Deleted algorithm ${String(args?.name)}`);
       if (had) recordMockActivity('user', 'recipe.delete', 'system', String(args?.name), `Deleted algorithm ${String(args?.name)}`);
       return had;
     }
@@ -415,6 +444,8 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
       mockBuildHook(r, info); // test hook, see the end of this file
       const i = datasets.findIndex((d) => d.name === r.name);
       if (i >= 0) datasets[i] = info; else datasets.push(info);
+      // Names containing "huge" stand for very large write-once files: the ledger keeps only the hash.
+      ledgerPut('dataset', r.name, datasetText(info), 'user', `Built dataset ${r.name} (${rows} rows)`, { reference: r.name.includes('huge') });
       recordMockActivity('user', 'dataset.build', 'dataset', r.name, `Built dataset ${r.name} (${rows} rows)`);
       return info;
     }
@@ -428,7 +459,7 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
     }
     case 'delete_dataset': {
       const i = datasets.findIndex((d) => d.name === args?.name);
-      if (i >= 0) { datasets.splice(i, 1); recordMockActivity('user', 'dataset.delete', 'dataset', String(args?.name), `Deleted dataset ${String(args?.name)}`); }
+      if (i >= 0) { datasets.splice(i, 1); ledgerTombstone('dataset', String(args?.name), 'user', `Deleted dataset ${String(args?.name)}`); recordMockActivity('user', 'dataset.delete', 'dataset', String(args?.name), `Deleted dataset ${String(args?.name)}`); }
       return i >= 0;
     }
     case 'list_ml_models': return [...details.values()].map(toSummary).sort((a, b) => b.created_at.localeCompare(a.created_at));
@@ -444,6 +475,7 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
     case 'delete_ml_model': {
       const id = String(args?.modelId);
       const had = details.delete(id);
+      if (had) ledgerTombstone('model', id, 'user', `Deleted model ${id}`);
       if (had) recordMockActivity('user', 'model.delete', 'model', id, `Deleted model ${id}`);
       return had;
     }
@@ -458,6 +490,7 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
       if (typeof args?.displayName === 'string') d.display_name = args.displayName.trim().slice(0, 80);
       if (typeof args?.notes === 'string') d.notes = args.notes.slice(0, 4000);
       if (Array.isArray(args?.tags)) d.tags = (args.tags as string[]).map((t) => t.trim()).filter(Boolean).slice(0, 12);
+      recordModelVersion(d, 'user', `Edited details of ${d.display_name || d.model_id}`);
       recordMockActivity('user', 'model.update', 'model', d.model_id, `Edited details of ${d.display_name || d.model_id}`);
       return { ...d, used_by: mockUsage(d.model_id, automations()) };
     }
@@ -473,9 +506,49 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
       }));
       return { model_id: id, symbol: String(args?.symbol), points } as ModelSignalHistoryDto;
     }
+    case 'ledger_history': return ledgerHistoryOf(args?.kind as VersionedKind, String(args?.id));
+    case 'ledger_version': return ledgerContent(args?.kind as VersionedKind, String(args?.id), Number(args?.version));
+    case 'ledger_objects': return ledgerObjectList(args?.kind as VersionedKind, args?.includeDeleted !== false);
+    case 'ledger_restore': {
+      const kind = args?.kind as VersionedKind;
+      const id = String(args?.id);
+      const version = Number(args?.version);
+      const { record, text } = ledgerRestoreVersion(kind, id, version, 'user');
+      applyToWorkingCopy(kind, id, text);
+      recordMockActivity('user', `${kind}.restore`, ledgerActivityKind(kind), id, `Restored version ${version} of ${id} as version ${record.version}`);
+      return record;
+    }
+    // Takes a moment so the UI's progress state can be seen.
+    case 'ledger_verify': return new Promise((resolve) => { setTimeout(() => resolve(ledgerVerifyNow()), 250); });
+    case 'ledger_status': return ledgerStatusNow();
+    case 'list_order_events': {
+      return ledgerListOrderEvents({ orderId: args?.orderId as string | undefined, brokerId: args?.brokerId as string | undefined, limit: args?.limit as number | undefined });
+    }
     default: return undefined;
   }
 }
+
+registerLedgerApplier('estimator', (id, text) => {
+  estimators.set(id, { name: id, path: `estimators/${id}`, content: text, updated_at: new Date().toISOString() });
+});
+registerLedgerApplier('recipe', (id, text) => {
+  const parsed = JSON.parse(text) as RecipeDto;
+  const now = new Date().toISOString();
+  recipes.set(id, { ...parsed, created_at: recipes.get(id)?.created_at ?? now, updated_at: now });
+});
+registerLedgerApplier('dataset', (id, text) => {
+  const parsed = JSON.parse(text) as DatasetInfoDto;
+  const i = datasets.findIndex((d) => d.name === id);
+  const next: DatasetInfoDto = { ...parsed, created_at: datasets[i]?.created_at ?? new Date().toISOString() };
+  if (i >= 0) datasets[i] = next; else datasets.push(next);
+});
+registerLedgerApplier('model', (id, text) => {
+  const parsed = JSON.parse(text) as ModelDetailDto;
+  const current = details.get(id);
+  // The ledger keeps the model's editable details and its existence; a live model only takes the details back.
+  if (current) Object.assign(current, { display_name: parsed.display_name, notes: parsed.notes, tags: parsed.tags });
+  else details.set(id, { ...parsed, used_by: [] });
+});
 
 if (typeof window !== 'undefined') {
   (window as unknown as { __apexMock?: unknown }).__apexMock = {
@@ -494,10 +567,13 @@ if (typeof window !== 'undefined') {
       const d = details.get(modelId);
       if (!d) throw new Error(`Unknown model ${modelId}`);
       Object.assign(d, patch);
+      recordModelVersion(d, 'copilot', `Edited details of ${d.display_name || modelId}`);
       recordMockActivity('copilot', 'model.update', 'model', modelId, `Edited details of ${d.display_name || modelId}`);
     },
     recordActivity: recordMockActivity,
     activity: mockActivity,
+    /** Immutable audit ledger test hooks: tamper, externalEdit, put, history, verify ... (see mockLedger.ts). */
+    ledger: ledgerHooks,
     /** Put a recipe straight into the mock store, skipping validation (so specs can seed one the backend would reject). */
     seedRecipe: (recipe: RecipeDto) => { recipes.set(recipe.name, recipe); },
   };

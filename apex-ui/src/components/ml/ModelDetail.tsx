@@ -20,6 +20,7 @@ import {
 } from './modelUtils';
 import type { RecipeStatus, ShortingContext } from './modelUtils';
 import { RecipeSummary } from './RecipeSummary';
+import { VersionHistory } from '../audit/VersionHistory';
 
 export interface ModelPatch {
   displayName?: string;
@@ -583,7 +584,8 @@ export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetr
           <NameEditor key={detail.model_id} detail={detail} onSave={onSave} />
           <div className="flex shrink-0 items-center gap-1">
             <button type="button" className={accentBtn} onClick={() => void startRetrain()} data-testid="model-retrain" title="Open the Train tab with these settings">Retrain with these settings</button>
-            <button type="button" className={`${btnCls} hover:text-bear`} onClick={() => onDelete(detail)} data-testid="model-delete">Delete</button>
+            <button type="button" className={`${btnCls} hover:text-bear`} onClick={() => onDelete(detail)} data-testid="model-delete" title="The model leaves the list; its history is kept and it can be restored">Delete (history is kept)</button>
+            <VersionHistory kind="model" id={detail.model_id} onRestored={onChanged} className={btnCls} />
             <button type="button" className={btnCls} onClick={onClose} aria-label="Close detail" data-testid="model-detail-close">×</button>
           </div>
         </div>

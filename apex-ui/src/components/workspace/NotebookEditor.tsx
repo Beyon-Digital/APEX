@@ -12,6 +12,8 @@ import type {
   NotebookDocumentDto,
   NotebookSummaryDto,
 } from '../../lib/types';
+import { DeletedObjects } from '../audit/DeletedObjects';
+import { VersionHistory } from '../audit/VersionHistory';
 
 const DEFAULT_NOTEBOOK_PATH = 'research.apexnb.json';
 
@@ -238,6 +240,7 @@ export const NotebookEditor: React.FC = () => {
             );
           })}
         </div>
+        <DeletedObjects kind="notebook" onRestored={() => void refreshNotebookList()} />
       </aside>
 
       <div className="flex-1 flex flex-col overflow-hidden">
@@ -277,6 +280,13 @@ export const NotebookEditor: React.FC = () => {
             >
               {saving ? 'Saving…' : 'Save Notebook'}
             </button>
+            {activeNotebook && (
+              <VersionHistory
+                kind="notebook" id={activeNotebook.path}
+                onRestored={() => { void refreshNotebookList(); void openNotebook(activeNotebook.path); setNotice('Restored as a new version. Nothing was overwritten.'); }}
+                className="rounded border border-[var(--border-color)] bg-surface-0 px-3 py-2 text-xs hover:bg-surface-2"
+              />
+            )}
           </div>
         </div>
 

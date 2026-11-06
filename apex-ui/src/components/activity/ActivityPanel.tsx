@@ -4,6 +4,8 @@ import { useArtifactStore } from '../../stores/artifactStore';
 import { openItem, useNavStore } from '../../stores/navStore';
 import type { NavKind } from '../../stores/navStore';
 import type { ActivityActor, ActivityDto } from '../../lib/types';
+import { LedgerBadge, IntegrityView } from '../audit/LedgerBadge';
+import { OrderTimeline } from '../audit/OrderTimeline';
 import { FETCH_LIMIT, ACTOR_LABEL, ACTOR_TONE, actionLabel, activityToCsv, formatDetails } from './activityUtils';
 
 const NAV_KINDS: Record<string, NavKind> = { strategy: 'strategy', model: 'model', automation: 'automation', dataset: 'dataset' };
@@ -15,6 +17,13 @@ const DATE_PRESETS = [
   { id: 'week', label: 'Last 7 days', ms: 7 * 86_400_000 },
 ];
 
+type View = 'activity' | 'orders' | 'integrity';
+const VIEWS: { id: View; label: string }[] = [
+  { id: 'activity', label: 'Activity' },
+  { id: 'orders', label: 'Orders' },
+  { id: 'integrity', label: 'Integrity' },
+];
+
 const selectCls = 'border border-[var(--border-color)] bg-surface-0 px-1.5 py-1 text-[11px] text-text-primary focus:border-accent focus:outline-none';
 const btnCls = 'border border-[var(--border-color)] bg-surface-2 px-2 py-1 text-[11px] font-mono text-text-secondary hover:text-text-primary disabled:opacity-40';
 
@@ -23,6 +32,7 @@ export const ActivityPanel: React.FC = () => {
   const request = useNavStore((s) => s.request);
   const clearRequest = useNavStore((s) => s.clear);
 
+  const [view, setView] = useState<View>('activity');
   const [entries, setEntries] = useState<ActivityDto[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -98,6 +108,23 @@ export const ActivityPanel: React.FC = () => {
 
   return (
     <div className="flex h-full min-h-0 flex-col text-xs" data-testid="activity-panel">
+      <div className="flex flex-wrap items-center gap-2 border-b border-[var(--border-color)] bg-surface-1 px-2 py-1" data-testid="activity-views">
+        <div role="tablist" aria-label="Activity views" className="flex gap-1">
+          {VIEWS.map((v) => (
+            <button
+              key={v.id} type="button" role="tab" aria-selected={view === v.id} onClick={() => setView(v.id)} data-testid={`activity-view-${v.id}`}
+              className={`border px-2 py-0.5 font-mono text-[11px] ${view === v.id ? 'border-accent bg-accent/10 text-accent' : 'border-[var(--border-color)] bg-surface-2 text-text-secondary hover:text-text-primary'}`}
+            >
+              {v.label}
+            </button>
+          ))}
+        </div>
+        <span className="flex-1" />
+        <LedgerBadge onOpen={() => setView('integrity')} />
+      </div>
+      {view === 'orders' && <OrderTimeline />}
+      {view === 'integrity' && <div className="min-h-0 flex-1 overflow-auto"><IntegrityView /></div>}
+      {view === 'activity' && (<>
       <div className="flex flex-wrap items-center gap-1.5 border-b border-[var(--border-color)] bg-surface-1 px-2 py-1.5">
         <input className={`${selectCls} min-w-[8rem] flex-1`} placeholder="Search summary, target, details" aria-label="Search activity" value={query} onChange={(e) => setQuery(e.target.value)} data-testid="activity-search" />
         <select className={selectCls} value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Filter by kind" data-testid="activity-filter-kind">
@@ -196,6 +223,7 @@ export const ActivityPanel: React.FC = () => {
           })}
         </ul>
       </div>
+      </>)}
     </div>
   );
 };

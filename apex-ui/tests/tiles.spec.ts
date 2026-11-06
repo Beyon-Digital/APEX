@@ -60,4 +60,23 @@ test.describe('Tiled workspace', () => {
     await page.getByTestId('watchlist-item-TCS.NS').locator('td').first().click();
     await expect(page.getByTestId('tile-chart')).toBeVisible();
   });
+
+  test('every tile is a labelled group with collapse, maximize and close buttons', async ({ page }) => {
+    for (const [id, title] of [['watchlist', 'Watchlist'], ['chart', 'Chart'], ['orders', 'Order Ticket']]) {
+      await expect(page.getByRole('group', { name: title, exact: true })).toBeVisible();
+      await expect(page.getByTestId(`tile-collapse-${id}`)).toHaveAttribute('aria-expanded', 'true');
+      await expect(page.getByTestId(`tile-maximize-${id}`)).toBeVisible();
+      await expect(page.getByTestId(`tile-close-${id}`)).toBeVisible();
+    }
+  });
+
+  test('a collapsed tile still closes and reopens from the panel menu', async ({ page }) => {
+    await page.getByTestId('tile-collapse-alerts').click();
+    await expect(page.getByTestId('tile-alerts')).toHaveAttribute('data-collapsed', 'true');
+    await page.getByTestId('tile-close-alerts').click();
+    await expect(page.getByTestId('tile-alerts')).toHaveCount(0);
+    await page.getByTestId('tiles-add-menu').click();
+    await page.getByTestId('tiles-add-alerts').click();
+    await expect(page.getByTestId('tile-alerts')).toBeVisible();
+  });
 });

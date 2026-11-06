@@ -18,6 +18,8 @@ import { useBrokerStore } from '../../stores/brokerStore';
 import { touchedKey, useArtifactStore } from '../../stores/artifactStore';
 import { useNavStore } from '../../stores/navStore';
 import { SymbolField } from '../common/SymbolField';
+import { VersionHistory } from '../audit/VersionHistory';
+import { DeletedObjects } from '../audit/DeletedObjects';
 
 type EditorInstance = editor.IStandaloneCodeEditor;
 
@@ -796,6 +798,10 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
             ))}
           </div>
 
+          <div className="shrink-0 border-t border-[var(--border-color)] px-2 py-1.5">
+            <DeletedObjects kind="strategy" />
+          </div>
+
           {/* Live metrics */}
           {metrics && (
             <div className="border-t border-[var(--border-color)] px-2 py-2 space-y-1">
@@ -831,7 +837,10 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
               <div className="truncate text-xs font-medium text-text-primary">{activeFile?.name ?? 'Choose a strategy'}</div>
               <div className="truncate text-[11px] text-text-muted">{activeFile?.path ?? 'Create or select a file to begin'}</div>
             </div>
-            <span className="shrink-0 text-xs text-text-muted">Python</span>
+            <div className="flex shrink-0 items-center gap-2">
+              {activeFile && <VersionHistory kind="strategy" id={activeFile.path} buttonLabel="History" className="rounded border border-[var(--border-color)] px-2 py-0.5 text-xs text-text-secondary hover:bg-surface-2" />}
+              <span className="text-xs text-text-muted">Python</span>
+            </div>
           </div>
 
           <details className="shrink-0 border-b border-[var(--border-color)] bg-surface-1/70" data-testid="strategy-backtest-panel">

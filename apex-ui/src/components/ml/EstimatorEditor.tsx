@@ -1,5 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { estimatorTemplate } from '../../lib/tauri';
+import { estimatorTemplate, ledgerVersion } from '../../lib/tauri';
+import type { VersionDto } from '../../lib/types';
+import { DeletedObjects } from '../audit/DeletedObjects';
+import { VersionHistory } from '../audit/VersionHistory';
 import { useMLStore } from '../../stores/mlStore';
 
 const inputCls =
@@ -83,6 +86,18 @@ export const EstimatorEditor: React.FC = () => {
     setNotice(`Saved ${result.file.name} and selected it for training.`);
   };
 
+  // A restore added a new version: show that content if this file is the one open in the editor.
+  const restored = async (record: VersionDto) => {
+    await refresh();
+    if (record.object_id !== withExtension(name)) return;
+    try {
+      const v = await ledgerVersion('estimator', record.object_id, record.version);
+      if (v.text !== null) { setContent(v.text); setError(null); setNotice(`Restored as version ${record.version}.`); }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const remove = async (fileName: string) => {
     setBusy(true);
     const err = await removeEstimator(fileName);
@@ -114,21 +129,22 @@ export const EstimatorEditor: React.FC = () => {
                   <div className="truncate font-mono text-xs text-text-primary">{f.name}</div>
                   {confirmDelete === f.name ? (
                     <div className="flex items-center gap-1 text-[11px]">
-                      <span className="text-bear">Delete?</span>
+                      <span className="text-bear" title="The file leaves the list, but every version stays in the history and it can be restored.">Delete (history is kept)?</span>
                       <button type="button" className="font-mono text-bear hover:underline" onClick={() => void remove(f.name)} disabled={busy} data-testid={`ml-est-delete-confirm-${f.name}`}>yes</button>
                       <button type="button" className="font-mono text-text-secondary hover:underline" onClick={() => setConfirmDelete(null)} data-testid={`ml-est-delete-cancel-${f.name}`}>no</button>
                     </div>
                   ) : (
-                    <div className="flex gap-2 text-[10px] font-mono text-accent">
+                    <div className="flex flex-wrap gap-x-2 text-[10px] font-mono text-accent">
                       <button type="button" className="hover:underline" onClick={() => open(f.name)} data-testid={`ml-est-open-${f.name}`}>edit</button>
                       <button type="button" className="hover:underline" onClick={() => patch({ estimatorFile: f.name })} disabled={selected === f.name} data-testid={`ml-est-use-${f.name}`}>{selected === f.name ? 'in use' : 'use'}</button>
-                      <button type="button" className="text-bear hover:underline" onClick={() => setConfirmDelete(f.name)} data-testid={`ml-est-delete-${f.name}`}>delete</button>
+                      <button type="button" className="text-bear hover:underline" onClick={() => setConfirmDelete(f.name)} data-testid={`ml-est-delete-${f.name}`} title="History is kept; the file can be restored later">delete (history is kept)</button>
                     </div>
                   )}
                 </li>
               ))}
             </ul>
           )}
+          <DeletedObjects kind="estimator" onRestored={() => void refresh()} />
           <div className="text-[11px] text-text-muted" data-testid="ml-est-selected">
             {selected ? <>Training with <span className="font-mono text-text-primary">{selected}</span></> : 'No file selected for training.'}
           </div>
@@ -140,6 +156,7 @@ export const EstimatorEditor: React.FC = () => {
             <input id="ml-est-name" className={`${inputCls} w-48 font-mono`} value={name} onChange={(e) => setName(e.target.value)} placeholder="my_model.py" data-testid="ml-est-name" />
             <button type="button" className={btnCls} onClick={() => void newFromTemplate()} data-testid="ml-est-new">New from template</button>
             <button type="button" className={primaryBtnCls} onClick={() => void save()} disabled={busy || content.trim() === ''} data-testid="ml-est-save">Save</button>
+            {files.some((f) => f.name === withExtension(name)) && <VersionHistory kind="estimator" id={withExtension(name)} onRestored={(r) => void restored(r)} className={btnCls} />}
           </div>
           <textarea
             className={`${inputCls} block h-56 w-full resize-y font-mono leading-snug`} spellCheck={false} wrap="off"

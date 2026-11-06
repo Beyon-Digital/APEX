@@ -14,6 +14,8 @@ import { touchedKey, useArtifactStore } from '../../stores/artifactStore';
 import { useBrokerStore } from '../../stores/brokerStore';
 import { openItem, useNavStore } from '../../stores/navStore';
 import { useOrderStore } from '../../stores/orderStore';
+import { DeletedObjects } from '../audit/DeletedObjects';
+import { VersionHistory } from '../audit/VersionHistory';
 
 const POLL_MS = 5000;
 
@@ -361,14 +363,20 @@ export const AutomationsPanel: React.FC = () => {
                     onClick={() => void remove(r.id)}
                     className="px-2 py-0.5 text-[10px] font-mono rounded border border-bear/40 text-bear hover:bg-bear/10"
                     data-testid="automation-delete"
+                    title="The rule stops and leaves the list. Its history is kept and it can be restored."
                   >
-                    Delete
+                    Delete (history is kept)
                   </button>
+                  <VersionHistory
+                    kind="automation" id={r.id} testId={`audit-history-open-automation-${r.id}`} onRestored={() => void refresh()}
+                    className="px-2 py-0.5 text-[10px] font-mono rounded border border-[var(--border-color)] text-text-secondary hover:border-accent hover:text-accent"
+                  />
                 </div>
               </div>
             </div>
           ))
         )}
+        <div className="px-3 pb-3"><DeletedObjects kind="automation" onRestored={() => void refresh()} /></div>
       </div>
     </div>
   );

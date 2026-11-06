@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMLStore, isBuilderDirty, RECIPE_ALGORITHM_ID } from '../../stores/mlStore';
-import { saveRecipe, validateRecipe } from '../../lib/tauri';
-import type { BuildingBlocksDto, RecipeCheckDto, RecipeDto } from '../../lib/types';
+import { ledgerVersion, saveRecipe, validateRecipe } from '../../lib/tauri';
+import { DeletedObjects } from '../audit/DeletedObjects';
+import { VersionHistory } from '../audit/VersionHistory';
+import type { BuildingBlocksDto, RecipeCheckDto, RecipeDto, VersionDto } from '../../lib/types';
 import { btnCls, CardIssues, inputCls, MemberEditor } from './MemberEditor';
 import { RecipeDiagram } from './RecipeDiagram';
 import {
@@ -242,6 +244,17 @@ const BuilderBody: React.FC<BodyProps> = ({ builder, blocks, algorithms }) => {
     const error = await removeRecipe(savedName);
     if (error) { setMessage({ ok: false, text: error }); setConfirm(null); } else closeBuilder();
     setBusy(null);
+  };
+
+  // A restore added a new version of a recipe: reload the list and show that version in the builder.
+  const restoredRecipe = async (record: VersionDto) => {
+    try {
+      const v = await ledgerVersion('recipe', record.object_id, record.version);
+      await refreshRecipes();
+      if (v.text !== null) { openBuilder(JSON.parse(v.text) as RecipeDto, record.object_id); setMessage({ ok: true, text: `Restored "${record.object_id}" as version ${record.version}.` }); }
+    } catch (err) {
+      setMessage({ ok: false, text: errorText(err) });
+    }
   };
 
   const needsSave = dirty || savedName === null;
@@ -529,10 +542,13 @@ const BuilderBody: React.FC<BodyProps> = ({ builder, blocks, algorithms }) => {
         )}
         <button type="button" className={btnCls} onClick={() => void trainWith()} disabled={busyAny || (needsSave ? !canSave : false)} data-testid="rb-train-with">Train with this</button>
         {savedName !== null && (
-          <button type="button" className={`${btnCls} text-bear`} onClick={() => setConfirm('delete')} disabled={busyAny} data-testid="rb-delete">Delete</button>
+          <button type="button" className={`${btnCls} text-bear`} onClick={() => setConfirm('delete')} disabled={busyAny} data-testid="rb-delete" title="The algorithm leaves the list; its history is kept and it can be restored">Delete (history is kept)</button>
         )}
+        {savedName !== null && <VersionHistory kind="recipe" id={savedName} onRestored={(r) => void restoredRecipe(r)} className={btnCls} />}
         <button type="button" className={btnCls} onClick={discard} disabled={busy === 'save' || busy === 'train'} data-testid="rb-discard">{dirty ? 'Discard changes' : 'Close'}</button>
       </div>
+
+      <DeletedObjects kind="recipe" onRestored={() => void refreshRecipes()} />
 
       {confirm === 'copy' && (
         <div className="space-y-1 border border-[var(--border-color)] bg-surface-1 p-2" data-testid="rb-copy-bar">
@@ -552,8 +568,8 @@ const BuilderBody: React.FC<BodyProps> = ({ builder, blocks, algorithms }) => {
       )}
       {confirm === 'delete' && (
         <div className="flex flex-wrap items-center gap-2 border border-bear/40 bg-bear/10 px-2 py-1 text-xs text-bear" data-testid="rb-delete-bar" role="alertdialog" aria-label="Confirm delete">
-          Delete &quot;{savedName}&quot;? Models already trained with it keep working.
-          <button type="button" className={btnCls} onClick={() => void doDelete()} disabled={busy === 'delete'} data-testid="rb-delete-confirm">Delete</button>
+          Delete &quot;{savedName}&quot;? Its history is kept and it can be restored. Models already trained with it keep working.
+          <button type="button" className={btnCls} onClick={() => void doDelete()} disabled={busy === 'delete'} data-testid="rb-delete-confirm">Delete (history is kept)</button>
           <button type="button" className={btnCls} onClick={() => setConfirm(null)} data-testid="rb-delete-cancel">Cancel</button>
         </div>
       )}

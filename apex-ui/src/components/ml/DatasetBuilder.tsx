@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { buildDataset, deleteDataset, previewDataset } from '../../lib/tauri';
+import { DeletedObjects } from '../audit/DeletedObjects';
+import { VersionHistory } from '../audit/VersionHistory';
 import { useMLStore } from '../../stores/mlStore';
 import type { BuildDatasetRequestDto, DatasetInfoDto, DatasetPreviewDto, LabelSpecDto } from '../../lib/types';
 import { CustomFeatureEditor } from './CustomFeatureEditor';
@@ -686,18 +688,20 @@ export const DatasetBuilder: React.FC<DatasetBuilderProps> = ({ focusDataset, on
               <button type="button" className={btnCls} onClick={() => void showDataset(d.name)} data-testid={`ml-ds-preview-${d.name}`}>Preview</button>
               <button type="button" className={btnCls} onClick={() => duplicateSettings(d)} data-testid={`ml-ds-duplicate-${d.name}`}>Duplicate settings</button>
               <button type="button" className={btnCls} onClick={() => onUseForTraining(d.name)} data-testid={`ml-ds-train-${d.name}`}>Train</button>
+              <VersionHistory kind="dataset" id={d.name} testId={`audit-history-open-dataset-${d.name}`} onRestored={() => void refreshDatasets()} className={btnCls} />
               {confirmDelete === d.name ? (
                 <>
-                  <span className="text-bear">Delete {d.name}?</span>
-                  <button type="button" className={`${btnCls} text-bear`} onClick={() => void remove(d.name)} data-testid={`ml-ds-delete-confirm-${d.name}`}>Delete</button>
+                  <span className="text-bear">Delete {d.name}? Its history is kept and it can be restored.</span>
+                  <button type="button" className={`${btnCls} text-bear`} onClick={() => void remove(d.name)} data-testid={`ml-ds-delete-confirm-${d.name}`}>Delete (history is kept)</button>
                   <button type="button" className={btnCls} onClick={() => setConfirmDelete(null)} data-testid={`ml-ds-delete-cancel-${d.name}`}>Cancel</button>
                 </>
               ) : (
-                <button type="button" className={`${btnCls} hover:text-bear`} onClick={() => setConfirmDelete(d.name)} data-testid={`ml-ds-delete-${d.name}`}>Delete</button>
+                <button type="button" className={`${btnCls} hover:text-bear`} onClick={() => setConfirmDelete(d.name)} data-testid={`ml-ds-delete-${d.name}`} title="The dataset leaves the list; its history is kept and it can be restored">Delete (history is kept)</button>
               )}
             </div>
           );
         })}
+        <DeletedObjects kind="dataset" onRestored={() => void refreshDatasets()} />
       </section>
     </div>
   );

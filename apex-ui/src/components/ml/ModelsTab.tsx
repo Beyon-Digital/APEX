@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { deleteMLModel, getMlModel, listMLModels, updateMlModel } from '../../lib/tauri';
 import { touchedKey, useArtifactStore } from '../../stores/artifactStore';
 import type { MLModelDto, ModelDetailDto } from '../../lib/types';
+import { DeletedObjects } from '../audit/DeletedObjects';
 import { ModelCompare } from './ModelCompare';
 import { ModelDetail, SourceBadge } from './ModelDetail';
 import type { ModelPatch } from './ModelDetail';
@@ -242,8 +243,9 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({ initialModelId, onRetrain,
         <span className="flex-1" />
         {checked.length > 0 && <span className="text-text-secondary" data-testid="ml-models-selected-count">{checked.length} selected</span>}
         <button type="button" className={accentBtn} disabled={!canCompare} onClick={() => { setComparing(true); }} title={canCompare ? 'Compare side by side' : 'Tick 2 or 3 models to compare'} data-testid="ml-models-compare">Compare{checked.length ? ` (${checked.length})` : ''}</button>
-        <button type="button" className={`${btnCls} hover:text-bear`} disabled={checked.length === 0} onClick={() => void askDelete(checked.map((id) => details[id]).filter((d): d is ModelDetailDto => Boolean(d)))} data-testid="ml-models-bulk-delete">Delete selected</button>
+        <button type="button" className={`${btnCls} hover:text-bear`} disabled={checked.length === 0} onClick={() => void askDelete(checked.map((id) => details[id]).filter((d): d is ModelDetailDto => Boolean(d)))} data-testid="ml-models-bulk-delete" title="Deleted models keep their history and can be restored">Delete selected</button>
       </div>
+      <div className="border-b border-[var(--border-color)] px-2 py-1"><DeletedObjects kind="model" onRestored={() => void load()} /></div>
       {checked.length === 1 && <div className="px-2 py-1 text-[10px] text-text-muted" data-testid="ml-models-compare-hint">Tick one more model to compare (up to 3).</div>}
       {checked.length > 3 && <div className="px-2 py-1 text-[10px] text-text-muted" data-testid="ml-models-compare-hint">Comparison needs 2 or 3 models. Untick some to compare.</div>}
 
@@ -381,11 +383,11 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({ initialModelId, onRetrain,
             ) : (
               <p className="mt-3 text-[11px] text-text-muted" data-testid="ml-delete-no-usage">No automation uses {deleteTargets.length === 1 ? 'this model' : 'these models'}.</p>
             )}
-            <p className="mt-2 text-[10px] text-text-muted">The saved model file is removed. This cannot be undone.</p>
+            <p className="mt-2 text-[10px] text-text-muted" data-testid="ml-delete-history-note">The {deleteTargets.length === 1 ? 'model leaves' : 'models leave'} your list. Version history is kept, and {deleteTargets.length === 1 ? 'it' : 'they'} can be restored from Show deleted.</p>
             {deleteError && <p className="mt-2 text-[11px] text-bear" data-testid="ml-delete-error">{deleteError}</p>}
             <div className="mt-3 flex justify-end gap-2">
               <button type="button" className={btnCls} onClick={() => setDeleteTargets(null)} disabled={deleteBusy} data-testid="ml-delete-cancel">Cancel</button>
-              <button type="button" className="border border-bear/60 bg-bear/20 px-2 py-1 font-mono text-[11px] text-bear hover:bg-bear/30 disabled:opacity-50" onClick={() => void confirmDelete()} disabled={deleteBusy} data-testid="ml-delete-confirm">{deleteBusy ? 'Deleting…' : 'Delete'}</button>
+              <button type="button" className="border border-bear/60 bg-bear/20 px-2 py-1 font-mono text-[11px] text-bear hover:bg-bear/30 disabled:opacity-50" onClick={() => void confirmDelete()} disabled={deleteBusy} data-testid="ml-delete-confirm">{deleteBusy ? 'Deleting…' : 'Delete (history is kept)'}</button>
             </div>
           </div>
         </div>

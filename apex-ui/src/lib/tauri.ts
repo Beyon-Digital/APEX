@@ -1,5 +1,6 @@
-import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, StrategySessionInfoDto, ChatGptStatusDto, ChatGptModelDto, SymbolFeedDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto, ActivityDto, BuildDatasetRequestDto, DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, ModelDetailDto, ModelSignalHistoryDto, ExpressionCheckDto, SymbolDataDto, AlgorithmDto, EstimatorFileDto, RecipeDto, RecipeCheckDto, BuildingBlocksDto } from './types';
+import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, StrategySessionInfoDto, ChatGptStatusDto, ChatGptModelDto, SymbolFeedDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto, ActivityDto, BuildDatasetRequestDto, DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, ModelDetailDto, ModelSignalHistoryDto, ExpressionCheckDto, SymbolDataDto, AlgorithmDto, EstimatorFileDto, RecipeDto, RecipeCheckDto, BuildingBlocksDto, VersionedKind, VersionDto, VersionContentDto, VersionedObjectDto, LedgerVerifyDto, LedgerStatusDto, OrderEventDto, OrderSourceDto } from './types';
 import { handleMlMock, recordMockActivity } from './mockMl';
+import { ledgerHead, ledgerOrderEvent, ledgerPut, ledgerTombstone, registerLedgerApplier } from './mockLedger';
 
 const IS_TAURI = typeof window !== 'undefined' && '__TAURI__' in window;
 
@@ -54,6 +55,46 @@ let mockNotebooks: NotebookDocumentDto[] = [
   },
 ];
 let mockAutomations: AutomationDto[] = [];
+
+// Immutable audit ledger (mock): what is saved is recorded as versions. Volatile fields are left out so
+// saving an unchanged object is a no-op, as in the real ledger.
+const automationText = (a: AutomationDto): string =>
+  JSON.stringify(Object.fromEntries(Object.entries(a).filter(([k]) => !['last_run_at', 'last_result', 'orders_today'].includes(k))), null, 2);
+const notebookText = (n: NotebookDocumentDto): string => JSON.stringify({ title: n.title, path: n.path, cells: n.cells }, null, 2);
+// Files that already exist when the app starts are registered as version 1 (the real app does this on startup).
+for (const f of mockStrategyFiles) ledgerPut('strategy', f.path, f.content, 'system', 'Existing file registered');
+for (const n of mockNotebooks) ledgerPut('notebook', n.path, notebookText(n), 'system', 'Existing file registered');
+registerLedgerApplier('strategy', (path, text) => {
+  const name = path.split('/').pop() ?? 'strategy.py';
+  const next = { name, path, content: text };
+  mockStrategyFiles = mockStrategyFiles.some((f) => f.path === path)
+    ? mockStrategyFiles.map((f) => (f.path === path ? next : f))
+    : [...mockStrategyFiles, next];
+});
+registerLedgerApplier('automation', (id, text) => {
+  const parsed = JSON.parse(text) as AutomationDto;
+  const existing = mockAutomations.find((a) => a.id === id);
+  const next: AutomationDto = { ...parsed, last_run_at: existing?.last_run_at ?? null, last_result: existing?.last_result ?? null, orders_today: existing?.orders_today ?? 0 };
+  mockAutomations = existing ? mockAutomations.map((a) => (a.id === id ? next : a)) : [...mockAutomations, next];
+});
+registerLedgerApplier('notebook', (path, text) => {
+  const parsed = JSON.parse(text) as NotebookDocumentDto;
+  const next: NotebookDocumentDto = { ...parsed, updated_at: new Date().toISOString() };
+  mockNotebooks = mockNotebooks.some((n) => n.path === path) ? mockNotebooks.map((n) => (n.path === path ? next : n)) : [...mockNotebooks, next];
+});
+
+/** Who produced a mock order. Real orders carry this from the caller; the mock reads it from the order tag ("automation:<id>", "strategy:<path>", "copilot:<turn>"). */
+function mockOrderSource(tag: string | null | undefined): OrderSourceDto {
+  const [kind, ...rest] = (tag ?? '').split(':');
+  const id = rest.join(':');
+  if (kind === 'automation' || kind === 'strategy') {
+    const head = ledgerHead(kind, id);
+    return { kind, id, version: head?.version ?? null, hash: head?.content_hash ?? null };
+  }
+  if (kind === 'copilot') return { kind, id, version: null, hash: null };
+  return { kind: 'manual', id: '', version: null, hash: null };
+}
+const SOURCE_ACTOR: Record<string, string> = { manual: 'user', copilot: 'copilot', automation: 'automation', strategy: 'strategy', kill_switch: 'user' };
 const mockFeedPrefs = new Map<string, string>();
 let mockChatGpt: ChatGptStatusDto = { state: 'signed_out', email: null, plan_usage: false, message: null, use_for_copilot: false, model: null };
 // Browser mock: vault starts unlocked so web-mode specs are not gated.
@@ -382,6 +423,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
       allow_short: Boolean(req.allow_short),
     };
     mockAutomations.push(created);
+    ledgerPut('automation', created.id, automationText(created), 'user', `Created automation ${created.name}`);
     recordMockActivity('user', 'automation.create', 'automation', created.id, `Created automation ${created.name}`);
     return created as any;
   }
@@ -394,6 +436,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
       if (!broker?.can_short) throw new Error(`${rule.broker_id} cannot hold short positions`);
     }
     rule.allow_short = allow;
+    ledgerPut('automation', rule.id, automationText(rule), 'user', `${allow ? 'Allowed' : 'Disallowed'} shorting for ${rule.name}`);
     recordMockActivity('user', 'automation.toggle', 'automation', rule.id, `${allow ? 'Allowed' : 'Disallowed'} shorting for ${rule.name}`);
     return rule as any;
   }
@@ -401,6 +444,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     const rule = mockAutomations.find((a) => a.id === args?.id);
     if (rule) {
       rule.enabled = Boolean(args?.enabled);
+      ledgerPut('automation', rule.id, automationText(rule), 'user', `${rule.enabled ? 'Enabled' : 'Paused'} automation ${rule.name}`);
       recordMockActivity('user', 'automation.toggle', 'automation', rule.id, `${rule.enabled ? 'Enabled' : 'Paused'} automation ${rule.name}`);
     }
     return Boolean(rule) as any;
@@ -408,6 +452,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   if (cmd === 'delete_automation') {
     const before = mockAutomations.length;
     mockAutomations = mockAutomations.filter((a) => a.id !== args?.id);
+    if (mockAutomations.length < before) ledgerTombstone('automation', String(args?.id), 'user', `Deleted automation ${String(args?.id)}`);
     if (mockAutomations.length < before) recordMockActivity('user', 'automation.delete', 'automation', String(args?.id), `Deleted automation ${String(args?.id)}`);
     return (mockAutomations.length < before) as any;
   }
@@ -490,8 +535,26 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   }
   if (cmd === 'zerodha_login_url') return 'https://kite.zerodha.com/connect/login?v=3&api_key=mock' as any;
   if (cmd === 'get_live_status') return { ...mockLive } as any;
-  if (cmd === 'set_live_armed') { mockLive.armed = Boolean(args?.armed); return { ...mockLive } as any; }
-  if (cmd === 'kill_switch') { mockLive.armed = false; mockLive.halted = true; return { cancelled: [], failed: [] } as any; }
+  if (cmd === 'set_live_armed') {
+    mockLive.armed = Boolean(args?.armed);
+    ledgerOrderEvent('', '', mockLive.armed ? 'live_armed' : 'live_disarmed', 'user', { kind: 'manual', id: '', version: null, hash: null });
+    return { ...mockLive } as any;
+  }
+  if (cmd === 'kill_switch') {
+    mockLive.armed = false; mockLive.halted = true;
+    ledgerOrderEvent('', '', 'kill_switch', 'user', { kind: 'kill_switch', id: '', version: null, hash: null }, { cancelled: 0, failed: 0 });
+    return { cancelled: [], failed: [] } as any;
+  }
+  if (cmd === 'cancel_order') {
+    const orderId = String(args?.orderId);
+    const brokerId = String(args?.brokerId ?? '');
+    const source: OrderSourceDto = { kind: 'manual', id: '', version: null, hash: null };
+    ledgerOrderEvent(orderId, brokerId, 'cancel_requested', 'user', source);
+    const order = mockOrders.find((o) => o.id === orderId);
+    if (order) { order.status = 'Cancelled'; order.updated_at = new Date().toISOString(); }
+    ledgerOrderEvent(orderId, brokerId, 'cancelled', 'user', source, { filled_qty: order?.filled_qty ?? 0 });
+    return undefined as any;
+  }
   if (cmd === 'preview_order') {
     const req = args?.request as NewOrderRequestDto;
     const live = req.broker_id !== 'paper';
@@ -517,15 +580,38 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   }
   if (cmd === 'place_order') {
     const req = (args?.request as NewOrderRequestDto);
+    // Audit trail: every state of the order is a new, hash-chained event.
+    const orderId = Math.random().toString();
+    const source = mockOrderSource(req.tag);
+    const actor = SOURCE_ACTOR[source.kind] ?? 'user';
+    // Same shapes as the Rust order stream: `submitted`, `risk_accepted` and `risk_rejected` come before the
+    // broker has an order id (empty order_id, tied to the order by data.request_id); fills carry delta_qty and
+    // avg_price; the live-guard refusals are recorded as a `submitted` and a `risk_rejected` too.
+    const requestId = Math.random().toString(36).slice(2);
+    const isMarket = req.order_type.toLowerCase() === 'market';
+    const early = (event: string, data: Record<string, unknown> = {}) => ledgerOrderEvent('', req.broker_id, event, actor, source, { request_id: requestId, ...data });
+    const audit = (event: string, data: Record<string, unknown> = {}) => ledgerOrderEvent(orderId, req.broker_id, event, actor, source, data);
+    const snapshot = (status: string, filled: number, avg: number) => ({
+      status, filled_qty: filled, avg_price: avg, symbol: req.symbol, side: req.side.toLowerCase(), order_type: req.order_type.toLowerCase(),
+      quantity: req.quantity, price: req.price ?? null, stop_price: req.stop_price ?? null, tag: req.tag ?? null,
+    });
+    early('submitted', { request: { ...req }, live: req.broker_id !== 'paper', confirmed: args?.confirmationId ? true : null });
     if (req.broker_id !== 'paper') {
       const confirmation = args?.confirmationId as string | undefined;
-      if (!mockLive.armed) throw new Error('Live trading is not armed. Arm it in the Live panel before sending live orders.');
-      if (!confirmation || mockConfirmations.get(confirmation) !== req.broker_id) throw new Error('Order was not confirmed. Review and confirm it first.');
-      mockConfirmations.delete(confirmation);
+      const reject = (message: string): never => { early('risk_rejected', { reason: message, stage: 'live_guard' }); throw new Error(message); };
+      if (!mockLive.armed) reject('Live trading is not armed. Arm it in the Live panel before sending live orders.');
+      if (!confirmation || mockConfirmations.get(confirmation) !== req.broker_id) reject('Order was not confirmed. Review and confirm it first.');
+      mockConfirmations.delete(confirmation as string);
       mockLive.orders_today += 1;
     }
-    const isMarket = req.order_type.toLowerCase() === 'market';
-    const order: OrderDto = { id: Math.random().toString(), symbol: req.symbol, side: req.side, order_type: req.order_type, quantity: req.quantity, price: req.price, stop_price: req.stop_price, status: isMarket ? 'Filled' : 'Open', filled_qty: isMarket ? req.quantity : 0, avg_price: isMarket ? 150.2 : 0, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), broker_id: req.broker_id, source: 'mock' };
+    early('risk_accepted', { valued_price: req.price ?? 150.2 });
+    audit('broker_ack', { request_id: requestId, broker_order_id: `${req.broker_id}-${orderId.slice(2, 8)}` });
+    if (isMarket) {
+      audit('fill', { ...snapshot('filled', req.quantity, 150.2), delta_qty: req.quantity });
+    } else {
+      audit('status', snapshot('open', 0, 0));
+    }
+    const order: OrderDto = { id: orderId, symbol: req.symbol, side: req.side, order_type: req.order_type, quantity: req.quantity, price: req.price, stop_price: req.stop_price, status: isMarket ? 'Filled' : 'Open', filled_qty: isMarket ? req.quantity : 0, avg_price: isMarket ? 150.2 : 0, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), broker_id: req.broker_id, source: 'mock' };
     mockOrders.push(order);
     if (!isMarket) return order.id as any;
 
@@ -637,6 +723,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
       ],
     };
     mockNotebooks = [...mockNotebooks.filter((entry) => entry.path !== normalizedPath), created];
+    ledgerPut('notebook', normalizedPath, notebookText(created), 'user', `Created notebook ${created.title}`);
     return cloneNotebook(created) as any;
   }
   if (cmd === 'save_notebook') {
@@ -651,6 +738,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     } else {
       mockNotebooks = [...mockNotebooks, saved];
     }
+    ledgerPut('notebook', saved.path, notebookText(saved), 'user', `Saved notebook ${saved.title}`);
     return cloneNotebook(saved) as any;
   }
   if (cmd === 'run_notebook_cell') {
@@ -676,6 +764,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     const content = (args?.content as string | undefined) ?? DEFAULT_STRATEGY_TEMPLATE;
     const created: StrategyFileDto = { name, path, content };
     mockStrategyFiles = [...mockStrategyFiles.filter((file) => file.path !== path), created];
+    ledgerPut('strategy', path, content, 'user', `Created ${name}`);
     recordMockActivity('user', 'strategy.create', 'strategy', path, `Created ${name}`);
     return created as any;
   }
@@ -690,6 +779,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     } else {
       mockStrategyFiles = [...mockStrategyFiles, saved];
     }
+    ledgerPut('strategy', path, content, 'user', `Saved ${name}`);
     recordMockActivity('user', 'strategy.save', 'strategy', path, `Saved ${name}`);
     return saved as any;
   }
@@ -697,6 +787,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     const path = args?.path as string;
     const before = mockStrategyFiles.length;
     mockStrategyFiles = mockStrategyFiles.filter((file) => file.path !== path);
+    if (before !== mockStrategyFiles.length) ledgerTombstone('strategy', path, 'user', `Deleted ${path}`);
     if (before !== mockStrategyFiles.length) recordMockActivity('user', 'strategy.delete', 'strategy', path, `Deleted ${path}`);
     return (before !== mockStrategyFiles.length) as any;
   }
@@ -1038,6 +1129,18 @@ export async function listEstimatorFiles(): Promise<EstimatorFileDto[]> { return
 export async function saveEstimatorFile(name: string, content: string): Promise<EstimatorFileDto> { return invoke<EstimatorFileDto>('save_estimator_file', { name, content }); }
 export async function deleteEstimatorFile(name: string): Promise<boolean> { return invoke<boolean>('delete_estimator_file', { name }); }
 
+// Immutable audit ledger
+export async function ledgerHistory(kind: VersionedKind, id: string): Promise<VersionDto[]> { return invoke<VersionDto[]>('ledger_history', { kind, id }); }
+export async function ledgerVersion(kind: VersionedKind, id: string, version: number): Promise<VersionContentDto> { return invoke<VersionContentDto>('ledger_version', { kind, id, version }); }
+export async function ledgerObjects(kind: VersionedKind, includeDeleted = true): Promise<VersionedObjectDto[]> { return invoke<VersionedObjectDto[]>('ledger_objects', { kind, includeDeleted }); }
+/** Brings an old version back as a NEW version (nothing is rewritten). */
+export async function ledgerRestore(kind: VersionedKind, id: string, version: number): Promise<VersionDto> { return invoke<VersionDto>('ledger_restore', { kind, id, version }); }
+export async function ledgerVerify(): Promise<LedgerVerifyDto> { return invoke<LedgerVerifyDto>('ledger_verify'); }
+export async function ledgerStatus(): Promise<LedgerStatusDto> { return invoke<LedgerStatusDto>('ledger_status'); }
+export async function listOrderEvents(filter: { orderId?: string; brokerId?: string; limit?: number } = {}): Promise<OrderEventDto[]> {
+  return invoke<OrderEventDto[]>('list_order_events', filter);
+}
+
 // Algorithm recipes
 export async function listRecipes(): Promise<RecipeDto[]> { return invoke<RecipeDto[]>('list_recipes'); }
 export async function saveRecipe(recipe: RecipeDto): Promise<RecipeDto> { return invoke<RecipeDto>('save_recipe', { recipe }); }
@@ -1179,6 +1282,7 @@ if (typeof window !== 'undefined') {
   hooks.createStrategyAsCopilot = (name = 'copilot_strategy.py') => {
     const path = `strategies/${name}`;
     mockStrategyFiles = [...mockStrategyFiles.filter((f) => f.path !== path), { name, path, content: DEFAULT_STRATEGY_TEMPLATE }];
+    ledgerPut('strategy', path, DEFAULT_STRATEGY_TEMPLATE, 'copilot', `Saved ${name}`);
     recordMockActivity('copilot', 'strategy.save', 'strategy', path, `Saved ${name}`);
     return path;
   };
@@ -1188,6 +1292,7 @@ if (typeof window !== 'undefined') {
       id, name, kind: 'model_signal', symbol: 'RELIANCE.NS', model_id: modelId, interval_secs: 300, quantity: 1, threshold: 0.5,
       broker_id: 'paper', enabled: true, created_at: new Date().toISOString(), last_run_at: null, last_result: null, orders_today: 0, allow_short: false,
     });
+    ledgerPut('automation', id, automationText(mockAutomations[mockAutomations.length - 1]), 'copilot', `Created automation ${name}`);
     recordMockActivity('copilot', 'automation.create', 'automation', id, `Created automation ${name}`);
     return id;
   };
@@ -1198,10 +1303,14 @@ if (typeof window !== 'undefined') {
     mockStrategyFiles = mockStrategyFiles.some((f) => f.path === path)
       ? mockStrategyFiles.map((f) => (f.path === path ? next : f))
       : [...mockStrategyFiles, next];
+    ledgerPut('strategy', path, content, 'copilot', `Saved ${name}`);
     recordMockActivity('copilot', 'strategy.save', 'strategy', path, `Saved ${name}`);
     return path;
   };
   // Shorting specs: replace the mock positions, and say whether a broker can hold short positions.
+  // Place a paper order as a given source (automation / strategy / copilot / manual): the same path the order ticket uses.
+  hooks.placeOrderAs = (tag: string | null, overrides: Partial<NewOrderRequestDto> = {}) =>
+    invoke<string>('place_order', { request: { symbol: 'RELIANCE.NS', side: 'BUY', order_type: 'Market', quantity: 1, price: null, stop_price: null, broker_id: 'paper', tag, ...overrides }, confirmationId: null });
   hooks.setMockPositions = (positions: PositionDto[]) => { mockPositions.splice(0, mockPositions.length, ...positions); };
   hooks.setBrokerCanShort = (brokerId: string, canShort: boolean) => {
     const broker = mockBrokerConnections.find((b) => b.broker_id === brokerId);
