@@ -61,6 +61,7 @@ test.describe('ML training form', () => {
     expect(req).toMatchObject({
       algorithm: 'random_forest', dataset: 'train-basic', data_path: 'datasets/train-basic.csv',
       target_column: 'target', return_column: 'fwd_ret', n_splits: 5, hyperparams: {}, lag_periods: [],
+      trade_mode: 'long_flat', holdout_pct: 0,
     });
     expect(req.feature_columns).toHaveLength(15);
 
@@ -70,16 +71,20 @@ test.describe('ML training form', () => {
     expect(modelId).toMatch(/^random_forest_/);
   });
 
-  test('describes each algorithm and lists its own hyperparameters', async ({ page }) => {
+  test('describes each algorithm and lists its own parameters (from the backend catalog)', async ({ page }) => {
     await page.getByTestId('ml-tab-train').click();
     const select = page.getByTestId('ml-algorithm-select');
     await expect(select).toHaveValue('random_forest');
+    await expect(page.getByTestId('ml-algorithms-notice')).toHaveCount(0);
+    await expect(select.locator('option')).toHaveText([
+      'Random forest', 'Extra trees', 'Gradient boosting', 'Histogram gradient boosting', 'Logistic regression', 'XGBoost', 'Custom estimator (Python file)',
+    ]);
     await expect(page.getByTestId('ml-algorithm-desc')).toContainText('decision trees');
-    for (const k of ['n_estimators', 'max_depth', 'min_samples_leaf', 'max_features', 'class_weight']) await expect(page.getByTestId(`ml-hp-${k}`)).toBeVisible();
+    for (const k of ['n_estimators', 'max_depth', 'min_samples_leaf', 'class_weight', 'bootstrap', 'criterion']) await expect(page.getByTestId(`ml-hp-${k}`)).toBeVisible();
     await expect(page.getByTestId('ml-hp-learning_rate')).toHaveCount(0);
 
     await select.selectOption('gradient_boosting');
-    await expect(page.getByTestId('ml-algorithm-desc')).toContainText('one after another');
+    await expect(page.getByTestId('ml-algorithm-desc')).toContainText('one at a time');
     for (const k of ['n_estimators', 'learning_rate', 'max_depth', 'subsample']) await expect(page.getByTestId(`ml-hp-${k}`)).toBeVisible();
 
     await select.selectOption('logistic_regression');
@@ -87,7 +92,7 @@ test.describe('ML training form', () => {
     await expect(page.getByTestId('ml-hp-n_estimators')).toHaveCount(0);
 
     await select.selectOption('xgboost');
-    await expect(page.getByTestId('ml-algorithm-desc')).toContainText('xgboost package');
+    await expect(page.getByTestId('ml-algorithm-desc')).toContainText('strong defaults');
     await expect(page.getByTestId('ml-hp-colsample_bytree')).toBeVisible();
   });
 
@@ -96,8 +101,8 @@ test.describe('ML training form', () => {
     const train = page.getByTestId('ml-train-button');
     await expect(train).toBeEnabled();
 
-    await page.getByTestId('ml-hp-n_estimators').fill('5');
-    await expect(page.getByTestId('ml-hp-error-n_estimators')).toContainText('between 10 and 2000');
+    await page.getByTestId('ml-hp-n_estimators').fill('0');
+    await expect(page.getByTestId('ml-hp-error-n_estimators')).toContainText('between 1 and 2000');
     await expect(page.getByTestId('ml-train-validation')).toContainText('Trees must be a whole number');
     await expect(train).toBeDisabled();
 
@@ -106,29 +111,31 @@ test.describe('ML training form', () => {
     await expect(train).toBeDisabled();
 
     await page.getByTestId('ml-hp-n_estimators').fill('');
-    await expect(page.getByTestId('ml-hp-error-n_estimators')).toBeVisible(); // required: empty is not "default"
-    await expect(train).toBeDisabled();
+    await expect(page.getByTestId('ml-hp-error-n_estimators')).toHaveCount(0); // empty means "use the default"
+    await expect(train).toBeEnabled();
 
+    await page.getByTestId('ml-hp-n_estimators').fill('3000');
+    await expect(train).toBeDisabled();
     await page.getByTestId('ml-hp-reset-n_estimators').click();
     await expect(page.getByTestId('ml-hp-error-n_estimators')).toHaveCount(0);
     await expect(train).toBeEnabled();
     expect(await ipc(page, 'train_ml_model')).toHaveLength(0); // nothing was sent while blocked
   });
 
-  test('CV splits are limited to 2-10', async ({ page }) => {
+  test('CV splits are limited to 2-20', async ({ page }) => {
     await buildAndTrainOn(page, 'cv-limits');
     const train = page.getByTestId('ml-train-button');
-    for (const bad of ['1', '11', '', '2.5']) {
+    for (const bad of ['1', '21', '', '2.5']) {
       await page.getByTestId('ml-cv-splits').fill(bad);
-      await expect(page.getByTestId('ml-train-validation')).toContainText('CV splits must be a whole number from 2 to 10');
+      await expect(page.getByTestId('ml-train-validation')).toContainText('CV splits must be a whole number from 2 to 20');
       await expect(train).toBeDisabled();
     }
-    await page.getByTestId('ml-cv-splits').fill('10');
+    await page.getByTestId('ml-cv-splits').fill('20');
     await expect(train).toBeEnabled();
     await expect(page.getByTestId('ml-cv-help')).toContainText('embargo');
     await train.click();
     await expect(page.getByTestId('ml-train-result')).toBeVisible();
-    expect((await lastTrainRequest(page)).n_splits).toBe(10);
+    expect((await lastTrainRequest(page)).n_splits).toBe(20);
   });
 
   test('only changed hyperparameters are sent; reset and reset-all restore defaults', async ({ page }) => {
@@ -153,7 +160,8 @@ test.describe('ML training form', () => {
 
     await page.getByTestId('ml-hp-reset-all').click();
     await expect(count).toContainText('0 changed');
-    await expect(page.getByTestId('ml-hp-n_estimators')).toHaveValue('100');
+    await expect(page.getByTestId('ml-hp-n_estimators')).toHaveValue('');
+    await expect(page.getByTestId('ml-hp-n_estimators')).toHaveAttribute('placeholder', '100'); // the default is shown as a placeholder
     await page.getByTestId('ml-train-button').click();
     await expect.poll(async () => (await ipc(page, 'train_ml_model')).length).toBe(2);
     expect((await lastTrainRequest(page)).hyperparams).toEqual({});
@@ -163,7 +171,7 @@ test.describe('ML training form', () => {
     await buildAndTrainOn(page, 'hp-per-algo');
     await page.getByTestId('ml-hp-n_estimators').fill('300');
     await page.getByTestId('ml-algorithm-select').selectOption('xgboost');
-    await expect(page.getByTestId('ml-hp-n_estimators')).toHaveValue('100');
+    await expect(page.getByTestId('ml-hp-n_estimators')).toHaveValue('');
     await page.getByTestId('ml-hp-learning_rate').fill('0.05');
     await page.getByTestId('ml-algorithm-select').selectOption('random_forest');
     await expect(page.getByTestId('ml-hp-n_estimators')).toHaveValue('300');

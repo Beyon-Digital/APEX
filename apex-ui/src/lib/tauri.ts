@@ -1,4 +1,4 @@
-import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, StrategySessionInfoDto, ChatGptStatusDto, ChatGptModelDto, SymbolFeedDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto, ActivityDto, BuildDatasetRequestDto, DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, ModelDetailDto, ModelSignalHistoryDto } from './types';
+import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, StrategySessionInfoDto, ChatGptStatusDto, ChatGptModelDto, SymbolFeedDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto, ActivityDto, BuildDatasetRequestDto, DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, ModelDetailDto, ModelSignalHistoryDto, ExpressionCheckDto, SymbolDataDto, AlgorithmDto, EstimatorFileDto } from './types';
 import { handleMlMock, recordMockActivity } from './mockMl';
 
 const IS_TAURI = typeof window !== 'undefined' && '__TAURI__' in window;
@@ -101,6 +101,7 @@ let mockBrokerConnections: BrokerConnectionDto[] = [
     market_data_available: false,
     token_field_label: '',
     message: 'Paper trading is active for safe simulated execution.',
+    can_short: true,
   },
   {
     broker_id: 'zerodha',
@@ -113,6 +114,7 @@ let mockBrokerConnections: BrokerConnectionDto[] = [
     market_data_available: true,
     token_field_label: 'Access Token',
     message: 'Zerodha Kite is configured for live orders, account access, and market data. Paste an Access Token to enable live connectivity.',
+    can_short: false,
   },
   {
     broker_id: 'angel_one',
@@ -125,6 +127,7 @@ let mockBrokerConnections: BrokerConnectionDto[] = [
     market_data_available: true,
     token_field_label: 'JWT Token',
     message: 'Angel One is configured for live orders, account access, and market data. Paste a JWT Token to enable live connectivity.',
+    can_short: false,
   },
   {
     broker_id: 'groww',
@@ -137,6 +140,7 @@ let mockBrokerConnections: BrokerConnectionDto[] = [
     market_data_available: true,
     token_field_label: 'Access Token',
     message: 'Groww is configured for live orders, account access, and market data. Paste an Access Token to enable live connectivity.',
+    can_short: false,
   },
   {
     broker_id: 'robinhood',
@@ -149,6 +153,7 @@ let mockBrokerConnections: BrokerConnectionDto[] = [
     market_data_available: true,
     token_field_label: 'Access Token',
     message: 'Robinhood is configured for live orders, account access, and market data. Paste an Access Token to enable live connectivity.',
+    can_short: false,
   },
 ];
 
@@ -374,10 +379,23 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
       id: `auto_${mockAutomations.length + 1}`, name: req.name, kind: req.kind, symbol: req.symbol,
       model_id: req.model_id, interval_secs: req.interval_secs ?? 300, quantity: req.quantity ?? 1, threshold: req.threshold ?? 0.5,
       broker_id: req.broker_id ?? 'paper', enabled: true, created_at: new Date().toISOString(), last_run_at: null, last_result: null, orders_today: 0,
+      allow_short: Boolean(req.allow_short),
     };
     mockAutomations.push(created);
     recordMockActivity('user', 'automation.create', 'automation', created.id, `Created automation ${created.name}`);
     return created as any;
+  }
+  if (cmd === 'set_automation_short') {
+    const rule = mockAutomations.find((a) => a.id === args?.id);
+    if (!rule) throw new Error(`Unknown automation ${String(args?.id)}`);
+    const allow = Boolean(args?.allow);
+    if (allow) {
+      const broker = mockBrokerConnections.find((b) => b.broker_id === rule.broker_id);
+      if (!broker?.can_short) throw new Error(`${rule.broker_id} cannot hold short positions`);
+    }
+    rule.allow_short = allow;
+    recordMockActivity('user', 'automation.toggle', 'automation', rule.id, `${allow ? 'Allowed' : 'Disallowed'} shorting for ${rule.name}`);
+    return rule as any;
   }
   if (cmd === 'set_automation_enabled') {
     const rule = mockAutomations.find((a) => a.id === args?.id);
@@ -1002,6 +1020,30 @@ export async function listAutomations(): Promise<AutomationDto[]> { return invok
 export async function createAutomation(request: CreateAutomationDto): Promise<AutomationDto> { return invoke<AutomationDto>('create_automation', { request }); }
 export async function deleteAutomation(id: string): Promise<boolean> { return invoke<boolean>('delete_automation', { id }); }
 export async function setAutomationEnabled(id: string, enabled: boolean): Promise<boolean> { return invoke<boolean>('set_automation_enabled', { id, enabled }); }
+export async function setAutomationShort(id: string, allow: boolean): Promise<AutomationDto> { return invoke<AutomationDto>('set_automation_short', { id, allow }); }
+
+// Custom data and training
+export async function checkExpression(expr: string, symbol: string, timeframe = 'd1'): Promise<ExpressionCheckDto> {
+  return invoke<ExpressionCheckDto>('check_expression', { expr, symbol, timeframe });
+}
+export async function listSymbolData(symbols: string[], timeframe: string): Promise<SymbolDataDto[]> {
+  return invoke<SymbolDataDto[]>('list_symbol_data', { symbols, timeframe });
+}
+/** Download history for a symbol into local storage so it can be used for training. */
+export async function fetchSymbolHistory(symbol: string, timeframe: string, bars: number): Promise<SymbolDataDto> {
+  return invoke<SymbolDataDto>('fetch_symbol_history', { symbol, timeframe, bars });
+}
+export async function listAlgorithms(): Promise<AlgorithmDto[]> { return invoke<AlgorithmDto[]>('list_algorithms'); }
+export async function listEstimatorFiles(): Promise<EstimatorFileDto[]> { return invoke<EstimatorFileDto[]>('list_estimator_files'); }
+export async function saveEstimatorFile(name: string, content: string): Promise<EstimatorFileDto> { return invoke<EstimatorFileDto>('save_estimator_file', { name, content }); }
+export async function deleteEstimatorFile(name: string): Promise<boolean> { return invoke<boolean>('delete_estimator_file', { name }); }
+/** Starter source for a custom estimator file (the backend owns the template text). */
+export async function estimatorTemplate(): Promise<string> {
+  const r = await invoke<unknown>('estimator_template');
+  if (typeof r === 'string') return r;
+  const o = r as { content?: unknown; template?: unknown } | null;
+  return typeof o?.content === 'string' ? o.content : typeof o?.template === 'string' ? o.template : '';
+}
 
 // Broker connectivity
 export async function listBrokerConnections(): Promise<BrokerConnectionDto[]> { return invoke<BrokerConnectionDto[]>('list_broker_connections'); }
@@ -1137,7 +1179,7 @@ if (typeof window !== 'undefined') {
     const id = `auto_${mockAutomations.length + 1}`;
     mockAutomations.push({
       id, name, kind: 'model_signal', symbol: 'RELIANCE.NS', model_id: modelId, interval_secs: 300, quantity: 1, threshold: 0.5,
-      broker_id: 'paper', enabled: true, created_at: new Date().toISOString(), last_run_at: null, last_result: null, orders_today: 0,
+      broker_id: 'paper', enabled: true, created_at: new Date().toISOString(), last_run_at: null, last_result: null, orders_today: 0, allow_short: false,
     });
     recordMockActivity('copilot', 'automation.create', 'automation', id, `Created automation ${name}`);
     return id;
@@ -1151,5 +1193,11 @@ if (typeof window !== 'undefined') {
       : [...mockStrategyFiles, next];
     recordMockActivity('copilot', 'strategy.save', 'strategy', path, `Saved ${name}`);
     return path;
+  };
+  // Shorting specs: replace the mock positions, and say whether a broker can hold short positions.
+  hooks.setMockPositions = (positions: PositionDto[]) => { mockPositions.splice(0, mockPositions.length, ...positions); };
+  hooks.setBrokerCanShort = (brokerId: string, canShort: boolean) => {
+    const broker = mockBrokerConnections.find((b) => b.broker_id === brokerId);
+    if (broker) broker.can_short = canShort;
   };
 }

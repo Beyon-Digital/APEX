@@ -329,6 +329,8 @@ export interface AutomationDto {
   last_run_at: string | null;
   last_result: string | null;
   orders_today: number;
+  /** When true a "down" signal opens a short instead of only exiting a long. */
+  allow_short: boolean;
 }
 
 export interface CreateAutomationDto {
@@ -340,6 +342,7 @@ export interface CreateAutomationDto {
   quantity?: number;
   threshold?: number;
   broker_id?: string;
+  allow_short?: boolean;
 }
 
 export interface MLTrainingRequestDto {
@@ -354,6 +357,13 @@ export interface MLTrainingRequestDto {
   dataset?: string;
   /** Column holding each row's forward return, used to score trading performance. */
   return_column?: string;
+  /** How the evaluation trades the predictions. Default long_flat. */
+  trade_mode?: TradeMode;
+  /** Share of the final rows (0-40) kept out of cross-validation and scored once at the end. */
+  holdout_pct?: number;
+  /** Required when algorithm is "custom": a file saved with saveEstimatorFile. */
+  estimator_file?: string;
+  random_state?: number;
 }
 
 export interface MLTrainingResultDto {
@@ -393,6 +403,8 @@ export interface BrokerConnectionDto {
   market_data_available: boolean;
   token_field_label: string;
   message: string;
+  /** The broker can hold short positions (paper always; live brokers only when enabled and supported). */
+  can_short: boolean;
 }
 
 // News
@@ -759,6 +771,17 @@ export interface LabelSpecDto {
    *  "return_threshold": 1 above +threshold, -1 below -threshold, else 0. */
   kind: 'direction' | 'return_threshold';
   threshold_pct: number;
+  /** return_threshold only: separate up/down thresholds (percent). When absent, threshold_pct is used for both. */
+  up_threshold_pct?: number | null;
+  down_threshold_pct?: number | null;
+}
+
+/** A user-defined feature: a formula over bars. See the expression language in the Data tab. */
+export interface CustomFeatureDto {
+  /** [a-z][a-z0-9_]{0,40}, must not clash with a catalog feature id. */
+  name: string;
+  /** e.g. "sma(close, 20) / close - 1". Trailing windows only, so it can never look ahead. */
+  expr: string;
 }
 
 export interface BuildDatasetRequestDto {
@@ -768,6 +791,14 @@ export interface BuildDatasetRequestDto {
   bars: number;
   features: string[];
   label: LabelSpecDto;
+  /** Inclusive ISO dates (YYYY-MM-DD). When set they bound the bars used instead of the latest `bars`. */
+  from?: string | null;
+  to?: string | null;
+  custom_features?: CustomFeatureDto[];
+  /** Extra symbols whose bars custom formulas can read with other("SYMBOL","close"). Not rows of the dataset. */
+  context_symbols?: string[];
+  /** Round-trip trading cost in percent, subtracted from every forward return before labelling. */
+  fee_pct?: number;
 }
 
 export interface DatasetInfoDto {
@@ -784,6 +815,9 @@ export interface DatasetInfoDto {
   first_time: string | null;
   last_time: string | null;
   source: ActivityActor;
+  custom_features: CustomFeatureDto[];
+  context_symbols: string[];
+  fee_pct: number;
 }
 
 export interface DatasetPreviewDto extends DatasetInfoDto {
@@ -849,6 +883,75 @@ export interface ModelDetailDto extends MLModelDto {
   /** Last lines of the training output. */
   log_tail: string;
   used_by: ModelUsageDto[];
+  /** How the evaluation traded the predictions: long/flat, or long and short. */
+  trade_mode: TradeMode;
+  /** Result on the final period that cross-validation never saw; null when no hold-out was set. */
+  holdout: HoldoutDto | null;
+  custom_features: CustomFeatureDto[];
+  context_symbols: string[];
+  fee_pct: number;
+  /** Name of the custom estimator file when algorithm is "custom". */
+  estimator_file: string | null;
+}
+
+export type TradeMode = 'long_flat' | 'long_short';
+
+export interface HoldoutDto {
+  rows: number;
+  accuracy: number;
+  baseline_accuracy: number | null;
+  trading: TradingSummaryDto | null;
+}
+
+// ── Custom data and training ─────────────────────────────────────────
+
+export interface ExpressionCheckDto {
+  ok: boolean;
+  error: string | null;
+  /** 0-based character offset of the error in the expression. */
+  error_pos: number | null;
+  /** Bars needed before the first valid value. */
+  warmup_bars: number;
+  /** The last few computed values for the chosen symbol (null = not yet valid). */
+  sample: { time: string; value: number | null }[];
+}
+
+export interface SymbolDataDto {
+  symbol: string;
+  timeframe: string;
+  bars: number;
+  first_time: string | null;
+  last_time: string | null;
+}
+
+export interface ParamDefDto {
+  key: string;
+  label: string;
+  /** "int" | "float" | "bool" | "choice" | "text" */
+  type: string;
+  default: string | number | boolean | null;
+  min?: number | null;
+  max?: number | null;
+  choices?: string[] | null;
+  help: string;
+}
+
+export interface AlgorithmDto {
+  /** e.g. "random_forest", "extra_trees", "custom" */
+  id: string;
+  label: string;
+  description: string;
+  /** Every tunable parameter the library reports for this algorithm, with its default. */
+  params: ParamDefDto[];
+  /** Extra keys outside `params` are still validated against the estimator's constructor. */
+  accepts_extra_params: boolean;
+}
+
+export interface EstimatorFileDto {
+  name: string;
+  path: string;
+  content: string;
+  updated_at: string;
 }
 
 export interface ModelSignalPointDto {

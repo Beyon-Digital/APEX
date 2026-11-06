@@ -11,7 +11,7 @@
 import type {
   ActivityActor, ActivityDto, ArtifactEventDto, ArtifactKind, BuildDatasetRequestDto, CvFoldDto,
   DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, MLModelDto, MLTrainingRequestDto, ModelDetailDto,
-  ModelSignalHistoryDto,
+  ModelSignalHistoryDto, AlgorithmDto, EstimatorFileDto, ExpressionCheckDto, ParamDefDto, SymbolDataDto,
 } from './types';
 
 export const ARTIFACT_EVENT = 'apex:artifacts-changed';
@@ -112,6 +112,12 @@ export function createMockModel(req: Partial<MLTrainingRequestDto>, actor: Activ
     trading: { strategy_return_pct: 8.4, buy_hold_return_pct: 5.1, hit_rate: acc - 0.02, trades: 63, max_drawdown_pct: -4.2, sharpe: 1.1 },
     log_tail: `INFO Starting training run: algorithm=${req.algorithm ?? 'random_forest'}\nINFO Fold 1 - accuracy=${acc.toFixed(4)}\nINFO Model saved`,
     used_by: [],
+    trade_mode: req.trade_mode ?? 'long_flat',
+    holdout: req.holdout_pct ? { rows: Math.round(480 * (req.holdout_pct / 100)), accuracy: acc - 0.04, baseline_accuracy: 0.5, trading: { strategy_return_pct: 2.1, buy_hold_return_pct: 1.4, hit_rate: acc - 0.05, trades: 11, max_drawdown_pct: -2.2, sharpe: 0.6 } } : null,
+    custom_features: ds?.custom_features ?? [],
+    context_symbols: ds?.context_symbols ?? [],
+    fee_pct: ds?.fee_pct ?? 0,
+    estimator_file: req.estimator_file ?? null,
   };
   details.set(id, detail);
   recordMockActivity(actor, 'model.train', 'model', id, `Trained ${detail.algorithm} on ${detail.dataset ?? detail.data_path}`);
@@ -121,6 +127,120 @@ export function createMockModel(req: Partial<MLTrainingRequestDto>, actor: Activ
 export function mockUsage(modelId: string, automations: { id: string; name: string; enabled: boolean; symbol: string; model_id: string }[]) {
   return automations.filter((a) => a.model_id === modelId).map((a) => ({ kind: 'automation' as const, id: a.id, name: a.name, enabled: a.enabled, symbol: a.symbol }));
 }
+
+const fetched = new Map<string, number>();
+const estimators = new Map<string, EstimatorFileDto>();
+
+/** Like the backend's canonical_timeframe: "d1" and "1d" are both stored and reported as "1d". */
+const CANONICAL_TIMEFRAMES: Record<string, string> = {
+  m1: '1m', m5: '5m', m15: '15m', h1: '1h', d1: '1d', '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h', '1d': '1d',
+};
+function canonicalTimeframe(tf: string): string {
+  return CANONICAL_TIMEFRAMES[tf.trim().toLowerCase()] ?? tf;
+}
+/** The backend never downloads more than this many bars in one fetch; larger requests are clamped. */
+const MOCK_MAX_FETCH_BARS = 5000;
+
+function symbolData(symbol: string, timeframe: string): SymbolDataDto {
+  const known = /^(RELIANCE|TCS|INFY|HDFCBANK)\.NS$|^(AAPL|MSFT|GOOGL|SPY|BTC-USD|ETH-USD|GC=F)$/.test(symbol);
+  const tf = canonicalTimeframe(timeframe);
+  const bars = fetched.get(`${symbol}|${tf}`) ?? (known ? 520 : 0);
+  return {
+    symbol, timeframe: tf, bars,
+    first_time: bars ? '2024-01-02T00:00:00Z' : null, last_time: bars ? '2026-01-02T00:00:00Z' : null,
+  };
+}
+
+const num = (key: string, label: string, def: number, min: number, max: number, help: string, type = 'float'): ParamDefDto =>
+  ({ key, label, type, default: def, min, max, help });
+const choice = (key: string, label: string, def: string | null, choices: string[], help: string): ParamDefDto =>
+  ({ key, label, type: 'choice', default: def, choices, help });
+
+export const MOCK_ALGORITHMS: AlgorithmDto[] = [
+  { id: 'random_forest', label: 'Random forest', description: 'Many decision trees voting. Robust, hard to overfit badly.', accepts_extra_params: true, params: [
+    num('n_estimators', 'Trees', 100, 1, 2000, 'Number of trees.', 'int'), num('max_depth', 'Max depth', 0, 0, 100, '0 = unlimited.', 'int'),
+    num('min_samples_leaf', 'Min samples per leaf', 1, 1, 1000, 'Larger values smooth the model.', 'int'),
+    choice('class_weight', 'Class weight', null, ['balanced', 'balanced_subsample'], 'Balance rare classes.'),
+    { key: 'bootstrap', label: 'Bootstrap', type: 'bool', default: true, help: 'Sample rows with replacement.' },
+    { key: 'criterion', label: 'Criterion', type: 'choice', default: 'gini', choices: ['gini', 'entropy', 'log_loss'], help: 'Split quality measure.' },
+  ] },
+  { id: 'extra_trees', label: 'Extra trees', description: 'Like a random forest with random split points. Faster, often smoother.', accepts_extra_params: true, params: [
+    num('n_estimators', 'Trees', 100, 1, 2000, 'Number of trees.', 'int'), num('max_depth', 'Max depth', 0, 0, 100, '0 = unlimited.', 'int'),
+    num('min_samples_leaf', 'Min samples per leaf', 1, 1, 1000, 'Larger values smooth the model.', 'int'),
+  ] },
+  { id: 'gradient_boosting', label: 'Gradient boosting', description: 'Trees added one at a time to fix earlier errors.', accepts_extra_params: true, params: [
+    num('n_estimators', 'Rounds', 100, 1, 2000, 'Boosting rounds.', 'int'), num('learning_rate', 'Learning rate', 0.1, 0.001, 1, 'Step size.'),
+    num('max_depth', 'Max depth', 3, 1, 20, 'Depth of each tree.', 'int'), num('subsample', 'Subsample', 1, 0.1, 1, 'Row share per round.'),
+  ] },
+  { id: 'hist_gradient_boosting', label: 'Histogram gradient boosting', description: 'Fast boosting for larger datasets.', accepts_extra_params: true, params: [
+    num('max_iter', 'Rounds', 100, 1, 2000, 'Boosting rounds.', 'int'), num('learning_rate', 'Learning rate', 0.1, 0.001, 1, 'Step size.'),
+    num('max_depth', 'Max depth', 0, 0, 100, '0 = unlimited.', 'int'), num('l2_regularization', 'L2 regularization', 0, 0, 100, 'Penalty on leaf weights.'),
+  ] },
+  { id: 'logistic_regression', label: 'Logistic regression', description: 'A linear model. Simple, fast, good baseline.', accepts_extra_params: true, params: [
+    num('C', 'C (inverse regularization)', 1, 0.0001, 1000, 'Smaller = stronger regularization.'), num('max_iter', 'Max iterations', 200, 10, 10000, 'Solver iterations.', 'int'),
+    choice('class_weight', 'Class weight', null, ['balanced'], 'Balance rare classes.'),
+  ] },
+  { id: 'xgboost', label: 'XGBoost', description: 'Boosted trees with strong defaults (when installed).', accepts_extra_params: true, params: [
+    num('n_estimators', 'Rounds', 100, 1, 2000, 'Boosting rounds.', 'int'), num('max_depth', 'Max depth', 6, 1, 20, 'Depth of each tree.', 'int'),
+    num('learning_rate', 'Learning rate', 0.3, 0.001, 1, 'Step size.'), num('subsample', 'Subsample', 1, 0.1, 1, 'Row share per round.'),
+    num('colsample_bytree', 'Column share', 1, 0.1, 1, 'Feature share per tree.'),
+  ] },
+  { id: 'custom', label: 'Custom estimator (Python file)', description: 'Your own scikit-learn style classifier from estimators/<name>.py.', accepts_extra_params: true, params: [] },
+];
+
+/**
+ * A tiny evaluator for the mock only: it validates the shape of an expression (known functions,
+ * balanced parentheses) the way the backend would, and reports a plausible warmup.
+ */
+const FUNCS: Record<string, [number, number]> = {
+  sma: [2, 2], ema: [2, 2], std: [2, 2], rsi: [1, 2], ret: [1, 2], shift: [2, 2], max: [2, 2], min: [2, 2],
+  abs: [1, 1], log: [1, 1], zscore: [2, 2], atr: [0, 1], other: [2, 2], sum: [2, 2],
+};
+const SERIES = new Set(['open', 'high', 'low', 'close', 'volume']);
+
+function checkMockExpression(expr: string, symbol = '', timeframe = 'd1'): ExpressionCheckDto {
+  const fail = (error: string, pos: number): ExpressionCheckDto => ({ ok: false, error, error_pos: pos, warmup_bars: 0, sample: [] });
+  if (!expr.trim()) return fail('Enter a formula, for example sma(close, 20) / close - 1', 0);
+  let depth = 0;
+  let warmup = 1;
+  const re = /([A-Za-z_][A-Za-z0-9_]*)\s*(\()?|"[^"]*"|[()+\-*/,]|\d+(?:\.\d+)?|\S/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(expr))) {
+    const tok = m[0];
+    if (m[1]) {
+      if (m[2]) {
+        if (!(m[1] in FUNCS)) return fail(`Unknown function ${m[1]}(). Available: ${Object.keys(FUNCS).join(', ')}`, m.index);
+        depth += 1;
+        const win = /,\s*(\d+)/.exec(expr.slice(m.index));
+        if (win) warmup = Math.max(warmup, Number(win[1]));
+      } else if (!SERIES.has(m[1])) return fail(`Unknown name ${m[1]}. Use open, high, low, close or volume.`, m.index);
+    } else if (tok.startsWith('"')) continue; // string literal, e.g. other("SPY", "close")
+    else if (tok === '(') depth += 1;
+    else if (tok === ')') { depth -= 1; if (depth < 0) return fail('Unbalanced )', m.index); }
+    else if (!/^[()+\-*/,]$|^\d/.test(tok)) return fail(`Unexpected ${tok}`, m.index);
+  }
+  if (depth !== 0) return fail('Missing )', expr.length);
+  // As in the backend: once the main symbol has stored bars, every symbol read with other() needs them too.
+  if (symbol && symbolData(symbol.toUpperCase(), timeframe).bars > 0) {
+    for (const ref of expr.matchAll(/other\(\s*"([^"]+)"/g)) {
+      const sym = ref[1].toUpperCase();
+      if (symbolData(sym, timeframe).bars === 0) {
+        return fail(`no stored bars for ${sym}, which this formula reads with other("${sym}", ...); fetch its history first`, 0);
+      }
+    }
+  }
+  return {
+    ok: true, error: null, error_pos: null, warmup_bars: warmup,
+    sample: Array.from({ length: 5 }, (_, i) => ({ time: `2026-01-0${i + 1}T00:00:00Z`, value: Number((Math.sin(i) * 0.03).toFixed(4)) })),
+  };
+}
+
+export const MOCK_ESTIMATOR_TEMPLATE = `from sklearn.ensemble import ExtraTreesClassifier
+
+
+def make_estimator(params: dict):
+    return ExtraTreesClassifier(n_estimators=int(params.get("n_estimators", 200)), random_state=7, n_jobs=1)
+`;
 
 export type AutomationLookup = () => { id: string; name: string; enabled: boolean; symbol: string; model_id: string }[];
 
@@ -157,18 +277,42 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
       return activity.filter((a) => (!kind || a.kind === kind) && (!target || a.target_id === target)).slice(0, limit);
     }
     case 'list_feature_catalog': return MOCK_FEATURES;
+    case 'check_expression': return checkMockExpression(String(args?.expr ?? ''), String(args?.symbol ?? ''), String(args?.timeframe ?? 'd1'));
+    case 'list_symbol_data': return ((args?.symbols as string[]) ?? []).map((symbol) => symbolData(symbol, String(args?.timeframe ?? 'd1')));
+    case 'fetch_symbol_history': {
+      const symbol = String(args?.symbol);
+      if (/^(NOPE|BAD)/i.test(symbol)) throw new Error(`No history available for ${symbol}`);
+      fetched.set(`${symbol}|${canonicalTimeframe(String(args?.timeframe ?? 'd1'))}`, Math.min(MOCK_MAX_FETCH_BARS, Number(args?.bars ?? 500)));
+      return symbolData(symbol, String(args?.timeframe ?? 'd1'));
+    }
+    case 'list_algorithms': return MOCK_ALGORITHMS;
+    case 'estimator_template': return MOCK_ESTIMATOR_TEMPLATE;
+    case 'list_estimator_files': return [...estimators.values()];
+    case 'save_estimator_file': {
+      const name = String(args?.name);
+      if (!/^[a-z][a-z0-9_]{0,40}\.py$/.test(name)) throw new Error('Estimator names look like my_model.py (lowercase letters, digits, underscore)');
+      const content = String(args?.content ?? '');
+      if (!content.includes('def make_estimator')) throw new Error('The file must define make_estimator(params) returning a scikit-learn style classifier');
+      const file: EstimatorFileDto = { name, path: `estimators/${name}`, content, updated_at: new Date().toISOString() };
+      estimators.set(name, file);
+      recordMockActivity('user', 'estimator.save', 'system', name, `Saved estimator ${name}`);
+      return file;
+    }
+    case 'delete_estimator_file': return estimators.delete(String(args?.name));
     case 'list_datasets': return [...datasets];
     case 'build_dataset': {
       const r = args?.request as BuildDatasetRequestDto;
-      if (!r.features.length) throw new Error('Choose at least one feature');
+      if (!r.features.length && !(r.custom_features ?? []).length) throw new Error('Choose at least one feature');
       if (!r.symbols.length) throw new Error('Choose at least one symbol');
       const rows = Math.max(0, r.bars * r.symbols.length - 60 - r.label.horizon_bars);
       const info: DatasetInfoDto = {
-        name: r.name, path: `datasets/${r.name}.csv`, rows, symbols: r.symbols, timeframe: r.timeframe,
+        name: r.name, path: `datasets/${r.name}.csv`, rows, symbols: r.symbols, timeframe: canonicalTimeframe(r.timeframe),
         features: r.features, label: r.label,
         class_counts: r.label.kind === 'direction' ? { 0: Math.round(rows * 0.48), 1: Math.round(rows * 0.52) }
           : { '-1': Math.round(rows * 0.2), 0: Math.round(rows * 0.6), 1: Math.round(rows * 0.2) },
-        created_at: new Date().toISOString(), first_time: '2024-01-02T00:00:00Z', last_time: '2026-01-02T00:00:00Z', source: 'user',
+        created_at: new Date().toISOString(), first_time: r.from ? `${r.from}T00:00:00Z` : '2024-01-02T00:00:00Z',
+        last_time: r.to ? `${r.to}T00:00:00Z` : '2026-01-02T00:00:00Z', source: 'user',
+        custom_features: r.custom_features ?? [], context_symbols: r.context_symbols ?? [], fee_pct: r.fee_pct ?? 0,
       };
       mockBuildHook(r, info); // test hook, see the end of this file
       const i = datasets.findIndex((d) => d.name === r.name);
@@ -179,8 +323,9 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
     case 'preview_dataset': {
       const d = datasets.find((x) => x.name === args?.name);
       if (!d) throw new Error(`Unknown dataset ${String(args?.name)}`);
-      const columns = ['time', 'symbol', ...d.features, 'fwd_ret', 'target'];
-      const sample = Array.from({ length: 12 }, (_, i) => ['2025-01-0' + ((i % 9) + 1), d.symbols[0], ...d.features.map((_f, j) => Number((Math.sin(i + j) * 0.02).toFixed(4))), 0.004, i % 2]);
+      const allFeatures = [...d.features, ...d.custom_features.map((c) => c.name)];
+      const columns = ['time', 'symbol', ...allFeatures, 'fwd_ret', 'target'];
+      const sample = Array.from({ length: 12 }, (_, i) => ['2025-01-0' + ((i % 9) + 1), d.symbols[0], ...allFeatures.map((_f, j) => Number((Math.sin(i + j) * 0.02).toFixed(4))), 0.004, i % 2]);
       return { ...d, columns, sample } as DatasetPreviewDto;
     }
     case 'delete_dataset': {

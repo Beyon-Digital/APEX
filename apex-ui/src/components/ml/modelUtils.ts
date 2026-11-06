@@ -1,4 +1,6 @@
-import type { ActivityActor, CvFoldDto, LabelSpecDto, MLModelDto, ModelDetailDto } from '../../lib/types';
+import type {
+  ActivityActor, AutomationDto, BrokerConnectionDto, CvFoldDto, LabelSpecDto, MLModelDto, ModelDetailDto, TradeMode,
+} from '../../lib/types';
 
 /** Pure helpers shared by the model registry, detail and compare views. */
 
@@ -17,6 +19,9 @@ export const ALGORITHM_LABEL: Record<string, string> = {
   gradient_boosting: 'Gradient Boosting',
   logistic_regression: 'Logistic Regression',
   xgboost: 'XGBoost',
+  extra_trees: 'Extra Trees',
+  hist_gradient_boosting: 'Histogram Gradient Boosting',
+  custom: 'Custom estimator',
 };
 
 export const algorithmLabel = (algorithm: string): string => ALGORITHM_LABEL[algorithm] ?? algorithm;
@@ -79,9 +84,99 @@ export function bytesLabel(n: number | null | undefined): string {
 
 export function labelText(label: LabelSpecDto | null): string {
   if (!label) return 'n/a';
-  return label.kind === 'direction'
-    ? `Up or down after ${label.horizon_bars} bar${label.horizon_bars === 1 ? '' : 's'}`
-    : `Move beyond ±${label.threshold_pct}% after ${label.horizon_bars} bar${label.horizon_bars === 1 ? '' : 's'}`;
+  const bars = `${label.horizon_bars} bar${label.horizon_bars === 1 ? '' : 's'}`;
+  if (label.kind === 'direction') return `Up or down after ${bars}`;
+  const { up, down } = labelThresholds(label);
+  return up === down
+    ? `Move beyond ±${up}% after ${bars}`
+    : `Up beyond +${up}% / down beyond -${down}% after ${bars}`;
+}
+
+/** Effective up and down thresholds (percent) of a label; both fall back to `threshold_pct`. */
+export function labelThresholds(label: LabelSpecDto): { up: number; down: number } {
+  return {
+    up: label.up_threshold_pct ?? label.threshold_pct,
+    down: label.down_threshold_pct ?? label.threshold_pct,
+  };
+}
+
+// ── Trading rule, hold-out and shorting ─────────────────────────────
+
+export const TRADE_MODE_LABEL: Record<TradeMode, string> = { long_flat: 'Long / flat', long_short: 'Long / short' };
+
+export const tradeModeLabel = (mode: TradeMode | undefined): string => TRADE_MODE_LABEL[mode ?? 'long_flat'];
+
+export const TRADE_MODE_HINT: Record<TradeMode, string> = {
+  long_flat: 'The trading return assumes the rule: buy when the model signals up, otherwise sit in cash. No short positions.',
+  long_short: 'The trading return assumes the rule: buy when the model signals up and sell short when it signals down. It only applies to an automation with shorting allowed on a broker that can short.',
+};
+
+/** Hold-out accuracy this many percentage points below cross-validation accuracy counts as overfit. */
+export const HOLDOUT_GAP_PTS = 5;
+
+export type HoldoutVerdictId = 'none' | 'held' | 'overfit' | 'no-edge' | 'unknown';
+
+export interface HoldoutVerdict {
+  id: HoldoutVerdictId;
+  tone: VerdictTone;
+  text: string;
+  /** Cross-validation accuracy minus hold-out accuracy in points (positive = hold-out is worse). */
+  gapPts: number | null;
+}
+
+/**
+ * Did the model hold up on the final period that cross-validation never saw?
+ * Overfit when hold-out accuracy is at least HOLDOUT_GAP_PTS points below cross-validation accuracy.
+ * Otherwise it held up, unless it did not beat the hold-out's majority-class baseline.
+ */
+export function holdoutVerdict(m: Pick<ModelDetailDto, 'holdout' | 'metrics'>): HoldoutVerdict {
+  const h = m.holdout;
+  if (!h) {
+    return { id: 'none', tone: 'info', gapPts: null, text: 'No hold-out was set. Set a hold-out share in the Train tab to test the model on a final period that cross-validation never sees.' };
+  }
+  const cv = m.metrics.accuracy;
+  if (typeof cv !== 'number' || typeof h.accuracy !== 'number') {
+    return { id: 'unknown', tone: 'info', gapPts: null, text: 'Hold-out result recorded, but there is no cross-validation accuracy to compare it with.' };
+  }
+  const gap = Math.round((cv - h.accuracy) * 100 * 1e6) / 1e6; // rounded so exactly 5.0 pts is not lost to float error
+  if (gap >= HOLDOUT_GAP_PTS) {
+    return { id: 'overfit', tone: 'bad', gapPts: gap, text: `Much worse than cross-validation: likely overfit. Hold-out ${pct(h.accuracy)} vs ${pct(cv)} in cross-validation (${gap.toFixed(1)} pts lower, limit ${HOLDOUT_GAP_PTS}).` };
+  }
+  if (typeof h.baseline_accuracy === 'number' && h.accuracy < h.baseline_accuracy) {
+    return { id: 'no-edge', tone: 'warn', gapPts: gap, text: `Close to cross-validation, but below always predicting the majority class on the hold-out (${pct(h.accuracy)} vs ${pct(h.baseline_accuracy)}).` };
+  }
+  return { id: 'held', tone: 'good', gapPts: gap, text: `Held up on the hold-out: ${pct(h.accuracy)} vs ${pct(cv)} in cross-validation (within ${HOLDOUT_GAP_PTS} pts).` };
+}
+
+export interface ShortingContext {
+  /** True when the model was evaluated long/short but an automation using it cannot actually short. */
+  limited: boolean;
+  reasons: string[];
+}
+
+/**
+ * A long/short trading return is only reachable by automations with shorting allowed on a broker that
+ * can short. List the automations using the model that fall short of that.
+ */
+export function shortingContext(
+  model: Pick<ModelDetailDto, 'trade_mode' | 'model_id'>,
+  automations: Pick<AutomationDto, 'name' | 'model_id' | 'allow_short' | 'broker_id'>[],
+  brokers: Pick<BrokerConnectionDto, 'broker_id' | 'can_short'>[],
+): ShortingContext {
+  if (model.trade_mode !== 'long_short') return { limited: false, reasons: [] };
+  const reasons: string[] = [];
+  for (const a of automations.filter((x) => x.model_id === model.model_id)) {
+    if (!a.allow_short) reasons.push(`${a.name} is long only (shorting not allowed)`);
+    else if (!brokers.find((b) => b.broker_id === a.broker_id)?.can_short) reasons.push(`${a.name} uses ${a.broker_id}, which cannot short`);
+  }
+  return { limited: reasons.length > 0, reasons };
+}
+
+/** What a class means for this model's label when an automation trades it. */
+export function classMeaning(label: LabelSpecDto | null): string {
+  if (label?.kind === 'direction') return 'Class 1 buys. Class 0 sells short when shorting is allowed, otherwise it exits to flat.';
+  if (label?.kind === 'return_threshold') return 'Class 1 buys. Class -1 sells short when shorting is allowed, otherwise it exits to flat. Class 0 is flat.';
+  return 'Class 1 buys. Class 0 exits to flat. Class -1 sells short when shorting is allowed.';
 }
 
 /** Mean majority-class accuracy over the folds that recorded one. */
@@ -104,10 +199,12 @@ export interface Verdict {
 export const MIN_TRADES = 30;
 export const MIN_ROWS = 300;
 
-type VerdictInput = Pick<ModelDetailDto, 'metrics' | 'cv_folds' | 'trading' | 'rows'>;
+type VerdictInput = Pick<ModelDetailDto, 'metrics' | 'cv_folds' | 'trading' | 'rows'> & {
+  trade_mode?: TradeMode;
+};
 
 /** Plain-language read of a run: did it beat the naive baseline, and is there enough data to trust it. */
-export function modelVerdict(m: VerdictInput): Verdict {
+export function modelVerdict(m: VerdictInput, shorting?: ShortingContext): Verdict {
   const accuracy = m.metrics.accuracy;
   const baseline = baselineAccuracy(m.cv_folds);
   const warnings: Verdict['warnings'] = [];
@@ -141,7 +238,11 @@ export function modelVerdict(m: VerdictInput): Verdict {
       text = `Worse than always predicting the majority class by ${pts} pts (${pct(accuracy)} vs ${pct(baseline)}).`;
     }
   }
-  if (m.trading) {
+  if (m.trading && m.trade_mode === 'long_short' && shorting?.limited) {
+    // The figure needs shorts that the automations cannot make, so it must not count as a success.
+    text += ` Trading long and short returned ${signedPct(m.trading.strategy_return_pct)}, but that needs shorting and not every automation using this model can short, so do not rely on it.`;
+    if (tone === 'good') tone = 'warn';
+  } else if (m.trading) {
     const beat = m.trading.strategy_return_pct - m.trading.buy_hold_return_pct;
     text += beat >= 0
       ? ` Trading its signals returned ${signedPct(m.trading.strategy_return_pct)}, ahead of buy and hold (${signedPct(m.trading.buy_hold_return_pct)}).`

@@ -1,14 +1,18 @@
 /**
- * Algorithms and their tunable hyperparameters for the training form.
+ * Algorithms and their tunable parameters for the training form.
  *
- * The keys mirror the backend allow-list, so every key listed here is accepted by the trainer.
+ * The backend reports the algorithm list and every parameter (`AlgorithmDto` / `ParamDefDto`); the
+ * tables below are only the fallback used when that call fails, plus the optional quick-fill values.
  * Values are kept as the raw text the user typed (`HyperparamValues`) and are only converted to
  * numbers when a training request is built, so a half-typed "0." never gets lost while editing.
+ * An empty or missing value means "use the default", which is why only changed values are sent.
  */
+import type { AlgorithmDto, ParamDefDto } from '../../lib/types';
 
-export type AlgorithmId = 'random_forest' | 'gradient_boosting' | 'logistic_regression' | 'xgboost';
+export type AlgorithmId = string;
+export type BuiltinAlgorithmId = 'random_forest' | 'gradient_boosting' | 'logistic_regression' | 'xgboost';
 
-export interface HyperparamSpec {
+interface HyperparamSpec {
   key: string;
   label: string;
   type: 'number' | 'int' | 'select';
@@ -21,13 +25,13 @@ export interface HyperparamSpec {
   help: string;
 }
 
-export interface AlgorithmInfo {
-  id: AlgorithmId;
+interface AlgorithmInfo {
+  id: BuiltinAlgorithmId;
   label: string;
   description: string;
 }
 
-export const ALGORITHMS: AlgorithmInfo[] = [
+const ALGORITHMS: AlgorithmInfo[] = [
   { id: 'random_forest', label: 'Random Forest', description: 'Many decision trees voting. Hard to overfit badly, a good first baseline.' },
   { id: 'gradient_boosting', label: 'Gradient Boosting', description: 'Trees built one after another, each fixing the last one\'s mistakes. Often more accurate, easier to overfit.' },
   { id: 'logistic_regression', label: 'Logistic Regression', description: 'A linear model. Fast and hard to overfit; misses non-linear patterns.' },
@@ -40,7 +44,7 @@ const CLASS_WEIGHT: HyperparamSpec = {
   help: 'Balanced gives rare classes more weight, which helps when up and down bars are unevenly split.',
 };
 
-export const HYPERPARAMS: Record<AlgorithmId, HyperparamSpec[]> = {
+const HYPERPARAMS: Record<BuiltinAlgorithmId, HyperparamSpec[]> = {
   random_forest: [
     { key: 'n_estimators', label: 'Trees', type: 'int', default: 100, min: 10, max: 2000, step: 10, help: 'Number of trees. More is steadier but slower.' },
     { key: 'max_depth', label: 'Max depth', type: 'int', default: null, min: 1, max: 50, step: 1, help: 'Deepest a tree may grow. Empty means no limit. Lower values overfit less.' },
@@ -74,92 +78,181 @@ export const HYPERPARAMS: Record<AlgorithmId, HyperparamSpec[]> = {
 
 /** Raw field text per key. A missing key (or an empty string) means "use the default". */
 export type HyperparamValues = Record<string, string>;
-export type HyperparamsByAlgorithm = Partial<Record<AlgorithmId, HyperparamValues>>;
+export type HyperparamsByAlgorithm = Record<string, HyperparamValues>;
 
-export function specsFor(algorithm: string): HyperparamSpec[] {
-  return HYPERPARAMS[algorithm as AlgorithmId] ?? [];
-}
+export type ParamValue = number | string | boolean;
 
-export function algorithmInfo(algorithm: string): AlgorithmInfo | undefined {
-  return ALGORITHMS.find((a) => a.id === algorithm);
-}
+/* ---------- Built-in fallback list (used only when the backend call fails) ---------- */
 
-function defaultText(spec: HyperparamSpec): string {
-  return spec.default === null ? '' : String(spec.default);
-}
-
-/** The text a field shows: what the user set, or the default. */
-export function displayValue(spec: HyperparamSpec, values: HyperparamValues): string {
-  return values[spec.key] ?? defaultText(spec);
-}
-
-const INVALID = Symbol('invalid');
-
-function parseValue(spec: HyperparamSpec, text: string): number | string | null | typeof INVALID {
-  const trimmed = text.trim();
+function toParamDef(spec: HyperparamSpec): ParamDefDto {
   if (spec.type === 'select') {
-    return spec.options?.some((o) => o.value === trimmed) ? trimmed : INVALID;
+    const choices = (spec.options ?? []).map((o) => o.value).filter((v) => v !== '');
+    return { key: spec.key, label: spec.label, type: 'choice', default: spec.default === '' ? null : spec.default, choices, help: spec.help };
   }
-  if (trimmed === '') return spec.default === null ? null : INVALID;
-  const n = Number(trimmed);
-  if (!Number.isFinite(n)) return INVALID;
-  if (spec.type === 'int' && !Number.isInteger(n)) return INVALID;
-  if (spec.min !== undefined && n < spec.min) return INVALID;
-  if (spec.max !== undefined && n > spec.max) return INVALID;
-  return n;
+  return {
+    key: spec.key, label: spec.label, type: spec.type === 'int' ? 'int' : 'float', default: spec.default,
+    min: spec.min ?? null, max: spec.max ?? null, help: spec.help,
+  };
+}
+
+export const CUSTOM_ALGORITHM_ID = 'custom';
+
+/** The algorithm list shown until (or unless) the backend reports its own. */
+export const BUILTIN_ALGORITHMS: AlgorithmDto[] = [
+  ...ALGORITHMS.map((a): AlgorithmDto => ({
+    id: a.id, label: a.label, description: a.description, params: HYPERPARAMS[a.id].map(toParamDef), accepts_extra_params: true,
+  })),
+  {
+    id: CUSTOM_ALGORITHM_ID, label: 'Custom estimator (Python file)',
+    description: 'Your own scikit-learn style classifier from estimators/<name>.py.', params: [], accepts_extra_params: true,
+  },
+];
+
+export function findAlgorithm(algorithms: AlgorithmDto[], id: string): AlgorithmDto | undefined {
+  return algorithms.find((a) => a.id === id);
+}
+
+export function paramDefsFor(algorithms: AlgorithmDto[], id: string): ParamDefDto[] {
+  return findAlgorithm(algorithms, id)?.params ?? [];
+}
+
+/* ---------- Parsing and validation of one field ---------- */
+
+type Parsed = { ok: true; unset: true } | { ok: true; unset: false; value: ParamValue } | { ok: false; error: string };
+
+const INT_RE = /^[+-]?\d+$/;
+const FLOAT_RE = /^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i;
+
+function rangeText(def: ParamDefDto): string {
+  const hasMin = def.min !== null && def.min !== undefined;
+  const hasMax = def.max !== null && def.max !== undefined;
+  if (hasMin && hasMax) return ` between ${def.min} and ${def.max}`;
+  if (hasMin) return ` of at least ${def.min}`;
+  if (hasMax) return ` of at most ${def.max}`;
+  return '';
+}
+
+export function parseParam(def: ParamDefDto, raw: string | undefined): Parsed {
+  const text = (raw ?? '').trim();
+  if (text === '') return { ok: true, unset: true };
+  switch (def.type) {
+    case 'int':
+    case 'float': {
+      const isInt = def.type === 'int';
+      const n = Number(text);
+      if (!(isInt ? INT_RE : FLOAT_RE).test(text) || !Number.isFinite(n) || (isInt && !Number.isSafeInteger(n))) {
+        return { ok: false, error: `${def.label} must be ${isInt ? 'a whole number' : 'a number'}${rangeText(def)}.` };
+      }
+      if ((def.min !== null && def.min !== undefined && n < def.min) || (def.max !== null && def.max !== undefined && n > def.max)) {
+        return { ok: false, error: `${def.label} must be ${isInt ? 'a whole number' : 'a number'}${rangeText(def)}.` };
+      }
+      return { ok: true, unset: false, value: n };
+    }
+    case 'bool':
+      if (text === 'true' || text === 'false') return { ok: true, unset: false, value: text === 'true' };
+      return { ok: false, error: `${def.label} must be on or off.` };
+    case 'choice':
+      if ((def.choices ?? []).includes(text)) return { ok: true, unset: false, value: text };
+      return { ok: false, error: `${def.label}: pick one of the listed options.` };
+    default:
+      return { ok: true, unset: false, value: text };
+  }
+}
+
+function sameAsDefault(def: ParamDefDto, value: ParamValue): boolean {
+  const d = def.default;
+  if (d === null || d === undefined) return false;
+  if (def.type === 'int' || def.type === 'float') return Number(d) === value;
+  if (def.type === 'bool') return (d === true || d === 'true') === value;
+  return String(d) === String(value);
+}
+
+/** True when this field holds something other than its default. */
+export function isChanged(def: ParamDefDto, values: HyperparamValues): boolean {
+  const parsed = parseParam(def, values[def.key]);
+  if (!parsed.ok) return true; // being edited into something invalid still counts as touched
+  return !parsed.unset && !sameAsDefault(def, parsed.value);
 }
 
 /** Per-key error messages for the current text; empty when everything is valid. */
-export function validateHyperparams(algorithm: string, values: HyperparamValues): Record<string, string> {
+export function validateParams(defs: ParamDefDto[], values: HyperparamValues): Record<string, string> {
   const errors: Record<string, string> = {};
-  for (const spec of specsFor(algorithm)) {
-    const text = values[spec.key];
-    if (text === undefined) continue;
-    if (parseValue(spec, text) !== INVALID) continue;
-    if (spec.type === 'select') {
-      errors[spec.key] = `${spec.label}: pick one of the listed options.`;
-    } else {
-      const kind = spec.type === 'int' ? 'a whole number' : 'a number';
-      const range = spec.min !== undefined && spec.max !== undefined ? ` between ${spec.min} and ${spec.max}` : '';
-      errors[spec.key] = `${spec.label} must be ${kind}${range}.`;
-    }
+  for (const def of defs) {
+    const parsed = parseParam(def, values[def.key]);
+    if (!parsed.ok) errors[def.key] = parsed.error;
   }
   return errors;
 }
 
-/** True when this field holds something other than its default. */
-export function isChanged(spec: HyperparamSpec, values: HyperparamValues): boolean {
-  const text = values[spec.key];
-  if (text === undefined) return false;
-  const parsed = parseValue(spec, text);
-  if (parsed === INVALID) return true; // being edited into something invalid still counts as touched
-  if (spec.type === 'select') return text !== defaultText(spec);
-  return parsed !== spec.default;
-}
-
-/**
- * The hyperparameters to send: only valid values that differ from the default.
- * Everything else is left out so the trainer keeps its own defaults.
- */
-export function changedHyperparams(algorithm: string, values: HyperparamValues): Record<string, number | string> {
-  const out: Record<string, number | string> = {};
-  for (const spec of specsFor(algorithm)) {
-    const text = values[spec.key];
-    if (text === undefined) continue;
-    const parsed = parseValue(spec, text);
-    if (parsed === INVALID || parsed === null) continue;
-    if (spec.type === 'select') {
-      if (parsed !== '' && text !== defaultText(spec)) out[spec.key] = parsed as string;
-    } else if (parsed !== spec.default) {
-      out[spec.key] = parsed as number;
-    }
+/** The generated parameters to send: only valid values that differ from the default. */
+export function changedParams(defs: ParamDefDto[], values: HyperparamValues): Record<string, ParamValue> {
+  const out: Record<string, ParamValue> = {};
+  for (const def of defs) {
+    const parsed = parseParam(def, values[def.key]);
+    if (!parsed.ok || parsed.unset || sameAsDefault(def, parsed.value)) continue;
+    out[def.key] = parsed.value;
   }
   return out;
 }
 
-export function changedCount(algorithm: string, values: HyperparamValues): number {
-  return specsFor(algorithm).filter((s) => isChanged(s, values)).length;
+export function changedCount(defs: ParamDefDto[], values: HyperparamValues): number {
+  return defs.filter((d) => isChanged(d, values)).length;
 }
+
+/** What an empty field shows as its placeholder. */
+export function placeholderFor(def: ParamDefDto): string {
+  if (def.default === null || def.default === undefined) return 'not set';
+  return String(def.default);
+}
+
+/* ---------- The free-form JSON box ---------- */
+
+export type AdvancedParse = { ok: true; value: Record<string, ParamValue | null> } | { ok: false; error: string };
+
+/** Parse the "Advanced parameters" text: empty is fine, otherwise a flat JSON object. */
+export function parseAdvanced(text: string | undefined): AdvancedParse {
+  const raw = (text ?? '').trim();
+  if (raw === '') return { ok: true, value: {} };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return { ok: false, error: `Advanced parameters are not valid JSON: ${err instanceof Error ? err.message : 'parse error'}` };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, error: 'Advanced parameters must be a JSON object, for example {"n_jobs": 2}.' };
+  }
+  const out: Record<string, ParamValue | null> = {};
+  for (const [key, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (v !== null && typeof v !== 'number' && typeof v !== 'string' && typeof v !== 'boolean') {
+      return { ok: false, error: `"${key}" must be a number, text, true/false or null. Nested objects and lists are not supported.` };
+    }
+    out[key] = v;
+  }
+  return { ok: true, value: out };
+}
+
+export interface MergedParams {
+  /** Generated changed values plus the JSON keys. Meaningful only when `errors` is empty. */
+  params: Record<string, ParamValue | null>;
+  /** Keys set both in a changed field and in the JSON. */
+  collisions: string[];
+  /** JSON problems and collisions, in plain words. */
+  errors: string[];
+  /** Number of keys the JSON box contributes. */
+  advancedKeys: number;
+}
+
+export function mergeParams(defs: ParamDefDto[], values: HyperparamValues, advancedText: string | undefined): MergedParams {
+  const generated = changedParams(defs, values);
+  const advanced = parseAdvanced(advancedText);
+  if (!advanced.ok) return { params: generated, collisions: [], errors: [advanced.error], advancedKeys: 0 };
+  const collisions = Object.keys(advanced.value).filter((k) => k in generated);
+  const errors = collisions.map((k) => `"${k}" is set both in its field above and in the Advanced JSON. Clear one of them.`);
+  return { params: { ...generated, ...advanced.value }, collisions, errors, advancedKeys: Object.keys(advanced.value).length };
+}
+
+/* ---------- Quick-fills (the old fixed presets, now just ordinary values) ---------- */
 
 export type PresetId = 'fast' | 'balanced' | 'thorough';
 
@@ -169,7 +262,7 @@ export const PRESETS: { id: PresetId; label: string; hint: string }[] = [
   { id: 'thorough', label: 'Thorough', hint: 'Larger and slower, with gentler learning steps.' },
 ];
 
-const PRESET_VALUES: Record<AlgorithmId, Record<PresetId, Record<string, string>>> = {
+const PRESET_VALUES: Record<BuiltinAlgorithmId, Record<PresetId, Record<string, string>>> = {
   random_forest: {
     fast: { n_estimators: '50', max_depth: '6', min_samples_leaf: '5' },
     balanced: { n_estimators: '200', max_depth: '8', min_samples_leaf: '10', class_weight: 'balanced' },
@@ -192,18 +285,39 @@ const PRESET_VALUES: Record<AlgorithmId, Record<PresetId, Record<string, string>
   },
 };
 
-/** Field text a preset sets for an algorithm (every key the preset names, even when equal to the default). */
-export function presetValues(algorithm: string, preset: PresetId): HyperparamValues {
-  return { ...(PRESET_VALUES[algorithm as AlgorithmId]?.[preset] ?? {}) };
+/** True when the quick-fills know this algorithm. */
+export function hasQuickFill(algorithm: string): boolean {
+  return algorithm in PRESET_VALUES;
 }
 
-/** Turn a stored model's hyperparameters back into field text, keeping only known keys. */
-export function valuesFromModel(algorithm: string, stored: Record<string, unknown>): HyperparamValues {
-  const out: HyperparamValues = {};
-  for (const spec of specsFor(algorithm)) {
-    const v = stored[spec.key];
+/**
+ * Field text a quick-fill sets for an algorithm (every key it names, even when equal to the default).
+ * Keys the algorithm does not report are skipped so a quick-fill never invents a parameter.
+ */
+export function presetValues(algorithm: string, preset: PresetId, defs: ParamDefDto[]): HyperparamValues {
+  const wanted = PRESET_VALUES[algorithm as BuiltinAlgorithmId]?.[preset] ?? {};
+  const known = new Set(defs.map((d) => d.key));
+  return Object.fromEntries(Object.entries(wanted).filter(([k]) => known.has(k)));
+}
+
+/**
+ * Turn a stored model's hyperparameters back into form state: values for the generated fields, and a
+ * JSON object text for everything else (except `random_state`, which has its own field).
+ */
+export function valuesFromStored(defs: ParamDefDto[], stored: Record<string, unknown> | undefined): { values: HyperparamValues; advanced: string; randomState: string } {
+  const values: HyperparamValues = {};
+  const extra: Record<string, unknown> = {};
+  let randomState = '';
+  const known = new Set(defs.map((d) => d.key));
+  for (const [key, v] of Object.entries(stored ?? {})) {
     if (v === undefined || v === null) continue;
-    out[spec.key] = String(v);
+    if (key === 'random_state' && !known.has(key)) {
+      if (typeof v === 'number' && Number.isInteger(v)) randomState = String(v);
+    } else if (known.has(key)) {
+      values[key] = String(v);
+    } else if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') {
+      extra[key] = v;
+    }
   }
-  return out;
+  return { values, advanced: Object.keys(extra).length > 0 ? JSON.stringify(extra, null, 2) : '', randomState };
 }

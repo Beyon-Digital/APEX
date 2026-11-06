@@ -64,16 +64,20 @@ test.describe('Copilot tile', () => {
     expect(floating).toBe(0);
   });
 
-  test('the header launcher adds the tile once and highlights it when already open', async ({ page }) => {
+  test('the header button toggles the Copilot tile on and off', async ({ page }) => {
     await open(page);
+    const button = page.getByTestId('copilot-launch');
     await expect(page.getByTestId('tile-copilot')).toHaveCount(0);
-    await page.getByTestId('copilot-launch').click();
+    await expect(button).toHaveAttribute('aria-pressed', 'false');
+
+    await button.click();
     await expect(page.getByTestId('tile-copilot')).toBeVisible();
     await expect(page.getByTestId('copilot-panel')).toBeVisible();
-    await expect(page.getByTestId('tile-copilot')).toHaveClass(/border-accent/);
+    await expect(button).toHaveAttribute('aria-pressed', 'true');
 
-    await page.getByTestId('copilot-launch').click();
-    await expect(page.getByTestId('tile-copilot')).toHaveCount(1);
+    await button.click();
+    await expect(page.getByTestId('tile-copilot')).toHaveCount(0);
+    await expect(button).toHaveAttribute('aria-pressed', 'false');
   });
 
   for (const word of [':COPILOT', ':AI']) {

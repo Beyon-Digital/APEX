@@ -17,6 +17,7 @@ const ACTION_LABEL: Record<string, string> = {
   'automation.create': 'Created automation',
   'automation.toggle': 'Toggled automation',
   'automation.delete': 'Deleted automation',
+  'automation.short': 'Changed automation shorting',
   'dataset.build': 'Built dataset',
   'dataset.delete': 'Deleted dataset',
 };

@@ -1,12 +1,16 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { openItem } from '../../stores/navStore';
 import {
-  DATASET_RETURN_COLUMN, datasetFeatures, useMLStore, validateSettings, type RunResult, type TrainSettings,
+  DATASET_RETURN_COLUMN, MAX_HOLDOUT_PCT, MAX_SPLITS, allDatasetFeatures, datasetFeatures, trainContext, useMLStore, validateSettings,
+  type RunResult, type TrainSettings,
 } from '../../stores/mlStore';
+import type { TradeMode } from '../../lib/types';
+import { EstimatorEditor } from './EstimatorEditor';
+import { ParamEditor } from './ParamEditor';
 import {
-  ALGORITHMS, PRESETS, algorithmInfo, changedCount, displayValue, isChanged, presetValues, specsFor, validateHyperparams,
-  type AlgorithmId,
+  CUSTOM_ALGORITHM_ID, PRESETS, changedCount, findAlgorithm, hasQuickFill, mergeParams, paramDefsFor, presetValues, type PresetId,
 } from './hyperparams';
+import { presetSlug } from './trainingPresets';
 
 const inputCls =
   'px-2 py-1 text-xs bg-surface-0 border border-[var(--border-color)] text-text-primary focus:border-accent focus:outline-none disabled:opacity-50';
@@ -19,8 +23,6 @@ const headCls = 'text-[11px] font-semibold uppercase tracking-wider text-text-se
 
 const pct = (v: number | undefined) => (v === undefined || !Number.isFinite(v) ? 'n/a' : `${(v * 100).toFixed(1)}%`);
 const signed = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
-
-const algoLabel = (id: string) => algorithmInfo(id)?.label ?? id;
 
 export interface TrainingFormProps {
   /** Called when the user wants to see the datasets (e.g. none exist yet). */
@@ -38,11 +40,134 @@ function useElapsed(startedAt: number | null): number {
   return startedAt === null ? 0 : Math.max(0, Math.floor((now - startedAt) / 1000));
 }
 
+const slug = presetSlug;
+
+/** Your saved training configurations: save, load, rename, delete, export, import. */
+const PresetPanel: React.FC = () => {
+  const presets = useMLStore((s) => s.presets);
+  const savePreset = useMLStore((s) => s.savePreset);
+  const loadPreset = useMLStore((s) => s.loadPreset);
+  const renamePreset = useMLStore((s) => s.renamePreset);
+  const deletePreset = useMLStore((s) => s.deletePreset);
+  const exportPresets = useMLStore((s) => s.exportPresets);
+  const importPresets = useMLStore((s) => s.importPresets);
+
+  const [name, setName] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [notes, setNotes] = useState<string[]>([]);
+  const [info, setInfo] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState<{ id: string; text: string } | null>(null);
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [io, setIo] = useState('');
+  const [ioMessage, setIoMessage] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const save = () => {
+    const result = savePreset(name);
+    if (!result.ok) { setError(result.error ?? 'Could not save'); return; }
+    setInfo(`Saved "${name.trim()}".`);
+    setError(null); setNotes([]); setName('');
+  };
+
+  const load = (id: string, presetName: string) => {
+    const result = loadPreset(id);
+    setError(null);
+    setNotes(result.notes);
+    setInfo(result.ok ? `Loaded "${presetName}".` : null);
+  };
+
+  const commitRename = () => {
+    if (!renaming) return;
+    const result = renamePreset(renaming.id, renaming.text);
+    if (!result.ok) { setRenameError(result.error ?? 'Could not rename'); return; }
+    setRenaming(null); setRenameError(null);
+  };
+
+  const doExport = async () => {
+    const text = exportPresets();
+    setIo(text);
+    try {
+      await navigator.clipboard.writeText(text);
+      setIoMessage({ ok: true, text: 'Copied to the clipboard. The JSON is also shown below.' });
+    } catch {
+      setIoMessage({ ok: true, text: 'Could not use the clipboard. Copy the JSON below instead.' });
+    }
+  };
+
+  const doImport = () => {
+    const result = importPresets(io);
+    setIoMessage(result.ok
+      ? { ok: true, text: `Imported ${result.added} preset${result.added === 1 ? '' : 's'}.` }
+      : { ok: false, text: result.error ?? 'Import failed' });
+  };
+
+  return (
+    <section className={sectionCls} data-testid="ml-user-presets">
+      <div className={headCls}>Saved configurations</div>
+      <div className="text-[11px] text-text-muted">
+        Save everything on this tab except the dataset (algorithm, parameters, evaluation settings, features by name, lags) and load it later, also onto another dataset.
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <input className={`${inputCls} w-56`} value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') save(); }} placeholder="Name this configuration" aria-label="Preset name" data-testid="ml-upreset-name" />
+        <button type="button" className={btnCls} onClick={save} disabled={!name.trim()} data-testid="ml-upreset-save">Save current</button>
+        {error && <span className="text-[11px] text-bear" data-testid="ml-upreset-error">{error}</span>}
+        {!error && info && <span className="text-[11px] text-bull" data-testid="ml-upreset-info">{info}</span>}
+      </div>
+      {notes.length > 0 && (
+        <ul className="list-disc border border-warning/40 bg-warning/10 py-1 pl-6 pr-2 text-[11px] text-warning" data-testid="ml-upreset-notes">
+          {notes.map((n) => <li key={n}>{n}</li>)}
+        </ul>
+      )}
+      {presets.length === 0 ? (
+        <div className="text-[11px] text-text-muted" data-testid="ml-upreset-empty">No saved configurations yet.</div>
+      ) : (
+        <ul className="space-y-1" data-testid="ml-upreset-list">
+          {presets.map((p) => (
+            <li key={p.id} className="flex flex-wrap items-center gap-2 border border-[var(--border-color)] bg-surface-0 px-2 py-1" data-testid={`ml-upreset-row-${slug(p.name)}`}>
+              {renaming?.id === p.id ? (
+                <>
+                  <input className={`${inputCls} w-48`} value={renaming.text} onChange={(e) => setRenaming({ id: p.id, text: e.target.value })} onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') { setRenaming(null); setRenameError(null); } }} aria-label="New preset name" data-testid="ml-upreset-rename-input" autoFocus />
+                  <button type="button" className={btnCls} onClick={commitRename} data-testid="ml-upreset-rename-ok">OK</button>
+                  <button type="button" className={btnCls} onClick={() => { setRenaming(null); setRenameError(null); }} data-testid="ml-upreset-rename-cancel">Cancel</button>
+                  {renameError && <span className="text-[11px] text-bear" data-testid="ml-upreset-rename-error">{renameError}</span>}
+                </>
+              ) : (
+                <>
+                  <span className="text-xs text-text-primary" data-testid={`ml-upreset-name-${slug(p.name)}`}>{p.name}</span>
+                  <span className="font-mono text-[10px] text-text-muted">{p.algorithm}, {p.nSplits} splits, {p.tradeMode === 'long_short' ? 'long/short' : 'long/flat'}</span>
+                  <span className="ml-auto flex gap-2 text-[11px] font-mono text-accent">
+                    <button type="button" className="hover:underline" onClick={() => load(p.id, p.name)} data-testid={`ml-upreset-load-${slug(p.name)}`}>load</button>
+                    <button type="button" className="hover:underline" onClick={() => { setRenaming({ id: p.id, text: p.name }); setRenameError(null); }} data-testid={`ml-upreset-rename-${slug(p.name)}`}>rename</button>
+                    <button type="button" className="text-bear hover:underline" onClick={() => deletePreset(p.id)} data-testid={`ml-upreset-delete-${slug(p.name)}`}>delete</button>
+                  </span>
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="space-y-1 border-t border-[var(--border-color)] pt-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[11px] text-text-secondary">Share</span>
+          <button type="button" className={btnCls} onClick={() => void doExport()} disabled={presets.length === 0} data-testid="ml-upreset-export">Export all (copy)</button>
+          <button type="button" className={btnCls} onClick={doImport} disabled={!io.trim()} data-testid="ml-upreset-import">Import pasted JSON</button>
+          {ioMessage && <span className={`text-[11px] ${ioMessage.ok ? 'text-bull' : 'text-bear'}`} data-testid="ml-upreset-io-message">{ioMessage.text}</span>}
+        </div>
+        <textarea className={`${inputCls} block h-20 w-full font-mono`} value={io} onChange={(e) => { setIo(e.target.value); setIoMessage(null); }} placeholder="Export fills this box. To import, paste exported JSON here." spellCheck={false} aria-label="Preset JSON" data-testid="ml-upreset-io" />
+      </div>
+    </section>
+  );
+};
+
 export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
   const settings = useMLStore((s) => s.settings);
   const datasets = useMLStore((s) => s.datasets);
+  const algorithms = useMLStore((s) => s.algorithms);
+  const algorithmsNotice = useMLStore((s) => s.algorithmsNotice);
+  const estimatorFiles = useMLStore((s) => s.estimatorFiles);
   const patch = useMLStore((s) => s.patchSettings);
   const setHyperparams = useMLStore((s) => s.setHyperparams);
+  const loadAlgorithms = useMLStore((s) => s.loadAlgorithms);
+  const refreshEstimators = useMLStore((s) => s.refreshEstimators);
   const isTraining = useMLStore((s) => s.isTraining);
   const startedAt = useMLStore((s) => s.trainingStartedAt);
   const trainingLabel = useMLStore((s) => s.trainingLabel);
@@ -52,44 +177,49 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
   const train = useMLStore((s) => s.train);
   const compare = useMLStore((s) => s.compare);
 
+  useEffect(() => { void loadAlgorithms(); void refreshEstimators(); }, [loadAlgorithms, refreshEstimators]);
+
   const elapsed = useElapsed(startedAt);
   const algorithm = settings.algorithm;
-  const specs = specsFor(algorithm);
+  const algo = findAlgorithm(algorithms, algorithm);
+  const defs = paramDefsFor(algorithms, algorithm);
   const values = settings.hyperparams[algorithm] ?? {};
-  const hpErrors = validateHyperparams(algorithm, values);
-  const problems = useMemo(() => validateSettings(settings, datasets), [settings, datasets]);
+  const advanced = settings.advanced[algorithm] ?? '';
+  const ctx = useMemo(() => trainContext({ algorithms, estimatorFiles }), [algorithms, estimatorFiles]);
+  const problems = useMemo(() => validateSettings(settings, datasets, settings.algorithm, ctx), [settings, datasets, ctx]);
   const { info, features } = datasetFeatures(settings, datasets);
+  const allFeatures = info ? allDatasetFeatures(info) : [];
+  const customNames = new Set((info?.custom_features ?? []).map((c) => c.name));
   const comparing = leaderboard.length > 0;
+  const labelOf = (id: string) => findAlgorithm(algorithms, id)?.label ?? id;
 
+  const queue = useMemo(() => settings.compareAlgos.filter((a) => findAlgorithm(algorithms, a)), [settings.compareAlgos, algorithms]);
   const compareProblems = useMemo(
-    () => settings.compareAlgos.flatMap((a) => validateSettings(settings, datasets, a)),
-    [settings, datasets],
+    () => queue.flatMap((a) => validateSettings(settings, datasets, a, ctx)),
+    [queue, settings, datasets, ctx],
   );
 
   const set = <K extends keyof TrainSettings>(key: K, value: TrainSettings[K]) => patch({ [key]: value } as Partial<TrainSettings>);
 
-  const setValue = (key: string, text: string) => setHyperparams(algorithm, { ...values, [key]: text });
-  const resetKey = (key: string) => {
-    const next = { ...values };
-    delete next[key];
-    setHyperparams(algorithm, next);
-  };
-
-  const applyPreset = (preset: (typeof PRESETS)[number]['id']) => {
-    const targets = new Set<AlgorithmId>([algorithm, ...settings.compareAlgos]);
+  const quickFill = (preset: PresetId) => {
+    const targets = new Set<string>([algorithm, ...queue]);
     const byAlgo = { ...settings.hyperparams };
-    targets.forEach((a) => { byAlgo[a] = presetValues(a, preset); });
+    targets.forEach((a) => {
+      if (hasQuickFill(a)) byAlgo[a] = presetValues(a, preset, paramDefsFor(algorithms, a));
+    });
     patch({ hyperparams: byAlgo });
   };
 
   const toggleFeature = (id: string) => {
-    const base = info?.features ?? [];
-    const current = settings.selectedFeatures ?? base;
-    patch({ selectedFeatures: current.includes(id) ? current.filter((f) => f !== id) : base.filter((f) => f === id || current.includes(f)) });
+    const current = settings.selectedFeatures ?? allFeatures;
+    patch({ selectedFeatures: current.includes(id) ? current.filter((f) => f !== id) : allFeatures.filter((f) => f === id || current.includes(f)) });
   };
 
-  const toggleCompare = (id: AlgorithmId) =>
+  const toggleCompare = (id: string) =>
     set('compareAlgos', settings.compareAlgos.includes(id) ? settings.compareAlgos.filter((a) => a !== id) : [...settings.compareAlgos, id]);
+
+  const holdoutNumber = Number(settings.holdoutPct);
+  const holdoutShown = Number.isFinite(holdoutNumber) && settings.holdoutPct.trim() !== '' ? holdoutNumber : 0;
 
   const lagInput = (
     <label className="text-[11px] text-text-secondary">Lag periods (comma-separated, optional)
@@ -97,8 +227,15 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
     </label>
   );
 
+  const tradeModes: { id: TradeMode; label: string; text: string }[] = [
+    { id: 'long_flat', label: 'Long / flat', text: 'A buy signal holds the asset; any other signal sits in cash. Never bets on a fall.' },
+    { id: 'long_short', label: 'Long / short', text: 'A buy signal holds the asset and a sell signal bets on a fall (short). Scores what a rule that may short could earn.' },
+  ];
+
   return (
     <div className="space-y-3 max-w-4xl" data-testid="ml-training-form">
+      <PresetPanel />
+
       {/* Data */}
       <section className={sectionCls} data-testid="ml-train-data">
         <div className="flex items-center justify-between">
@@ -137,17 +274,18 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
                 </div>
                 <div>
                   <div className="mb-1 flex items-center justify-between">
-                    <span className="text-[11px] text-text-secondary" data-testid="ml-train-feature-count">Features ({features.length} of {info.features.length} on)</span>
+                    <span className="text-[11px] text-text-secondary" data-testid="ml-train-feature-count">Features ({features.length} of {allFeatures.length} on)</span>
                     <span className="flex gap-2 text-[10px] font-mono text-accent">
                       <button type="button" className="hover:underline" onClick={() => set('selectedFeatures', null)} data-testid="ml-train-features-all">all</button>
                       <button type="button" className="hover:underline" onClick={() => set('selectedFeatures', [])} data-testid="ml-train-features-none">none</button>
                     </span>
                   </div>
                   <div className="flex flex-wrap gap-x-3 gap-y-1 border border-[var(--border-color)] bg-surface-0 p-2" data-testid="ml-feature-list">
-                    {info.features.map((f) => (
+                    {allFeatures.map((f) => (
                       <label key={f} className="flex cursor-pointer items-center gap-1 text-xs font-mono text-text-primary">
                         <input type="checkbox" className="accent-[rgb(var(--color-accent-rgb))]" checked={features.includes(f)} onChange={() => toggleFeature(f)} data-testid={`ml-train-feature-${f}`} />
                         {f}
+                        {customNames.has(f) && <span className="border border-accent/50 px-0.5 text-[9px] uppercase text-accent">custom</span>}
                       </label>
                     ))}
                   </div>
@@ -172,70 +310,79 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
         )}
       </section>
 
-      {/* Algorithm and hyperparameters */}
+      {/* Algorithm and parameters */}
       <section className={sectionCls} data-testid="ml-train-algorithm">
         <div className={headCls}>2. Algorithm</div>
-        <select className={`${inputCls} block w-64`} value={algorithm} onChange={(e) => set('algorithm', e.target.value as AlgorithmId)} data-testid="ml-algorithm-select" aria-label="Algorithm">
-          {ALGORITHMS.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
+        {algorithmsNotice && <div className="border border-warning/40 bg-warning/10 px-2 py-1 text-[11px] text-warning" data-testid="ml-algorithms-notice">{algorithmsNotice}</div>}
+        <select className={`${inputCls} block w-72`} value={algorithm} onChange={(e) => set('algorithm', e.target.value)} data-testid="ml-algorithm-select" aria-label="Algorithm">
+          {!algo && <option value={algorithm}>{algorithm}</option>}
+          {algorithms.map((a) => <option key={a.id} value={a.id} title={a.description}>{a.label}</option>)}
         </select>
-        <div className="text-[11px] text-text-muted" data-testid="ml-algorithm-desc">{algorithmInfo(algorithm)?.description}</div>
+        <div className="text-[11px] text-text-muted" data-testid="ml-algorithm-desc">{algo?.description}</div>
 
-        <div className="flex flex-wrap items-center gap-1.5 pt-1">
-          <span className="text-[11px] text-text-secondary">Hyperparameters</span>
-          <span className="text-[11px] text-text-muted" data-testid="ml-hp-changed-count">{changedCount(algorithm, values)} changed from default</span>
-          <span className="ml-auto flex items-center gap-1.5">
-            <span className="text-[11px] text-text-muted">Presets</span>
-            {PRESETS.map((p) => (
-              <button key={p.id} type="button" className={btnCls} title={p.hint} onClick={() => applyPreset(p.id)} data-testid={`ml-preset-${p.id}`}>{p.label}</button>
-            ))}
-            <button type="button" className={btnCls} onClick={() => setHyperparams(algorithm, {})} disabled={changedCount(algorithm, values) === 0 && Object.keys(values).length === 0} data-testid="ml-hp-reset-all">Reset all</button>
-          </span>
-        </div>
-        <div className="grid grid-cols-1 gap-2 md:grid-cols-2" data-testid="ml-hp-editor">
-          {specs.map((spec) => {
-            const changed = isChanged(spec, values);
-            const err = hpErrors[spec.key];
-            return (
-              <div key={spec.key} className={`border p-2 ${err ? 'border-bear/50' : changed ? 'border-accent/50' : 'border-[var(--border-color)]'} bg-surface-0`} data-testid={`ml-hp-field-${spec.key}`}>
-                <div className="flex items-center justify-between gap-2">
-                  <label className="text-[11px] text-text-secondary" htmlFor={`ml-hp-${spec.key}`}>
-                    {spec.label} <span className="font-mono text-text-muted">{spec.key}</span>
-                  </label>
-                  {changed && <button type="button" className="text-[10px] font-mono text-accent hover:underline" onClick={() => resetKey(spec.key)} data-testid={`ml-hp-reset-${spec.key}`}>reset</button>}
-                </div>
-                {spec.type === 'select' ? (
-                  <select id={`ml-hp-${spec.key}`} className={`${inputCls} mt-0.5 block w-full`} value={displayValue(spec, values)} onChange={(e) => setValue(spec.key, e.target.value)} data-testid={`ml-hp-${spec.key}`}>
-                    {spec.options?.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                  </select>
-                ) : (
-                  <input
-                    id={`ml-hp-${spec.key}`}
-                    className={`${inputCls} mt-0.5 block w-full font-mono`}
-                    type="number" min={spec.min} max={spec.max} step={spec.step}
-                    placeholder={spec.default === null ? 'no limit' : String(spec.default)}
-                    value={displayValue(spec, values)}
-                    onChange={(e) => setValue(spec.key, e.target.value)}
-                    aria-invalid={err !== undefined}
-                    data-testid={`ml-hp-${spec.key}`}
-                  />
-                )}
-                <div className="mt-0.5 text-[10px] text-text-muted">{spec.help}</div>
-                {err && <div className="text-[11px] text-bear" data-testid={`ml-hp-error-${spec.key}`}>{err}</div>}
-              </div>
-            );
-          })}
-        </div>
+        {algorithm === CUSTOM_ALGORITHM_ID && <EstimatorEditor />}
+
+        <ParamEditor
+          defs={defs}
+          values={values}
+          advanced={advanced}
+          onValues={(next) => setHyperparams(algorithm, next)}
+          onAdvanced={(text) => patch({ advanced: { ...settings.advanced, [algorithm]: text } })}
+          toolbarExtra={hasQuickFill(algorithm) ? (
+            <>
+              <span className="text-[11px] text-text-muted" title="Quick-fills just set the ordinary fields below, which you can edit afterwards.">Quick fill</span>
+              {PRESETS.map((p) => (
+                <button key={p.id} type="button" className={btnCls} title={p.hint} onClick={() => quickFill(p.id)} data-testid={`ml-preset-${p.id}`}>{p.label}</button>
+              ))}
+            </>
+          ) : null}
+        />
       </section>
 
-      {/* Validation */}
+      {/* Evaluation */}
       <section className={sectionCls} data-testid="ml-train-validation-section">
-        <div className={headCls}>3. Validation</div>
+        <div className={headCls}>3. Evaluation</div>
         <label className="block text-[11px] text-text-secondary">
-          Cross-validation splits (2-10)
-          <input className={`${inputCls} mt-0.5 block w-24`} type="number" min={2} max={10} value={settings.nSplits} onChange={(e) => set('nSplits', e.target.value)} data-testid="ml-cv-splits" />
+          Cross-validation splits (2-{MAX_SPLITS})
+          <input className={`${inputCls} mt-0.5 block w-24`} type="number" min={2} max={MAX_SPLITS} value={settings.nSplits} onChange={(e) => set('nSplits', e.target.value)} data-testid="ml-cv-splits" />
         </label>
         <div className="text-[11px] text-text-muted" data-testid="ml-cv-help">
           Time-ordered cross-validation: each split trains on the past and tests on the next block, never on the future. A gap (embargo) is left between the training and test rows so a training row&apos;s label, which looks ahead, cannot overlap the test period.
+        </div>
+
+        <fieldset className="space-y-1" data-testid="ml-trade-mode">
+          <legend className="text-[11px] text-text-secondary">Trading simulation</legend>
+          {tradeModes.map((m) => (
+            <label key={m.id} className="flex cursor-pointer items-start gap-1.5 text-xs text-text-primary">
+              <input type="radio" name="ml-trade-mode" className="mt-0.5 accent-[rgb(var(--color-accent-rgb))]" checked={settings.tradeMode === m.id} onChange={() => set('tradeMode', m.id)} data-testid={`ml-trade-mode-${m.id}`} />
+              <span>{m.label} <span className="text-text-muted">{m.text}</span></span>
+            </label>
+          ))}
+          {settings.tradeMode === 'long_short' && (
+            <div className="border border-warning/40 bg-warning/10 px-2 py-1 text-[11px] text-warning" data-testid="ml-trade-mode-warning">
+              This only changes how the model is scored. An automation shorts only if its rule allows shorting and its broker can short; otherwise it stays flat on a sell signal, and its real result will be closer to the long / flat score.
+            </div>
+          )}
+        </fieldset>
+
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div className="space-y-1">
+            <label className="block text-[11px] text-text-secondary" htmlFor="ml-holdout-pct">Hold-out (0-{MAX_HOLDOUT_PCT}%)</label>
+            <div className="flex items-center gap-2">
+              <input type="range" min={0} max={MAX_HOLDOUT_PCT} step={1} value={Math.min(MAX_HOLDOUT_PCT, Math.max(0, holdoutShown))} onChange={(e) => set('holdoutPct', e.target.value)} className="w-40 accent-[rgb(var(--color-accent-rgb))]" aria-label="Hold-out percent" data-testid="ml-holdout-slider" />
+              <input id="ml-holdout-pct" className={`${inputCls} w-20`} type="number" min={0} max={MAX_HOLDOUT_PCT} step={1} value={settings.holdoutPct} onChange={(e) => set('holdoutPct', e.target.value)} data-testid="ml-holdout-pct" />
+            </div>
+            <div className="text-[11px] text-text-muted" data-testid="ml-holdout-help">
+              {holdoutShown > 0
+                ? `Scored once on the last ${holdoutShown}% of time, never used for training or tuning.`
+                : 'Off. Set a percentage to score the model once on the last part of time, never used for training or tuning.'}
+            </div>
+          </div>
+          <div className="space-y-1">
+            <label className="block text-[11px] text-text-secondary" htmlFor="ml-random-state">Random state (optional)</label>
+            <input id="ml-random-state" className={`${inputCls} w-32 font-mono`} type="number" min={0} step={1} placeholder="auto" value={settings.randomState} onChange={(e) => set('randomState', e.target.value)} data-testid="ml-random-state" />
+            <div className="text-[11px] text-text-muted">A fixed number makes a run repeatable. Leave empty to let the trainer choose.</div>
+          </div>
         </div>
       </section>
 
@@ -265,20 +412,31 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
       {/* Compare */}
       <section className={sectionCls} data-testid="ml-compare">
         <div className={headCls}>Compare algorithms</div>
-        <div className="text-[11px] text-text-muted">
-          Trains each ticked algorithm one after another, in the order ticked, on the same dataset, CV splits and features, using each algorithm&apos;s own hyperparameters. A failure does not stop the rest.
+        <div className="text-[11px] text-text-muted" data-testid="ml-compare-note">
+          Trains each ticked algorithm one after another, in the order ticked, on the same dataset, features, CV splits, trading simulation, hold-out and random state. Parameters apply only to the algorithm they were set for; an algorithm you have not edited runs with its defaults. A failure does not stop the rest.
         </div>
         <div className="flex flex-wrap gap-3">
-          {ALGORITHMS.map((a) => (
-            <label key={a.id} className="flex cursor-pointer items-center gap-1 text-xs text-text-primary">
-              <input type="checkbox" className="accent-[rgb(var(--color-accent-rgb))]" checked={settings.compareAlgos.includes(a.id)} onChange={() => toggleCompare(a.id)} data-testid={`ml-compare-algo-${a.id}`} />
-              {a.label}
-            </label>
-          ))}
-          <button type="button" className={primaryBtnCls} disabled={isTraining || settings.compareAlgos.length === 0 || compareProblems.length > 0} onClick={() => void compare()} data-testid="ml-compare-run">
+          {algorithms.map((a) => {
+            const aDefs = paramDefsFor(algorithms, a.id);
+            const merged = mergeParams(aDefs, settings.hyperparams[a.id] ?? {}, settings.advanced[a.id]);
+            const n = changedCount(aDefs, settings.hyperparams[a.id] ?? {}) + merged.advancedKeys;
+            return (
+              <label key={a.id} className="flex cursor-pointer items-center gap-1 text-xs text-text-primary">
+                <input type="checkbox" className="accent-[rgb(var(--color-accent-rgb))]" checked={settings.compareAlgos.includes(a.id)} onChange={() => toggleCompare(a.id)} data-testid={`ml-compare-algo-${a.id}`} />
+                {a.label}
+                <span className="text-[10px] text-text-muted" data-testid={`ml-compare-params-${a.id}`}>{n > 0 ? `${n} custom` : 'defaults'}</span>
+              </label>
+            );
+          })}
+          <button type="button" className={primaryBtnCls} disabled={isTraining || queue.length === 0 || compareProblems.length > 0} onClick={() => void compare()} data-testid="ml-compare-run">
             {isTraining && comparing ? 'Comparing...' : 'Compare'}
           </button>
         </div>
+        {queue.length > 0 && compareProblems.length > 0 && (
+          <ul className="list-disc pl-4 text-[11px] text-bear" data-testid="ml-compare-validation">
+            {[...new Set(compareProblems)].map((p) => <li key={p}>{p}</li>)}
+          </ul>
+        )}
         {comparing && (
           <table className="w-full text-xs" data-testid="ml-leaderboard">
             <thead className="text-left text-[11px] text-text-secondary">
@@ -287,7 +445,7 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
             <tbody>
               {leaderboard.map((row) => (
                 <tr key={row.algorithm} className="border-t border-[var(--border-color)]" data-testid={`ml-leaderboard-row-${row.algorithm}`}>
-                  <td className="py-1 text-text-primary">{algoLabel(row.algorithm)}</td>
+                  <td className="py-1 text-text-primary">{labelOf(row.algorithm)}</td>
                   <td className={row.status === 'failed' ? 'text-bear' : row.status === 'done' ? 'text-bull' : 'text-text-muted'} data-testid={`ml-leaderboard-status-${row.algorithm}`}>{row.status}</td>
                   <td className="font-mono" data-testid={`ml-leaderboard-acc-${row.algorithm}`}>{row.result?.ok ? pct(row.result.metrics?.accuracy) : ''}</td>
                   <td className="font-mono" data-testid={`ml-leaderboard-ret-${row.algorithm}`}>

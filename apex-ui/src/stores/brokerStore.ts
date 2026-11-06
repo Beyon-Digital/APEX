@@ -14,6 +14,7 @@ const DEFAULT_CONNECTIONS: BrokerConnectionDto[] = [
     market_data_available: false,
     token_field_label: '',
     message: 'Paper trading is active for safe simulated execution.',
+    can_short: true,
   },
 ];
 

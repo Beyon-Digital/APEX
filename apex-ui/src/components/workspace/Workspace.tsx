@@ -2,6 +2,7 @@ import { AdapterManager } from '../settings/AdapterManager';
 import { ChatGptCard } from '../settings/ChatGptCard';
 import { CopilotTile } from '../copilot/CopilotTile';
 import { ActivityPanel } from '../activity/ActivityPanel';
+import { CopilotSidePanel } from '../copilot/CopilotSidePanel';
 import { ProviderKeyField } from '../settings/ProviderKeyField';
 import { SymbolField } from '../common/SymbolField';
 import { DataFeedsOverview } from '../settings/DataFeedsOverview';
@@ -67,7 +68,6 @@ const CENTER_TABS: { id: CenterTab; label: string }[] = [
   { id: 'automations', label: 'Automations' },
   { id: 'notebook', label: 'Notebook' },
   { id: 'activity', label: 'Activity' },
-  { id: 'copilot', label: 'Copilot' },
   { id: 'health', label: 'Health' },
 ];
 
@@ -229,6 +229,24 @@ export const Workspace: React.FC = () => {
     if (useWorkspaceStore.getState().viewMode === 'tiles') ensureTile(tab);
   }, [ensureTile]);
 
+  const toggleCopilot = useWorkspaceStore((s) => s.toggleCopilot);
+  const copilotSideOpen = useWorkspaceStore((s) => s.copilotSideOpen);
+  const copilotShown = useWorkspaceStore((s) =>
+    s.viewMode === 'focus' ? s.copilotSideOpen : s.tiles.some((t) => t.i === 'copilot'));
+
+  // Ctrl/Cmd+Shift+A toggles the Copilot, even while typing or inside the code editor.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.key.toLowerCase() === 'a') {
+        event.preventDefault();
+        event.stopPropagation();
+        useWorkspaceStore.getState().toggleCopilot();
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
+
   // React to CommandBar dispatches
   const commandSymbol = useWorkspaceStore((s) => s.commandSymbol);
   const commandTab = useWorkspaceStore((s) => s.commandTab);
@@ -244,7 +262,10 @@ export const Workspace: React.FC = () => {
 
   useEffect(() => {
     if (!commandTab) return;
-    if ((VALID_TABS as readonly string[]).includes(commandTab)) {
+    if (commandTab === 'copilot') {
+      // Never a centre tab: a tile in tiles mode, the docked side panel in focus mode.
+      useWorkspaceStore.getState().showCopilot();
+    } else if ((VALID_TABS as readonly string[]).includes(commandTab)) {
       selectTab(commandTab as CenterTab);
     }
     setCommandTab(null);
@@ -1283,12 +1304,13 @@ export const Workspace: React.FC = () => {
         ))}
         <button
           type="button"
-          onClick={() => setCommandTab('copilot')}
-          title="Open the Copilot as a tile (or focus it if it is already open)"
+          onClick={toggleCopilot}
+          aria-pressed={copilotShown}
+          title={copilotShown ? 'Hide the Copilot (Ctrl+Shift+A)' : 'Show the Copilot (Ctrl+Shift+A)'}
           data-testid="copilot-launch"
-          className="ml-auto shrink-0 border border-accent/60 bg-accent/10 px-3 py-1.5 text-xs font-medium text-accent hover:bg-accent/20"
+          className={`ml-auto shrink-0 border px-3 py-1.5 text-xs font-medium ${copilotShown ? 'border-accent bg-accent/25 text-accent' : 'border-accent/60 bg-accent/10 text-accent hover:bg-accent/20'}`}
         >
-          ✦ Copilot
+          ✦ Copilot{copilotShown ? ' ●' : ''}
         </button>
         <button
           type="button"
@@ -1306,7 +1328,8 @@ export const Workspace: React.FC = () => {
 
       {/* Main Workspace Grid (focus mode) */}
       {viewMode === 'focus' && (
-      <div className="flex-1 min-h-0 grid grid-cols-12 gap-1 p-1 bg-surface-0" data-testid="workspace-panel">
+      <div className="flex min-h-0 flex-1" data-testid="focus-layout">
+      <div className="min-h-0 min-w-0 flex-1 grid grid-cols-12 gap-1 p-1 bg-surface-0" data-testid="workspace-panel">
         {/* Left: Watchlist */}
         <div className={`${researchView ? 'hidden' : centerTab === 'chart' ? 'col-span-2' : 'col-span-3'} bg-surface-1 rounded-lg overflow-hidden border border-[var(--border-color)]`}>
           <Watchlist onSelectSymbol={setSelectedSymbol} selectedSymbol={selectedSymbol} />
@@ -1372,10 +1395,6 @@ export const Workspace: React.FC = () => {
             <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
               <NotebookEditor />
             </div>
-          ) : centerTab === 'copilot' ? (
-            <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
-              <CopilotTile />
-            </div>
           ) : centerTab === 'activity' ? (
             <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
               <ActivityPanel />
@@ -1402,6 +1421,8 @@ export const Workspace: React.FC = () => {
             <AlertConsole />
           </div>
         </div>
+      </div>
+      {copilotSideOpen && <ErrorBoundary label="Copilot"><CopilotSidePanel /></ErrorBoundary>}
       </div>
       )}
     </div>

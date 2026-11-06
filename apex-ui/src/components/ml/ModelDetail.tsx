@@ -1,20 +1,21 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { SymbolField } from '../common/SymbolField';
 import {
-  createAutomation, listActivity, listBrokerConnections, modelSignalHistory, predictModelSignal,
+  createAutomation, listActivity, listAutomations, listBrokerConnections, modelSignalHistory, predictModelSignal,
 } from '../../lib/tauri';
 import { openItem } from '../../stores/navStore';
 import { useArtifactStore } from '../../stores/artifactStore';
 import type {
-  ActivityDto, BrokerConnectionDto, ModelDetailDto, ModelSignalDto, ModelSignalHistoryDto,
+  ActivityDto, AutomationDto, BrokerConnectionDto, ModelDetailDto, ModelSignalDto, ModelSignalHistoryDto,
 } from '../../lib/types';
 import {
   ChartLegend, FoldAccuracyChart, FoldReturnChart, HorizontalBars, SignalChart,
 } from './ModelCharts';
 import {
-  SOURCE_LABEL, algorithmLabel, baselineAccuracy, bytesLabel, displayName, exactTime, fmtValue, isLegacyModel,
-  labelText, modelVerdict, num, paramRows, pct, relativeTime, signedPct,
+  HOLDOUT_GAP_PTS, SOURCE_LABEL, TRADE_MODE_HINT, algorithmLabel, baselineAccuracy, bytesLabel, classMeaning, displayName, exactTime, fmtValue,
+  holdoutVerdict, isLegacyModel, labelText, modelVerdict, num, paramRows, pct, relativeTime, shortingContext, signedPct, tradeModeLabel,
 } from './modelUtils';
+import type { ShortingContext } from './modelUtils';
 
 export interface ModelPatch {
   displayName?: string;
@@ -63,13 +64,75 @@ const inputCls = 'w-full border border-[var(--border-color)] bg-surface-0 px-2 p
 const btnCls = 'border border-[var(--border-color)] bg-surface-2 px-2 py-1 text-[11px] font-mono text-text-secondary hover:text-text-primary disabled:opacity-50';
 const accentBtn = 'border border-accent/50 bg-accent/15 px-2 py-1 text-[11px] font-mono text-accent hover:bg-accent/25 disabled:opacity-50';
 
-const Card: React.FC<{ name: string; label: string; value: string; sub?: string; tone?: 'good' | 'bad' | 'neutral' }> = ({ name, label, value, sub, tone = 'neutral' }) => (
+const Card: React.FC<{ name: string; label: string; value: string; sub?: string; tone?: 'good' | 'bad' | 'neutral'; extra?: React.ReactNode }> = ({ name, label, value, sub, tone = 'neutral', extra }) => (
   <div className="border border-[var(--border-color)] bg-surface-0 px-2 py-1.5" data-testid={`model-metric-${name}`}>
     <div className="text-[10px] uppercase text-text-muted">{label}</div>
-    <div className={`font-mono text-sm ${tone === 'good' ? 'text-bull' : tone === 'bad' ? 'text-bear' : 'text-text-primary'}`} data-testid={`model-metric-${name}-value`}>{value}</div>
+    <div className="flex items-baseline gap-2">
+      <div className={`font-mono text-sm ${tone === 'good' ? 'text-bull' : tone === 'bad' ? 'text-bear' : 'text-text-primary'}`} data-testid={`model-metric-${name}-value`}>{value}</div>
+      {extra}
+    </div>
     {sub && <div className="text-[10px] text-text-muted">{sub}</div>}
   </div>
 );
+
+/** Automations using a model and the brokers they trade on, to tell whether a long/short result is reachable. */
+function useShortingContext(detail: ModelDetailDto): { context: ShortingContext; automations: AutomationDto[] } {
+  const version = useArtifactStore((s) => s.versions.automation);
+  const [automations, setAutomations] = useState<AutomationDto[]>([]);
+  const [brokers, setBrokers] = useState<BrokerConnectionDto[]>([]);
+  useEffect(() => {
+    if (detail.trade_mode !== 'long_short') return undefined;
+    let live = true;
+    void listAutomations().then((a) => { if (live) setAutomations(a); }).catch(() => { /* note stays off */ });
+    void listBrokerConnections().then((b) => { if (live) setBrokers(b); }).catch(() => { /* note stays off */ });
+    return () => { live = false; };
+  }, [detail.model_id, detail.trade_mode, detail.used_by.length, version]);
+  const context = useMemo(() => shortingContext(detail, automations, brokers), [detail, automations, brokers]);
+  return { context, automations };
+}
+
+const CopyButton: React.FC<{ text: string; testId: string }> = ({ text, testId }) => {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { setCopied(false); }
+  };
+  return (
+    <button type="button" className="shrink-0 border border-[var(--border-color)] bg-surface-2 px-1.5 py-px font-mono text-[10px] text-text-secondary hover:text-text-primary" onClick={() => void copy()} data-testid={testId} aria-label="Copy formula">
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  );
+};
+
+const HoldoutCard: React.FC<{ detail: ModelDetailDto }> = ({ detail }) => {
+  const v = holdoutVerdict(detail);
+  const h = detail.holdout;
+  const toneCls = { good: 'border-bull/40 bg-bull/10 text-bull', warn: 'border-warning/40 bg-warning/10 text-warning', bad: 'border-bear/40 bg-bear/10 text-bear', info: 'border-[var(--border-color)] bg-surface-2 text-text-secondary' }[v.tone];
+  return (
+    <div className="mt-2 border border-[var(--border-color)] bg-surface-0 px-2 py-1.5" data-testid="model-holdout" data-verdict={v.id}>
+      <div className="text-[10px] uppercase text-text-muted">Hold-out (final period never seen in cross-validation)</div>
+      {h && (
+        <div className="mt-1 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+          <div><div className="text-[10px] text-text-muted">Rows</div><div className="font-mono text-sm" data-testid="holdout-rows">{h.rows}</div></div>
+          <div>
+            <div className="text-[10px] text-text-muted">Accuracy</div>
+            <div className="font-mono text-sm" data-testid="holdout-accuracy">{pct(h.accuracy)}</div>
+            <div className="text-[10px] text-text-muted" data-testid="holdout-baseline">{h.baseline_accuracy === null ? 'no baseline' : `baseline ${pct(h.baseline_accuracy)}`}</div>
+          </div>
+          <div>
+            <div className="text-[10px] text-text-muted">Trading result</div>
+            <div className={`font-mono text-sm ${h.trading ? (h.trading.strategy_return_pct >= 0 ? 'text-bull' : 'text-bear') : ''}`} data-testid="holdout-trading">{h.trading ? signedPct(h.trading.strategy_return_pct) : 'n/a'}</div>
+            <div className="text-[10px] text-text-muted">{h.trading ? `buy and hold ${signedPct(h.trading.buy_hold_return_pct)} · ${h.trading.trades} trades` : 'not recorded'}</div>
+          </div>
+          <div>
+            <div className="text-[10px] text-text-muted">Cross-validation</div>
+            <div className="font-mono text-sm" data-testid="holdout-cv">{pct(detail.metrics.accuracy)}</div>
+          </div>
+        </div>
+      )}
+      <div className={`mt-1.5 border px-2 py-1 text-[11px] ${toneCls}`} data-testid="model-holdout-verdict" data-tone={v.tone} title={`Flagged as likely overfit when hold-out accuracy is ${HOLDOUT_GAP_PTS} or more points below cross-validation accuracy.`}>{v.text}</div>
+    </div>
+  );
+};
 
 const NameEditor: React.FC<{ detail: ModelDetailDto; onSave: ModelDetailProps['onSave'] }> = ({ detail, onSave }) => {
   const [editing, setEditing] = useState(false);
@@ -253,6 +316,8 @@ const AutomationForm: React.FC<{ detail: ModelDetailDto; onCreated: () => void }
   const [interval, setIntervalSecs] = useState('300');
   const [broker, setBroker] = useState('paper');
   const [brokers, setBrokers] = useState<BrokerConnectionDto[]>([]);
+  // null = follow the default (on only for a model evaluated long/short); a click makes it the user's choice.
+  const [shortChoice, setShortChoice] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<string | null>(null);
@@ -262,6 +327,13 @@ const AutomationForm: React.FC<{ detail: ModelDetailDto; onCreated: () => void }
     void listBrokerConnections().then((b) => { if (live) setBrokers(b); }).catch(() => { /* paper only */ });
     return () => { live = false; };
   }, []);
+
+  const brokerInfo = brokers.find((b) => b.broker_id === broker);
+  const canShort = broker === 'paper' ? (brokerInfo?.can_short ?? true) : Boolean(brokerInfo?.can_short);
+  const allowShort = canShort && (shortChoice ?? detail.trade_mode === 'long_short');
+  const shortBlockedReason = broker === 'paper'
+    ? 'The paper broker could not be read.'
+    : `${broker} cannot short. Live shorting needs allow_live_shorting in config and an adapter that supports it.`;
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -278,7 +350,7 @@ const AutomationForm: React.FC<{ detail: ModelDetailDto; onCreated: () => void }
     try {
       const rule = await createAutomation({
         name: name.trim() || `${displayName(detail)} signal`, kind: 'model_signal', symbol: symbol.trim(), model_id: detail.model_id,
-        interval_secs: secs, quantity: qty, threshold: thr, broker_id: broker,
+        interval_secs: secs, quantity: qty, threshold: thr, broker_id: broker, allow_short: allowShort,
       });
       setCreated(rule.name);
       onCreated();
@@ -312,6 +384,20 @@ const AutomationForm: React.FC<{ detail: ModelDetailDto; onCreated: () => void }
       <label className="text-[10px] uppercase text-text-muted">Run every (seconds)
         <input className={`${inputCls} mt-0.5 font-mono`} value={interval} onChange={(e) => setIntervalSecs(e.target.value)} data-testid="auto-interval" />
       </label>
+      <div className="col-span-2" data-testid="auto-short-block">
+        <label className={`flex items-center gap-2 text-[11px] ${canShort ? 'text-text-secondary' : 'text-text-muted'}`}>
+          <input
+            type="checkbox" checked={allowShort} disabled={!canShort} data-testid="auto-allow-short"
+            onChange={(e) => setShortChoice(e.target.checked)}
+          />
+          Allow shorting
+        </label>
+        {!canShort && <p className="mt-0.5 text-[11px] text-warning" data-testid="auto-short-reason">{shortBlockedReason}</p>}
+        <p className="mt-0.5 text-[10px] text-text-muted" data-testid="auto-short-help">
+          {classMeaning(detail.label)} This model was evaluated {tradeModeLabel(detail.trade_mode).toLowerCase()}.
+        </p>
+        {allowShort && broker !== 'paper' && <p className="text-[11px] text-warning" data-testid="auto-short-live-warning">Live shorting needs allow_live_shorting in config and live trading armed.</p>}
+      </div>
       <div className="flex items-end">
         <button type="submit" className={accentBtn} disabled={busy} data-testid="auto-create">{busy ? 'Creating…' : 'Create automation'}</button>
       </div>
@@ -358,7 +444,8 @@ const ModelActivity: React.FC<{ modelId: string }> = ({ modelId }) => {
 export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetrain, onDelete, onClose, onChanged }) => {
   const rootRef = useRef<HTMLDivElement>(null);
   const [logOpen, setLogOpen] = useState(false);
-  const verdict = useMemo(() => modelVerdict(detail), [detail]);
+  const { context: shorting } = useShortingContext(detail);
+  const verdict = useMemo(() => modelVerdict(detail, shorting), [detail, shorting]);
   const legacy = isLegacyModel(detail);
   const baseline = baselineAccuracy(detail.cv_folds);
   const t = detail.trading;
@@ -409,6 +496,11 @@ export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetr
 
         <Section id="overview" title="Overview">
           <div className={`mb-2 border px-2 py-1.5 text-xs ${toneCls}`} data-testid="model-verdict" data-tone={verdict.tone}>{verdict.text}</div>
+          {detail.trade_mode === 'long_short' && shorting.limited && (
+            <div className="mb-1 border border-warning/40 bg-warning/10 px-2 py-1 text-[11px] text-warning" data-testid="model-shorting-note">
+              The trading return assumes shorting. {shorting.reasons.join('; ')}. Those automations cannot earn the short side of this result.
+            </div>
+          )}
           {verdict.warnings.map((w) => (
             <div key={w.id} className="mb-1 border border-warning/40 bg-warning/10 px-2 py-1 text-[11px] text-warning" data-testid={`model-warning-${w.id}`}>{w.text}</div>
           ))}
@@ -417,11 +509,20 @@ export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetr
             <Card name="f1" label="F1" value={num(m.f1, 3)} />
             <Card name="precision" label="Precision" value={num(m.precision, 3)} />
             <Card name="recall" label="Recall" value={num(m.recall, 3)} />
-            <Card name="trading-return" label="Trading return" value={t ? signedPct(t.strategy_return_pct) : 'n/a'} sub={t ? `buy and hold ${signedPct(t.buy_hold_return_pct)}` : 'not recorded'} tone={t ? (t.strategy_return_pct >= t.buy_hold_return_pct ? 'good' : 'bad') : 'neutral'} />
+            <Card
+              name="trading-return" label="Trading return" value={t ? signedPct(t.strategy_return_pct) : 'n/a'} sub={t ? `buy and hold ${signedPct(t.buy_hold_return_pct)}` : 'not recorded'}
+              tone={t ? (t.strategy_return_pct >= t.buy_hold_return_pct ? 'good' : 'bad') : 'neutral'}
+              extra={t && (
+                <span className="cursor-help border-b border-dotted border-text-muted font-mono text-[10px] text-text-secondary" title={TRADE_MODE_HINT[detail.trade_mode ?? 'long_flat']} data-testid="model-trading-rule" data-mode={detail.trade_mode ?? 'long_flat'}>
+                  Trading rule: {tradeModeLabel(detail.trade_mode)}
+                </span>
+              )}
+            />
             <Card name="hit-rate" label="Hit rate" value={t ? pct(t.hit_rate) : 'n/a'} sub={t ? `${t.trades} trades` : undefined} />
             <Card name="max-drawdown" label="Max drawdown" value={t ? signedPct(t.max_drawdown_pct) : 'n/a'} />
             <Card name="sharpe" label="Sharpe" value={t ? num(t.sharpe, 2) : 'n/a'} />
           </div>
+          <HoldoutCard detail={detail} />
           <div className="mt-2">
             <div className="mb-0.5 text-[10px] uppercase text-text-muted">Notes</div>
             <NotesEditor key={`${detail.model_id}-notes`} detail={detail} onSave={onSave} />
@@ -493,6 +594,10 @@ export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetr
             <dt className="text-text-muted">CV splits</dt><dd className="font-mono" data-testid="config-splits">{detail.n_splits}</dd>
             <dt className="text-text-muted">Lag periods</dt><dd className="font-mono" data-testid="config-lags">{detail.lag_periods.length ? detail.lag_periods.join(', ') : 'none'}</dd>
             <dt className="text-text-muted">Label</dt><dd data-testid="config-label">{labelText(detail.label)}</dd>
+            <dt className="text-text-muted">Trading rule</dt><dd className="font-mono" data-testid="config-trade-mode" title={TRADE_MODE_HINT[detail.trade_mode ?? 'long_flat']}>{tradeModeLabel(detail.trade_mode)}</dd>
+            <dt className="text-text-muted">Fee assumed</dt><dd className="font-mono" data-testid="config-fee">{detail.fee_pct ? `${detail.fee_pct}% per round trip, taken off every forward return` : 'none'}</dd>
+            <dt className="text-text-muted">Random state</dt>
+            <dd className="font-mono" data-testid="config-random-state">{detail.hyperparams.random_state === undefined ? 'default (fixed seed)' : fmtValue(detail.hyperparams.random_state)}</dd>
             <dt className="text-text-muted">Dataset</dt>
             <dd>
               {detail.dataset
@@ -505,7 +610,34 @@ export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetr
             <dt className="text-text-muted">Target column</dt><dd className="font-mono">{detail.target_column}</dd>
             <dt className="text-text-muted">Features ({detail.feature_names.length})</dt>
             <dd className="flex flex-wrap gap-1">{detail.feature_names.map((f) => <span key={f} className="border border-[var(--border-color)] bg-surface-2 px-1 font-mono text-[10px]">{f}</span>)}</dd>
+            {detail.context_symbols.length > 0 && (<>
+              <dt className="text-text-muted">Context symbols</dt>
+              <dd className="font-mono" data-testid="config-context-symbols" title="Read by custom formulas with other(&quot;SYMBOL&quot;, field). Not rows of the training data.">{detail.context_symbols.join(', ')}</dd>
+            </>)}
+            {detail.estimator_file && (<>
+              <dt className="text-text-muted">Estimator file</dt>
+              <dd>
+                <span className="font-mono" data-testid="config-estimator">{detail.estimator_file}</span>
+                <div className="mt-0.5 border border-warning/40 bg-warning/10 px-2 py-1 text-[11px] text-warning" data-testid="config-estimator-warning">
+                  Custom code. Training and scoring run the copy saved with this model, not later edits to estimators/{detail.estimator_file}.
+                </div>
+              </dd>
+            </>)}
           </dl>
+          {detail.custom_features.length > 0 && (
+            <div className="mt-2" data-testid="config-custom-features">
+              <div className="mb-0.5 text-[10px] uppercase text-text-muted">Custom features ({detail.custom_features.length})</div>
+              <ul className="space-y-1">
+                {detail.custom_features.map((c) => (
+                  <li key={c.name} className="flex items-center gap-2 text-[11px]" data-testid={`custom-feature-${c.name}`}>
+                    <span className="w-32 shrink-0 truncate font-mono text-accent" title={c.name} data-testid={`custom-feature-name-${c.name}`}>{c.name}</span>
+                    <code className="min-w-0 flex-1 break-all bg-surface-0 px-1.5 py-0.5 font-mono text-[11px] text-text-primary" data-testid={`custom-feature-expr-${c.name}`}>{c.expr}</code>
+                    <CopyButton text={c.expr} testId={`custom-feature-copy-${c.name}`} />
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="mt-2 text-[10px] uppercase text-text-muted">Hyperparameters ({changedCount} changed from defaults)</div>
           <table className="mt-0.5 w-full text-[11px]" data-testid="hyper-table">
             <thead><tr className="text-left text-[10px] uppercase text-text-muted"><th className="px-1.5 py-0.5 font-normal">Parameter</th><th className="px-1.5 py-0.5 font-normal">Used</th><th className="px-1.5 py-0.5 font-normal">Default</th><th className="px-1.5 py-0.5 font-normal" /></tr></thead>

@@ -26,6 +26,15 @@ interface WorkspaceState {
   ensureTile: (id: PanelId) => void;
   removeTile: (id: PanelId) => void;
   setHighlightedTile: (id: PanelId | null) => void;
+  /** Focus mode: the Copilot docks as a side panel next to the focused panel. */
+  copilotSideOpen: boolean;
+  copilotSideWidth: number;
+  setCopilotSideOpen: (open: boolean) => void;
+  setCopilotSideWidth: (width: number) => void;
+  /** Show the Copilot if hidden, hide it if shown: a tile in tiles mode, the side panel in focus mode. */
+  toggleCopilot: () => void;
+  /** Make sure the Copilot is visible (never hides it). */
+  showCopilot: () => void;
   saveLayout: (name: string, config: Record<string, unknown>) => void;
   loadLayout: (name: string) => WorkspaceLayout | undefined;
   deleteLayout: (name: string) => void;
@@ -44,6 +53,8 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       viewMode: 'tiles',
       tiles: PRESETS.trading.tiles,
       highlightedTile: null,
+      copilotSideOpen: false,
+      copilotSideWidth: 420,
 
       setViewMode: (mode) => set({ viewMode: mode }),
       setTiles: (tiles) => set({ tiles }),
@@ -60,6 +71,22 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       },
       removeTile: (id) => set((state) => ({ tiles: state.tiles.filter((t) => t.i !== id) })),
       setHighlightedTile: (id) => set({ highlightedTile: id }),
+      setCopilotSideOpen: (open) => set({ copilotSideOpen: open }),
+      setCopilotSideWidth: (width) => set({ copilotSideWidth: Math.round(Math.min(900, Math.max(280, width))) }),
+      toggleCopilot: () => {
+        const { viewMode, tiles, copilotSideOpen } = get();
+        if (viewMode === 'focus') {
+          set({ copilotSideOpen: !copilotSideOpen });
+        } else if (tiles.some((t) => t.i === 'copilot')) {
+          set({ tiles: tiles.filter((t) => t.i !== 'copilot') });
+        } else {
+          get().ensureTile('copilot');
+        }
+      },
+      showCopilot: () => {
+        if (get().viewMode === 'focus') set({ copilotSideOpen: true });
+        else get().ensureTile('copilot');
+      },
 
       saveLayout: (name: string, config: Record<string, unknown>) => {
         set((state) => {
@@ -110,6 +137,8 @@ export const useWorkspaceStore = create<WorkspaceState>()(
         currentLayout: state.currentLayout,
         viewMode: state.viewMode,
         tiles: state.tiles,
+        copilotSideOpen: state.copilotSideOpen,
+        copilotSideWidth: state.copilotSideWidth,
       }),
     }
   )

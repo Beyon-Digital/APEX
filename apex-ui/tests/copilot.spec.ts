@@ -18,10 +18,19 @@ async function chatCalls(page: Page) {
   );
 }
 
+async function ensureOpen(page: Page) {
+  if (!(await page.getByTestId('copilot-panel').isVisible())) {
+    await page.getByTestId('copilot-launch').click();
+  }
+}
+
 async function openCopilot(page: Page) {
   await page.goto('/');
   await page.waitForLoadState('networkidle');
-  await page.getByTestId('copilot-launch').click();
+  // The launcher is a toggle and its state survives a reload, so only open it when it is shut.
+  if (!(await page.getByTestId('copilot-panel').isVisible())) {
+    await page.getByTestId('copilot-launch').click();
+  }
   await expect(page.getByTestId('copilot-panel')).toBeVisible();
 }
 
@@ -62,7 +71,7 @@ test.describe('Copilot modes', () => {
 
     await page.reload();
     await page.waitForLoadState('networkidle');
-    await page.getByTestId('copilot-launch').click();
+    await ensureOpen(page);
     await expect(page.getByTestId('copilot-mode-ask')).toHaveAttribute('aria-pressed', 'true');
     await expect(page.getByTestId('copilot-mode-agent')).toHaveAttribute('aria-pressed', 'false');
 
@@ -161,7 +170,7 @@ test.describe('Copilot sessions', () => {
 
     await page.reload();
     await page.waitForLoadState('networkidle');
-    await page.getByTestId('copilot-launch').click();
+    await ensureOpen(page);
     await expect(page.getByTestId('copilot-user-msg')).toHaveText(['and me']);
     await openSessions(page);
     await expect(page.getByTestId('copilot-session-item')).toHaveCount(2);
@@ -186,7 +195,7 @@ test.describe('Copilot sessions', () => {
 
     await page.reload();
     await page.waitForLoadState('networkidle');
-    await page.getByTestId('copilot-launch').click();
+    await ensureOpen(page);
     await expect(page.getByTestId('copilot-session-title')).toHaveText('Renamed chat');
   });
 
@@ -245,7 +254,7 @@ test.describe('Copilot sessions', () => {
     });
     await page.reload();
     await page.waitForLoadState('networkidle');
-    await page.getByTestId('copilot-launch').click();
+    await ensureOpen(page);
     await expect(page.getByTestId('copilot-user-msg')).toHaveText(['legacy question about RELIANCE']);
     await expect(page.getByTestId('copilot-assistant-msg')).toHaveText(['legacy answer']);
     await openSessions(page);
@@ -256,7 +265,7 @@ test.describe('Copilot sessions', () => {
     // A second reload must not migrate again or duplicate.
     await page.reload();
     await page.waitForLoadState('networkidle');
-    await page.getByTestId('copilot-launch').click();
+    await ensureOpen(page);
     await openSessions(page);
     await expect(page.getByTestId('copilot-session-item')).toHaveCount(1);
   });

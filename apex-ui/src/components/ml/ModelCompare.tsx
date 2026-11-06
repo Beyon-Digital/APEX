@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import type { ModelDetailDto } from '../../lib/types';
 import {
-  SERIES_COLORS, algorithmLabel, baselineAccuracy, bestIndexes, displayName, fmtValue, labelText, meanOf, num, paramRows, pct, signedPct,
+  SERIES_COLORS, algorithmLabel, baselineAccuracy, bestIndexes, displayName, fmtValue, labelText, meanOf, num, paramRows, pct, signedPct, tradeModeLabel,
 } from './modelUtils';
 
 export interface ModelCompareProps {
@@ -27,6 +27,8 @@ const METRICS: MetricDef[] = [
   { id: 'cv-accuracy', label: 'Mean fold accuracy', higherIsBetter: true, value: (m) => meanOf(m.cv_folds, (f) => f.accuracy), show: (v) => pct(v) },
   { id: 'trading-return', label: 'Trading return', higherIsBetter: true, value: (m) => m.trading?.strategy_return_pct ?? null, show: (v) => signedPct(v) },
   { id: 'excess', label: 'Return vs buy and hold (pts)', higherIsBetter: true, value: (m) => (m.trading ? m.trading.strategy_return_pct - m.trading.buy_hold_return_pct : null), show: (v) => (v === null ? 'n/a' : `${v >= 0 ? '+' : ''}${v.toFixed(1)}`) },
+  { id: 'holdout-accuracy', label: 'Hold-out accuracy', higherIsBetter: true, value: (m) => m.holdout?.accuracy ?? null, show: (v) => pct(v) },
+  { id: 'holdout-return', label: 'Hold-out trading return', higherIsBetter: true, value: (m) => m.holdout?.trading?.strategy_return_pct ?? null, show: (v) => signedPct(v) },
   { id: 'hit-rate', label: 'Hit rate', higherIsBetter: true, value: (m) => m.trading?.hit_rate ?? null, show: (v) => pct(v) },
   { id: 'max-drawdown', label: 'Max drawdown', higherIsBetter: true, value: (m) => m.trading?.max_drawdown_pct ?? null, show: (v) => signedPct(v) },
   { id: 'sharpe', label: 'Sharpe', higherIsBetter: true, value: (m) => m.trading?.sharpe ?? null, show: (v) => num(v, 2) },
@@ -50,6 +52,12 @@ export const ModelCompare: React.FC<ModelCompareProps> = ({ models, onClose, onO
       { id: 'symbols', label: 'Symbols', values: models.map((m) => (m.symbols.length ? m.symbols.join(', ') : 'n/a')) },
       { id: 'timeframe', label: 'Timeframe', values: models.map((m) => m.timeframe ?? 'n/a') },
       { id: 'label', label: 'Label', values: models.map((m) => labelText(m.label)) },
+      { id: 'trade-mode', label: 'Trading rule', values: models.map((m) => tradeModeLabel(m.trade_mode)) },
+      { id: 'holdout', label: 'Hold-out', values: models.map((m) => (m.holdout ? `${m.holdout.rows} rows` : 'none')) },
+      { id: 'fee', label: 'Fee (round trip)', values: models.map((m) => (m.fee_pct ? `${m.fee_pct}%` : 'none')) },
+      { id: 'estimator', label: 'Estimator file', values: models.map((m) => m.estimator_file ?? 'built-in') },
+      { id: 'custom-features', label: 'Custom features', values: models.map((m) => (m.custom_features.length ? m.custom_features.map((c) => `${c.name} = ${c.expr}`).join('\n') : 'none')) },
+      { id: 'context-symbols', label: 'Context symbols', values: models.map((m) => (m.context_symbols.length ? m.context_symbols.join(', ') : 'none')) },
       { id: 'rows', label: 'Rows', values: models.map((m) => String(m.rows ?? 'n/a')) },
       { id: 'n_splits', label: 'CV splits', values: models.map((m) => String(m.n_splits)) },
       { id: 'lags', label: 'Lag periods', values: models.map((m) => (m.lag_periods.length ? m.lag_periods.join(', ') : 'none')) },
@@ -151,7 +159,7 @@ export const ModelCompare: React.FC<ModelCompareProps> = ({ models, onClose, onO
           <React.Fragment key={r.id}>
             <div className="bg-surface-1 p-1.5 text-text-muted">{r.label}</div>
             {r.values.map((v, i) => (
-              <div key={models[i].model_id} className={`break-words p-1.5 font-mono ${r.differs ? 'bg-warning/10 text-warning' : 'bg-surface-1 text-text-secondary'}`} data-testid={`compare-config-${r.id}-${models[i].model_id}`} data-differs={r.differs}>{v}</div>
+              <div key={models[i].model_id} className={`whitespace-pre-wrap break-words p-1.5 font-mono ${r.differs ? 'bg-warning/10 text-warning' : 'bg-surface-1 text-text-secondary'}`} data-testid={`compare-config-${r.id}-${models[i].model_id}`} data-differs={r.differs}>{v}</div>
             ))}
           </React.Fragment>
         ))}

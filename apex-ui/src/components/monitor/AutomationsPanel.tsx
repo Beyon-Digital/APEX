@@ -6,10 +6,14 @@ import {
   listAutomations,
   listMLModels,
   setAutomationEnabled,
+  setAutomationShort,
 } from '../../lib/tauri';
-import type { AutomationDto, MLModelDto } from '../../lib/types';
+import type { AutomationDto, BrokerConnectionDto, MLModelDto } from '../../lib/types';
+import { positionState } from './positionState';
 import { touchedKey, useArtifactStore } from '../../stores/artifactStore';
+import { useBrokerStore } from '../../stores/brokerStore';
 import { openItem, useNavStore } from '../../stores/navStore';
+import { useOrderStore } from '../../stores/orderStore';
 
 const POLL_MS = 5000;
 
@@ -32,12 +36,22 @@ function fmtTime(iso: string | null): string {
   }
 }
 
+const isLiveBroker = (brokerId: string, connections: BrokerConnectionDto[]): boolean => {
+  const conn = connections.find((c) => c.broker_id === brokerId);
+  return conn ? conn.mode === 'live' : brokerId !== 'paper';
+};
+
 export const AutomationsPanel: React.FC = () => {
   const [rules, setRules] = useState<AutomationDto[]>([]);
   const [models, setModels] = useState<MLModelDto[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [highlightId, setHighlightId] = useState<string | null>(null);
+  const [shortBusy, setShortBusy] = useState<string | null>(null);
+  const [shortErrors, setShortErrors] = useState<Record<string, string>>({});
+  const positions = useOrderStore((s) => s.positions);
+  const connections = useBrokerStore((s) => s.connections);
+  const activeBrokerId = useBrokerStore((s) => s.activeBrokerId);
   const automationVersion = useArtifactStore((s) => s.versions.automation);
   const modelVersion = useArtifactStore((s) => s.versions.model);
   const touched = useArtifactStore((s) => s.copilotTouched);
@@ -55,6 +69,11 @@ export const AutomationsPanel: React.FC = () => {
   const [quantity, setQuantity] = useState('1');
   const [threshold, setThreshold] = useState('0.5');
   const [brokerId, setBrokerId] = useState('paper');
+  const [allowShort, setAllowShort] = useState(false);
+
+  const formBroker = brokerId.trim() || 'paper';
+  const formCanShort = connections.find((c) => c.broker_id === formBroker)?.can_short ?? false;
+  const formShort = allowShort && formCanShort;
 
   const refresh = useCallback(async (): Promise<AutomationDto[] | null> => {
     try {
@@ -127,7 +146,8 @@ export const AutomationsPanel: React.FC = () => {
           interval_secs: Math.max(30, parseInt(intervalSecs, 10) || 300),
           quantity: parseFloat(quantity) || 1,
           threshold: Math.min(1, Math.max(0, parseFloat(threshold) || 0.5)),
-          broker_id: brokerId.trim() || 'paper',
+          broker_id: formBroker,
+          allow_short: formShort,
         });
         setName('');
         setSymbol('');
@@ -138,7 +158,7 @@ export const AutomationsPanel: React.FC = () => {
         setBusy(false);
       }
     },
-    [busy, name, symbol, modelId, intervalSecs, quantity, threshold, brokerId, refresh],
+    [busy, name, symbol, modelId, intervalSecs, quantity, threshold, formBroker, formShort, refresh],
   );
 
   const toggle = useCallback(
@@ -148,6 +168,23 @@ export const AutomationsPanel: React.FC = () => {
         await refresh();
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [refresh],
+  );
+
+  const toggleShort = useCallback(
+    async (rule: AutomationDto) => {
+      setShortBusy(rule.id);
+      setShortErrors((e) => Object.fromEntries(Object.entries(e).filter(([id]) => id !== rule.id)));
+      try {
+        await setAutomationShort(rule.id, !rule.allow_short);
+        await refresh();
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        setShortErrors((all) => ({ ...all, [rule.id]: message }));
+      } finally {
+        setShortBusy(null);
       }
     },
     [refresh],
@@ -201,6 +238,20 @@ export const AutomationsPanel: React.FC = () => {
         <input className={inputCls} placeholder="Qty" value={quantity} onChange={(e) => setQuantity(e.target.value)} title="Order quantity" data-testid="automation-qty" />
         <input className={inputCls} placeholder="Prob threshold 0–1" value={threshold} onChange={(e) => setThreshold(e.target.value)} title="Minimum model confidence to place the order" data-testid="automation-threshold" />
         <input className={inputCls} placeholder="Broker (default paper)" value={brokerId} onChange={(e) => setBrokerId(e.target.value)} data-testid="automation-broker" />
+        <div className="col-span-2">
+          <label className={`flex items-center gap-2 text-[11px] ${formCanShort ? 'text-text-secondary' : 'text-text-muted'}`}>
+            <input type="checkbox" checked={formShort} disabled={!formCanShort} onChange={(e) => setAllowShort(e.target.checked)} data-testid="automation-allow-short" />
+            Allow shorting
+          </label>
+          <div className="text-[10px] text-text-muted" data-testid="automation-short-help">
+            {formCanShort
+              ? 'A down signal opens a short instead of only exiting a long.'
+              : `${formBroker} cannot short. Live shorting needs allow_live_shorting in config and an adapter that supports it.`}
+          </div>
+          {formShort && isLiveBroker(formBroker, connections) && (
+            <div className="text-[11px] text-warning" data-testid="automation-short-live-warning">Live shorting needs allow_live_shorting in config and live trading armed.</div>
+          )}
+        </div>
         <button type="submit" disabled={busy || !symbol.trim() || !modelId} className="px-2 py-1 text-xs font-mono rounded bg-accent/20 text-accent hover:bg-accent/30 disabled:opacity-50" data-testid="automation-create">
           {busy ? 'Creating…' : 'Create rule'}
         </button>
@@ -229,6 +280,21 @@ export const AutomationsPanel: React.FC = () => {
                     <span className={`inline-block h-1.5 w-1.5 rounded-full ${r.enabled ? 'bg-bull' : 'bg-text-muted'}`} />
                     <span className="text-xs font-medium text-text-primary truncate">{r.name}</span>
                     <span className="text-[10px] font-mono text-text-muted uppercase">{r.kind}</span>
+                    <span
+                      className={`shrink-0 border px-1 text-[9px] font-semibold uppercase tracking-wider ${r.allow_short ? 'border-warning/50 bg-warning/10 text-warning' : 'border-[var(--border-color)] bg-surface-2 text-text-muted'}`}
+                      data-testid="automation-short-badge" data-short={r.allow_short}
+                    >
+                      {r.allow_short ? 'Long & short' : 'Long only'}
+                    </span>
+                    {r.allow_short && isLiveBroker(r.broker_id, connections) && (
+                      <span
+                        className="shrink-0 border border-bear/50 bg-bear/10 px-1 text-[9px] font-semibold uppercase tracking-wider text-bear"
+                        title="Live shorting needs allow_live_shorting in config and live trading armed"
+                        data-testid="automation-short-live-chip"
+                      >
+                        Live shorting: needs allow_live_shorting in config and live trading armed
+                      </span>
+                    )}
                     {touched[touchedKey('automation', r.id)] !== undefined && (
                       <button
                         type="button"
@@ -248,6 +314,17 @@ export const AutomationsPanel: React.FC = () => {
                     last run: {fmtTime(r.last_run_at)}
                     {r.last_result ? ` — ${r.last_result}` : ''}
                   </div>
+                  {(() => {
+                    const state = positionState(r, positions, activeBrokerId);
+                    return state && (
+                      <div className="mt-0.5 text-[10px] font-mono text-text-muted" data-testid="automation-position" data-state={state}>
+                        position: <span className={state === 'long' ? 'text-bull' : state === 'short' ? 'text-bear' : ''}>{state}</span>
+                      </div>
+                    );
+                  })()}
+                  {shortErrors[r.id] && (
+                    <div className="mt-0.5 text-[11px] text-bear" data-testid="automation-short-error">{shortErrors[r.id]}</div>
+                  )}
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
                   {r.model_id && (
@@ -260,6 +337,15 @@ export const AutomationsPanel: React.FC = () => {
                       Open model
                     </button>
                   )}
+                  <button
+                    onClick={() => void toggleShort(r)}
+                    disabled={shortBusy === r.id}
+                    className="px-2 py-0.5 text-[10px] font-mono rounded border border-[var(--border-color)] text-text-secondary hover:border-accent hover:text-accent disabled:opacity-50"
+                    title={r.allow_short ? 'Back to long only' : 'Let a down signal open a short'}
+                    data-testid="automation-short-toggle"
+                  >
+                    {r.allow_short ? 'Long only' : 'Allow shorting'}
+                  </button>
                   <button
                     onClick={() => void toggle(r.id, r.enabled)}
                     className={`px-2 py-0.5 text-[10px] font-mono rounded border ${
