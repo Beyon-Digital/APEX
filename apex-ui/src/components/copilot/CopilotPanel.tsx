@@ -11,6 +11,8 @@ interface ChatEntry extends CopilotMessageDto {
   approvalState?: 'pending' | 'approved' | 'denied';
   /** The user message that produced this pending turn (for resend-on-approve). */
   prompt?: string;
+  /** Turn id of that message; re-sent on approve so the backend treats it as the same turn. */
+  turnId?: string;
   error?: boolean;
 }
 
@@ -20,6 +22,8 @@ const SUGGESTIONS = [
   'Backtest the default strategy on RELIANCE.NS and report the metrics',
   'Export RELIANCE.NS bars and train a model to predict next-day direction',
   'Place a paper order: buy 5 RELIANCE.NS at market',
+  'Write a moving-average strategy for RELIANCE.NS, backtest it, then run it on paper',
+  'What is my live trading status and what is running right now?',
   'Create an automation that trades my model on RELIANCE.NS every 5 minutes',
 ];
 
@@ -50,6 +54,19 @@ const TOOL_LABELS: Record<string, string> = {
   create_alert: 'New alert',
   list_alerts: 'Alerts',
   remove_alert: 'Remove alert',
+  get_system_status: 'System status',
+  list_brokers: 'Brokers',
+  get_account_balance: 'Balance',
+  get_holdings: 'Holdings',
+  search_symbols: 'Symbol search',
+  add_to_watchlist: 'Add to watchlist',
+  remove_from_watchlist: 'Remove from watchlist',
+  list_strategy_sessions: 'Sessions',
+  get_strategy_session: 'Session',
+  start_strategy: 'Run strategy',
+  stop_strategy: 'Stop strategy',
+  modify_order: 'Modify order',
+  kill_switch: 'KILL SWITCH',
 };
 
 const HISTORY_KEY = 'apex.copilot.history';
@@ -149,14 +166,25 @@ export const CopilotPanel: React.FC = () => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [entries, busy]);
 
-  const send = useCallback(async (text: string, replay: boolean) => {
+  const send = useCallback(async (text: string, replay: boolean, replayTurnId?: string) => {
     const message = text.trim();
     if (!message || busy) return;
 
-    // History is prior turns only — the backend appends `message` itself.
-    const history: CopilotMessageDto[] = entries
+    // History is prior turns only: the backend appends `message` itself. When
+    // replaying after an approval, the message and its "Paused" reply are already
+    // in the list, so cut them off or the model sees the request twice.
+    let prior = entries;
+    if (replay) {
+      let lastUser = -1;
+      entries.forEach((e, i) => { if (e.role === 'user') lastUser = i; });
+      prior = lastUser >= 0 ? entries.slice(0, lastUser) : entries;
+    }
+    const history: CopilotMessageDto[] = prior
       .filter((e) => !e.error)
       .map((e) => ({ role: e.role, content: e.content }));
+    // One id per user message. Approvals and cached tool results are scoped to it,
+    // so asking for the same order again later is a new turn, not a replay.
+    const turnId = replay && replayTurnId ? replayTurnId : crypto.randomUUID();
 
     if (!replay) {
       const userEntry: ChatEntry = { id: nextId.current++, role: 'user', content: message };
@@ -165,7 +193,7 @@ export const CopilotPanel: React.FC = () => {
     }
     setBusy(true);
     try {
-      const reply = await copilotChat(message, history);
+      const reply = await copilotChat(message, history, turnId);
       setEntries((current) => [
         ...current,
         {
@@ -179,6 +207,7 @@ export const CopilotPanel: React.FC = () => {
           approvalState:
             reply.pending_approvals.length > 0 ? 'pending' : undefined,
           prompt: message,
+          turnId,
         },
       ]);
     } catch (err) {
@@ -200,12 +229,13 @@ export const CopilotPanel: React.FC = () => {
     (entry: ChatEntry) => {
       const keys = (entry.pendingApprovals ?? []).map((a) => a.key);
       const prompt = entry.prompt ?? '';
+      const turnId = entry.turnId;
       setEntries((current) =>
         current.map((e) => (e.id === entry.id ? { ...e, approvalState: 'approved' as const } : e)),
       );
       void approveCopilotTools(keys)
         .then(() => {
-          if (prompt) return send(prompt, true);
+          if (prompt) return send(prompt, true, turnId);
         })
         .catch(() => undefined);
     },

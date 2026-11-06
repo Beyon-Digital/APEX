@@ -79,6 +79,8 @@ pub struct AppState {
     /// Id of the copilot turn whose approvals and tool results are cached. A new
     /// user message gets a new id, which clears both.
     pub copilot_turn: std::sync::Mutex<Option<String>>,
+    /// ChatGPT sign-in state (pending flow, refresh lock).
+    pub chatgpt: crate::chatgpt_auth::Runtime,
     market_data_feed: String,
     pub started_at: Instant,
 }
@@ -301,6 +303,7 @@ impl AppState {
             automations_paused: std::sync::atomic::AtomicBool::new(false),
             app: std::sync::OnceLock::new(),
             copilot_turn: std::sync::Mutex::new(None),
+            chatgpt: crate::chatgpt_auth::Runtime::default(),
             market_data_feed,
             started_at: Instant::now(),
         })

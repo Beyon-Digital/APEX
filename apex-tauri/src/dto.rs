@@ -814,3 +814,27 @@ pub struct SymbolSearchResultDto {
     /// Where the match came from: "zerodha" or "yahoo".
     pub source: String,
 }
+
+/// One data feed that could serve a symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedOptionDto {
+    pub adapter_id: String,
+    pub name: String,
+    /// "delayed" | "live" | "exchange"
+    pub quality: String,
+    pub supports: bool,
+    pub ready: bool,
+    /// Why it can't be chosen right now, if so.
+    pub unavailable_reason: Option<String>,
+}
+
+/// Which feed is serving a symbol and which others could.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolFeedDto {
+    pub symbol: String,
+    /// The feed currently supplying quotes.
+    pub active: Option<String>,
+    /// The feed the user pinned, if any (None = automatic).
+    pub preferred: Option<String>,
+    pub options: Vec<FeedOptionDto>,
+}

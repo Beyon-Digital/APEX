@@ -1,4 +1,4 @@
-import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto } from './types';
+import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, StrategySessionInfoDto, ChatGptStatusDto, ChatGptModelDto, SymbolFeedDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto } from './types';
 
 const IS_TAURI = typeof window !== 'undefined' && '__TAURI__' in window;
 
@@ -51,6 +51,9 @@ let mockNotebooks: NotebookDocumentDto[] = [
   },
 ];
 let mockTrainingCounter = 0;
+let mockAutomations: AutomationDto[] = [];
+const mockFeedPrefs = new Map<string, string>();
+let mockChatGpt: ChatGptStatusDto = { state: 'signed_out', email: null, plan_usage: false, message: null, use_for_copilot: false, model: null };
 // Browser mock: vault starts unlocked so web-mode specs are not gated.
 let mockVaultStatus: VaultStatusDto['status'] = 'unlocked';
 const mockAdapterConfigs = new Map<string, AdapterConfigDto>();
@@ -356,6 +359,72 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     }
   }
   
+  if (cmd === 'list_strategy_sessions' || cmd === 'list_strategy_session_details') return [] as any;
+  if (cmd === 'list_automations') return [...mockAutomations] as any;
+  if (cmd === 'create_automation') {
+    const req = args?.request as CreateAutomationDto;
+    const created: AutomationDto = {
+      id: `auto_${mockAutomations.length + 1}`, name: req.name, kind: req.kind, symbol: req.symbol,
+      model_id: req.model_id, interval_secs: req.interval_secs ?? 300, quantity: req.quantity ?? 1, threshold: req.threshold ?? 0.5,
+      broker_id: req.broker_id ?? 'paper', enabled: true, created_at: new Date().toISOString(), last_run_at: null, last_result: null, orders_today: 0,
+    };
+    mockAutomations.push(created);
+    return created as any;
+  }
+  if (cmd === 'set_automation_enabled') {
+    const rule = mockAutomations.find((a) => a.id === args?.id);
+    if (rule) rule.enabled = Boolean(args?.enabled);
+    return Boolean(rule) as any;
+  }
+  if (cmd === 'delete_automation') {
+    const before = mockAutomations.length;
+    mockAutomations = mockAutomations.filter((a) => a.id !== args?.id);
+    return (mockAutomations.length < before) as any;
+  }
+  if (cmd === 'get_symbol_feeds') {
+    const symbols = (args?.symbols as string[] | undefined) ?? [];
+    return symbols.map((symbol) => {
+      const indian = symbol.endsWith('.NS') || symbol.endsWith('.BO');
+      const preferred = mockFeedPrefs.get(symbol) ?? null;
+      return {
+        symbol,
+        active: preferred ?? 'yahoo',
+        preferred,
+        options: [
+          { adapter_id: 'yahoo', name: 'Yahoo Finance', quality: 'delayed', supports: true, ready: true, unavailable_reason: null },
+          { adapter_id: 'zerodha_kite', name: 'Zerodha Kite', quality: 'live', supports: indian, ready: false,
+            unavailable_reason: 'Not connected. Add or unlock it under Settings > Accounts.' },
+        ],
+      };
+    }) as any;
+  }
+  if (cmd === 'set_symbol_provider') {
+    const symbol = args?.symbol as string;
+    if (typeof args?.adapterId === 'string') mockFeedPrefs.set(symbol, args.adapterId);
+    else mockFeedPrefs.delete(symbol);
+    return undefined as any;
+  }
+  if (cmd === 'chatgpt_status') return { ...mockChatGpt } as any;
+  if (cmd === 'chatgpt_sign_in') {
+    mockChatGpt = { ...mockChatGpt, state: 'waiting', message: 'Waiting for you to finish signing in in the browser…' };
+    setTimeout(() => { mockChatGpt = { ...mockChatGpt, state: 'connected', email: 'demo@example.com', plan_usage: true, message: null }; }, 700);
+    return 'https://auth.openai.com/api/accounts/authorize?client_id=dynamic_agent_client' as any;
+  }
+  if (cmd === 'chatgpt_sign_out') {
+    mockChatGpt = { state: 'signed_out', email: null, plan_usage: false, message: null, use_for_copilot: false, model: null };
+    return 'Signed out.' as any;
+  }
+  if (cmd === 'chatgpt_list_models') return [{ slug: 'gpt-demo', name: 'GPT Demo' }, { slug: 'gpt-demo-mini', name: 'GPT Demo Mini' }] as any;
+  if (cmd === 'chatgpt_set_preferences') {
+    if (args?.useForCopilot === true && mockChatGpt.state !== 'connected') throw new Error('Sign in with ChatGPT (and allow plan usage) first.');
+    mockChatGpt = {
+      ...mockChatGpt,
+      ...(typeof args?.useForCopilot === 'boolean' ? { use_for_copilot: args.useForCopilot } : {}),
+      ...(typeof args?.model === 'string' ? { model: args.model } : {}),
+    };
+    return { ...mockChatGpt } as any;
+  }
+  if (cmd === 'open_external_url') return undefined as any;
   if (cmd === 'vault_status') return { status: mockVaultStatus } as any;
   if (cmd === 'vault_init' || cmd === 'vault_unlock') { mockVaultStatus = 'unlocked'; return { status: mockVaultStatus } as any; }
   if (cmd === 'vault_lock') { mockVaultStatus = 'locked'; return { status: mockVaultStatus } as any; }
@@ -924,8 +993,9 @@ export async function runScan(request: ScanRequestDto): Promise<ScanOutputDto> {
 }
 
 // AI Copilot (OpenRouter — desktop only)
-export async function copilotChat(message: string, history?: CopilotMessageDto[]): Promise<CopilotReplyDto> {
-  return invoke<CopilotReplyDto>('copilot_chat', { message, history });
+/** `turnId` identifies one user turn; re-send the same id when replaying after an approval. */
+export async function copilotChat(message: string, history?: CopilotMessageDto[], turnId?: string): Promise<CopilotReplyDto> {
+  return invoke<CopilotReplyDto>('copilot_chat', { message, history, turnId });
 }
 
 export async function approveCopilotTools(keys: string[]): Promise<number> {
@@ -951,6 +1021,7 @@ export async function getRegression(xSymbol: string, ySymbol: string, timeframe?
 export async function stopStrategyFile(path: string): Promise<void> { return invoke<void>('stop_strategy_file', { path }); }
 
 export async function listStrategySessions(): Promise<string[]> { return invoke<string[]>('list_strategy_sessions'); }
+export async function listStrategySessionDetails(): Promise<StrategySessionInfoDto[]> { return invoke<StrategySessionInfoDto[]>('list_strategy_session_details'); }
 
 // Credential vault
 export async function vaultStatus(): Promise<VaultStatusDto> { return invoke<VaultStatusDto>('vault_status'); }
@@ -981,3 +1052,22 @@ export async function zerodhaLoginUrl(): Promise<string> { return invoke<string>
 export async function getLiveStatus(): Promise<LiveStatusDto> { return invoke<LiveStatusDto>('get_live_status'); }
 export async function setLiveArmed(armed: boolean): Promise<LiveStatusDto> { return invoke<LiveStatusDto>('set_live_armed', { armed }); }
 export async function killSwitch(): Promise<KillSwitchResultDto> { return invoke<KillSwitchResultDto>('kill_switch'); }
+
+// ChatGPT plan sign-in (Copilot)
+export async function chatgptStatus(): Promise<ChatGptStatusDto> { return invoke<ChatGptStatusDto>('chatgpt_status'); }
+export async function chatgptSignIn(): Promise<string> { return invoke<string>('chatgpt_sign_in'); }
+export async function chatgptSignOut(): Promise<string> { return invoke<string>('chatgpt_sign_out'); }
+export async function chatgptListModels(): Promise<ChatGptModelDto[]> { return invoke<ChatGptModelDto[]>('chatgpt_list_models'); }
+export async function chatgptSetPreferences(useForCopilot?: boolean, model?: string): Promise<ChatGptStatusDto> {
+  return invoke<ChatGptStatusDto>('chatgpt_set_preferences', { useForCopilot, model });
+}
+export async function openExternalUrl(url: string): Promise<void> {
+  if (!IS_TAURI) { window.open(url, '_blank', 'noopener'); return; }
+  return invoke<void>('open_external_url', { url });
+}
+
+// Per-ticker data feed choice
+export async function getSymbolFeeds(symbols: string[]): Promise<SymbolFeedDto[]> { return invoke<SymbolFeedDto[]>('get_symbol_feeds', { symbols }); }
+export async function setSymbolProvider(symbol: string, adapterId: string | null): Promise<void> {
+  return invoke<void>('set_symbol_provider', { symbol, adapterId });
+}

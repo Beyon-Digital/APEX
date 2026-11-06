@@ -10,9 +10,12 @@ import {
   runStrategyFile,
   stopStrategyFile,
   listStrategySessions,
+  listStrategySessionDetails,
   saveStrategyFile,
 } from '../../lib/tauri';
-import type { StrategyBacktestRequestDto, StrategyBacktestResultDto, StrategyExecutionResultDto } from '../../lib/types';
+import type { StrategyBacktestRequestDto, StrategyBacktestResultDto, StrategyExecutionResultDto, StrategySessionInfoDto } from '../../lib/types';
+import { useBrokerStore } from '../../stores/brokerStore';
+import { SymbolField } from '../common/SymbolField';
 
 type EditorInstance = editor.IStandaloneCodeEditor;
 
@@ -131,6 +134,26 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
   const runningPathRef = useRef<string | null>(null);
   const [runState, setRunState] = useState<RunState>('idle');
   const [paperQuantity, setPaperQuantity] = useState(1);
+  const [runBroker, setRunBroker] = useState('paper');
+  const [runMinutes, setRunMinutes] = useState(30);
+  // A live run needs a second click; it disarms itself so a stray click cannot start it later.
+  const [liveRunPending, setLiveRunPending] = useState(false);
+  const [sessionDetails, setSessionDetails] = useState<StrategySessionInfoDto[]>([]);
+  const brokerConnections = useBrokerStore((s) => s.connections);
+  const runnableBrokers = React.useMemo(
+    () => brokerConnections.filter((b) => b.mode === 'paper' || (b.execution_available && b.authenticated)),
+    [brokerConnections],
+  );
+  const runBrokerInfo = runnableBrokers.find((b) => b.broker_id === runBroker);
+  const runIsLive = runBroker !== 'paper';
+  useEffect(() => {
+    if (runBroker !== 'paper' && !runnableBrokers.some((b) => b.broker_id === runBroker)) setRunBroker('paper');
+  }, [runBroker, runnableBrokers]);
+  useEffect(() => {
+    if (!liveRunPending) return;
+    const timer = setTimeout(() => setLiveRunPending(false), 6000);
+    return () => clearTimeout(timer);
+  }, [liveRunPending]);
   const [output, setOutput] = useState<string[]>([]);
   const [saveConfirm, setSaveConfirm] = useState(false);
   const [isLoadingFiles, setIsLoadingFiles] = useState(!initialFiles);
@@ -159,6 +182,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     let disposed = false;
     const refresh = async () => {
       try { const paths = await listStrategySessions(); if (!disposed && Array.isArray(paths)) setActiveSessions(paths); } catch { /* Browser fixtures do not run native sessions. */ }
+      try { const details = await listStrategySessionDetails(); if (!disposed && Array.isArray(details)) setSessionDetails(details); } catch { /* same */ }
     };
     void refresh();
     const timer = setInterval(() => void refresh(), 2000);
@@ -317,11 +341,11 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     runningPathRef.current = fileToRun.path;
     setRunState('running');
     setStrategyError(null);
-    appendOutput(`[${new Date().toLocaleTimeString()}] ▶ Running ${fileToRun.name}...`);
+    appendOutput(`[${new Date().toLocaleTimeString()}] ▶ Running ${fileToRun.name} on ${runBroker}...`);
 
     try {
       const savedFile = await persistFile(fileToRun);
-      const result = await runStrategyFile(savedFile.path, { quantity: paperQuantity });
+      const result = await runStrategyFile(savedFile.path, { quantity: paperQuantity, broker_id: runBroker, duration_minutes: runMinutes });
       appendResult(result);
       onRun?.(savedFile);
       runningPathRef.current = null;
@@ -336,7 +360,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
       runningPathRef.current = null;
       setRunState('error');
     }
-  }, [appendOutput, appendResult, currentEditorFile, onRun, persistFile, paperQuantity]);
+  }, [appendOutput, appendResult, currentEditorFile, onRun, persistFile, paperQuantity, runBroker, runMinutes]);
 
   const handleStop = useCallback(async () => {
     const path = currentEditorFile()?.path;
@@ -412,11 +436,29 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
 
   return (
     <div className="flex flex-1 flex-col h-full min-h-0 min-w-0 bg-surface-0" data-testid="strategy-ide">
-      {activeSessions.length > 0 && <div className="px-4 py-2 text-xs border-b border-[var(--border-color)]" data-testid="paper-strategy-sessions">
-        {activeSessions.map((path) => <div key={path} className="flex items-center justify-between gap-2">
-          <span>Paper running: {path}</span>
-          <button type="button" onClick={() => void stopStrategyFile(path).catch((err) => setStrategyError(String(err)))}>Stop paper session</button>
-        </div>)}
+      {activeSessions.length > 0 && <div className="space-y-1 px-4 py-2 text-xs border-b border-[var(--border-color)]" data-testid="paper-strategy-sessions">
+        {activeSessions.map((path) => {
+          const info = sessionDetails.find((s) => s.path === path);
+          const live = info ? info.broker_id !== 'paper' : false;
+          return (
+            <div key={path} className="flex items-start justify-between gap-3" data-testid={`strategy-session-${path}`}>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`border px-1 text-[9px] font-semibold uppercase tracking-wider ${live ? 'border-bear text-bear' : 'border-[var(--border-color)] text-text-muted'}`}>
+                    {live ? `LIVE ${info?.broker_id}` : 'Paper'}
+                  </span>
+                  <span className="font-mono text-text-primary">{path}</span>
+                  {info && <span className="text-text-muted">
+                    {info.symbol} {info.timeframe} · {info.state} · {info.held ? 'in position' : 'flat'} · {info.bars_processed} bars · {info.orders_placed} orders
+                  </span>}
+                </div>
+                {info?.recent_logs.length ? <div className="mt-0.5 truncate text-[11px] text-text-muted" title={info.recent_logs[info.recent_logs.length - 1]}>{info.recent_logs[info.recent_logs.length - 1]}</div> : null}
+                {info?.last_error && <div className="mt-0.5 text-[11px] text-bear">{info.last_error}</div>}
+              </div>
+              <button type="button" className="shrink-0 border border-[var(--border-color)] px-2 py-0.5 text-text-secondary hover:text-bear" onClick={() => void stopStrategyFile(path).catch((err) => setStrategyError(String(err)))}>Stop</button>
+            </div>
+          );
+        })}
       </div>}
       {/* Toolbar */}
       <div className="px-4 py-3 border-b border-[var(--border-color)] flex flex-wrap items-center justify-between gap-3 bg-surface-1">
@@ -429,17 +471,34 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <label className="flex items-center gap-2 text-xs text-text-secondary">
-            Paper size
+            Account
+            <select value={runBroker} onChange={(event) => { setRunBroker(event.target.value); setLiveRunPending(false); }}
+              className="rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1 text-text-primary" data-testid="strategy-run-broker">
+              {runnableBrokers.map((b) => <option key={b.broker_id} value={b.broker_id}>{b.mode === 'paper' ? 'Paper (simulated)' : `LIVE ${b.display_name}`}</option>)}
+              {runnableBrokers.length === 0 && <option value="paper">Paper (simulated)</option>}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-text-secondary">
+            Size
             <input type="number" min="0" step="any" value={paperQuantity} onChange={(event) => setPaperQuantity(Number(event.target.value))} className="w-16 rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1 text-text-primary" data-testid="paper-strategy-quantity" />
+          </label>
+          <label className="flex items-center gap-2 text-xs text-text-secondary" title="The session stops itself after this long (1-1440)">
+            Minutes
+            <input type="number" min="1" max="1440" step="1" value={runMinutes} onChange={(event) => setRunMinutes(Math.max(1, Math.min(1440, Math.round(Number(event.target.value) || 30))))} className="w-16 rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1 text-text-primary" data-testid="strategy-run-minutes" />
           </label>
           <button
             type="button"
-            onClick={() => void handleRun()}
+            onClick={() => {
+              if (runIsLive && !liveRunPending) { setLiveRunPending(true); return; }
+              setLiveRunPending(false);
+              void handleRun();
+            }}
             disabled={isLoadingFiles || !activeFile || !Number.isFinite(paperQuantity) || paperQuantity <= 0 || activeSessions.includes(activeFile.path) || runningPathRef.current === activeFile.path}
             data-testid="execute-strategy"
-            className="px-4 py-2 text-xs font-medium rounded bg-bull text-on-bull hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className={`px-4 py-2 text-xs font-medium rounded hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${runIsLive ? 'bg-bear text-on-bear' : 'bg-bull text-on-bull'}`}
+            title={runIsLive ? `Places REAL orders on ${runBrokerInfo?.display_name ?? runBroker}. Needs live trading armed; the order and daily caps apply.` : undefined}
           >
-            Run paper
+            {!runIsLive ? 'Run paper' : liveRunPending ? `Confirm: trade LIVE on ${runBrokerInfo?.display_name ?? runBroker}` : `Run LIVE on ${runBrokerInfo?.display_name ?? runBroker}`}
           </button>
           <button
             type="button"
@@ -599,12 +658,11 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
           <label className="text-xs text-text-secondary">
             <span className="mb-1 block">Symbol</span>
-            <input
-              type="text"
+            <SymbolField
               value={backtestConfig.symbol}
-              onChange={(e) => setBacktestConfig((prev) => ({ ...prev, symbol: e.target.value.toUpperCase() }))}
+              onChange={(v) => setBacktestConfig((prev) => ({ ...prev, symbol: v.toUpperCase() }))}
               className="w-full rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1 font-mono text-xs text-text-primary"
-              data-testid="backtest-symbol-input"
+              testId="backtest-symbol-input"
             />
           </label>
           <label className="text-xs text-text-secondary">

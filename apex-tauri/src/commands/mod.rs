@@ -3,6 +3,7 @@ pub mod adapters;
 pub mod alerts;
 pub mod automation;
 pub mod brokers;
+pub mod chatgpt;
 pub mod copilot;
 pub mod copilot_tools;
 pub mod data;

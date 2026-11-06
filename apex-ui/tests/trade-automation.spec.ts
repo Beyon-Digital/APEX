@@ -198,6 +198,7 @@ test.describe('Trade Automation Features', () => {
     await expect(settingsPanel).toBeVisible({ timeout: 5000 });
 
     // Check for various settings sections
+    await page.getByTestId('settings-tab-trading').click();
     const tradingSettings = page.getByTestId('trading-settings-section');
     await expect(tradingSettings).toBeVisible();
   });

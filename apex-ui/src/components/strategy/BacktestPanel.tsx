@@ -1,3 +1,4 @@
+import { SymbolField } from '../common/SymbolField';
 import { formatProfitFactor } from '../../lib/format';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createChart } from 'lightweight-charts';
@@ -191,7 +192,7 @@ export const BacktestPanel: React.FC<{ defaultSymbol?: string }> = ({ defaultSym
             </select>
           </label>
           <label className="text-xs text-text-secondary">Symbol
-            <input value={symbol} onChange={(e) => setSymbol(e.target.value)} placeholder="e.g. BTC-USD" className={`${inputCls} mt-1 w-full font-mono`} data-testid="backtest-symbol" />
+            <SymbolField value={symbol} onChange={setSymbol} placeholder="e.g. BTC-USD" className={`${inputCls} mt-1 w-full font-mono`} testId="backtest-symbol" />
           </label>
           <label className="text-xs text-text-secondary">Timeframe
             <select value={timeframe} onChange={(e) => setTimeframe(e.target.value)} className={`${inputCls} mt-1 w-full`} data-testid="backtest-timeframe">

@@ -644,3 +644,61 @@ export interface SymbolSearchResultDto {
   /** "zerodha" | "yahoo" | "local" */
   source: string;
 }
+
+// ── Strategy sessions ────────────────────────────────────────────────
+
+export interface StrategySessionInfoDto {
+  path: string;
+  symbol: string;
+  timeframe: string;
+  broker_id: string;
+  quantity: number;
+  started_at: string;
+  /** "starting" | "running" | "stopped" | "error" */
+  state: string;
+  held: boolean;
+  bars_processed: number;
+  orders_placed: number;
+  last_error: string | null;
+  recent_logs: string[];
+}
+
+// ── ChatGPT plan sign-in ─────────────────────────────────────────────
+
+export interface ChatGptStatusDto {
+  /** "locked" | "signed_out" | "waiting" | "connected" | "error" */
+  state: string;
+  email: string | null;
+  /** False when signed in but plan usage was not granted. */
+  plan_usage: boolean;
+  message: string | null;
+  /** The copilot is set to run on the ChatGPT plan. */
+  use_for_copilot: boolean;
+  model: string | null;
+}
+
+export interface ChatGptModelDto {
+  slug: string;
+  name: string;
+}
+
+// ── Data feeds per ticker ────────────────────────────────────────────
+
+export interface FeedOptionDto {
+  adapter_id: string;
+  name: string;
+  /** "delayed" | "live" | "exchange" */
+  quality: string;
+  supports: boolean;
+  ready: boolean;
+  unavailable_reason: string | null;
+}
+
+export interface SymbolFeedDto {
+  symbol: string;
+  /** The feed currently supplying quotes. */
+  active: string | null;
+  /** The feed the user pinned (null = automatic). */
+  preferred: string | null;
+  options: FeedOptionDto[];
+}

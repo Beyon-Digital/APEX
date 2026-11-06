@@ -178,7 +178,7 @@ struct ResolvedProvider {
     id: String,
     base_url: String,
     model: String,
-    /// "chat" | "responses" | "acp"
+    /// "chat" | "responses" | "chatgpt" | "acp"
     api_kind: String,
     api_key: String,
     max_tokens: u32,
@@ -196,6 +196,25 @@ fn vault_key(state: &AppState, provider_id: &str) -> Result<Option<String>, Stri
 }
 
 fn resolve_provider(state: &AppState) -> Result<ResolvedProvider, String> {
+    // The user's ChatGPT plan, when they signed in and chose it for the copilot.
+    let prefs = crate::chatgpt_auth::preferences(&state.vault);
+    if prefs.use_for_copilot {
+        let status = crate::chatgpt_auth::status(state);
+        if status.state == "connected" && status.plan_usage {
+            // Model names differ per account, so never guess one.
+            let model = prefs.model.filter(|m| !m.trim().is_empty()).ok_or_else(|| {
+                "Choose a ChatGPT model under Settings > AI Copilot > ChatGPT plan.".to_string()
+            })?;
+            return Ok(ResolvedProvider {
+                id: "chatgpt".to_string(),
+                base_url: crate::chatgpt_auth::RESOURCE.to_string(),
+                model,
+                api_kind: "chatgpt".to_string(),
+                api_key: String::new(),
+                max_tokens: state.copilot.max_tokens,
+            });
+        }
+    }
     // Provider registry takes precedence when an active id is set.
     if !state.llm.active.trim().is_empty() {
         let provider = state
@@ -1116,7 +1135,7 @@ pub async fn copilot_chat(
     let paths_ref = runtime_paths.inner();
 
     match provider.api_kind.as_str() {
-        "responses" => {
+        "responses" | "chatgpt" => {
             let tools = chat_tools_to_responses(&tool_schemas());
             let mut input: Vec<Value> = vec![json!({
                 "role": "developer",
@@ -1145,7 +1164,11 @@ pub async fn copilot_chat(
             let mut model_name = provider.model.clone();
             let mut pending_approvals: Vec<PendingApprovalDto> = Vec::new();
             'rounds: for _ in 0..MAX_AGENT_ROUNDS {
-                let resp = responses_round(&state.http, &provider, &input, &tools).await?;
+                let resp = if provider.api_kind == "chatgpt" {
+                    crate::chatgpt_auth::responses_round(&state, &provider.model, &input, &tools).await?
+                } else {
+                    responses_round(&state.http, &provider, &input, &tools).await?
+                };
                 if let Some(m) = resp.get("model").and_then(|v| v.as_str()) {
                     model_name = m.to_string();
                 }

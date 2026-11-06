@@ -10,6 +10,8 @@ test.describe('Broker connectivity settings', () => {
     await page.getByTestId('open-settings').click();
 
     await expect(page.getByTestId('settings-panel')).toBeVisible({ timeout: 5000 });
+    // Session tokens live under the Accounts tab, in an advanced section.
+    await page.getByTestId('session-tokens-details').locator('summary').click();
     await expect(page.getByTestId('broker-settings-section')).toBeVisible();
 
     await page.getByTestId('broker-token-zerodha').fill('mock-zerodha-session-token');

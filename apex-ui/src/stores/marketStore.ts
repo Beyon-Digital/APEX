@@ -6,6 +6,9 @@ interface MarketState {
   quotes: Map<string, QuoteDto>;
   watchlist: string[];
   lastQuoteAt: number | null;
+  /** Data feed pinned per symbol (adapter id). Absent = automatic. */
+  providerPrefs: Record<string, string>;
+  setProviderPref: (symbol: string, adapterId: string | null) => void;
   updateQuote: (quote: QuoteDto) => void;
   setWatchlist: (symbols: string[]) => void;
   addToWatchlist: (symbol: string) => void;
@@ -19,6 +22,16 @@ export const useMarketStore = create<MarketState>()(
       quotes: new Map(),
       watchlist: ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'INFY.NS', 'AAPL', 'MSFT', 'GOOGL'],
       lastQuoteAt: null,
+      providerPrefs: {},
+
+      setProviderPref: (symbol, adapterId) => {
+        set((state) => {
+          const next = { ...state.providerPrefs };
+          if (adapterId) next[symbol] = adapterId;
+          else delete next[symbol];
+          return { providerPrefs: next };
+        });
+      },
 
       updateQuote: (quote: QuoteDto) => {
         set((state) => {
@@ -55,7 +68,7 @@ export const useMarketStore = create<MarketState>()(
     }),
     {
       name: 'market-storage',
-      partialize: (state) => ({ watchlist: state.watchlist }),
+      partialize: (state) => ({ watchlist: state.watchlist, providerPrefs: state.providerPrefs }),
     }
   )
 );

@@ -4,6 +4,7 @@ import { placeOrder, previewOrder, setLiveArmed } from '../../lib/tauri';
 import type { NewOrderRequestDto, OrderPreviewDto } from '../../lib/types';
 import { useBrokerStore } from '../../stores/brokerStore';
 import { useLiveStore } from '../../stores/liveStore';
+import { SymbolField } from '../common/SymbolField';
 
 interface OrderEntryProps {
   defaultSymbol?: string;
@@ -157,8 +158,7 @@ export const OrderEntry: React.FC<OrderEntryProps> = ({ defaultSymbol }) => {
 
       <div className="mt-3 grid grid-cols-2 gap-x-2 gap-y-2">
         <label className="min-w-0 text-xs text-text-secondary">Symbol
-          <input type="text" value={symbol} onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-            aria-label="Symbol" placeholder="Symbol" data-testid="order-symbol-input"
+          <SymbolField value={symbol} onChange={(v) => setSymbol(v.toUpperCase())} ariaLabel="Symbol" placeholder="Symbol" testId="order-symbol-input"
             className="mt-1 w-full min-w-0 rounded border border-[var(--border-color)] bg-surface-0 px-2 py-1.5 font-mono text-sm text-text-primary focus:border-accent focus:outline-none" />
         </label>
         <label className="min-w-0 text-xs text-text-secondary">Quantity

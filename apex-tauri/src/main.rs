@@ -1,4 +1,5 @@
 mod broker_runtime;
+mod chatgpt_auth;
 mod commands;
 mod config;
 mod dto;
@@ -63,6 +64,8 @@ fn main() {
             market::subscribe_symbols,
             market::unsubscribe_symbols,
             market::search_symbols,
+            market::get_symbol_feeds,
+            market::set_symbol_provider,
             orders::get_holdings,
             orders::place_order,
             orders::preview_order,
@@ -116,6 +119,12 @@ fn main() {
             brokers::clear_broker_session,
             brokers::zerodha_login,
             brokers::zerodha_login_url,
+            commands::chatgpt::chatgpt_status,
+            commands::chatgpt::chatgpt_sign_in,
+            commands::chatgpt::chatgpt_sign_out,
+            commands::chatgpt::chatgpt_list_models,
+            commands::chatgpt::chatgpt_set_preferences,
+            commands::chatgpt::open_external_url,
             vault_cmd::vault_status,
             vault_cmd::vault_init,
             vault_cmd::vault_unlock,

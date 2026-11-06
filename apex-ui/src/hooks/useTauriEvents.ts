@@ -9,6 +9,7 @@ import { useMarketStore } from '../stores/marketStore';
 import { useOrderStore } from '../stores/orderStore';
 import { useHealthStore } from '../stores/healthStore';
 import { useNewsStore } from '../stores/newsStore';
+import { addSymbolToWatchlist, removeSymbolFromWatchlist } from '../lib/watchlistActions';
 import type { QuoteDto, OrderDto, PositionDto, SystemHealthDto, NewsItemDto, AlertDto } from '../lib/types';
 
 const IS_TAURI = typeof window !== 'undefined' && '__TAURI__' in window;
@@ -231,6 +232,40 @@ export function useAlertStream() {
 }
 
 /**
+ * The AI copilot edits the watchlist (which lives in the UI) by emitting this event.
+ */
+export function useCopilotWatchlistStream() {
+  const unlistenRef = useRef<UnlistenFn | null>(null);
+
+  useEffect(() => {
+    if (!IS_TAURI) return;
+
+    let mounted = true;
+
+    (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        const unlisten = await listen<{ action: string; symbols: string[] }>('copilot-watchlist', (event) => {
+          if (!mounted || !Array.isArray(event.payload?.symbols)) return;
+          for (const symbol of event.payload.symbols) {
+            if (event.payload.action === 'add') void addSymbolToWatchlist(symbol, false);
+            else if (event.payload.action === 'remove') removeSymbolFromWatchlist(symbol);
+          }
+        });
+        unlistenRef.current = unlisten;
+      } catch {
+        // Tauri event API not available
+      }
+    })();
+
+    return () => {
+      mounted = false;
+      unlistenRef.current?.();
+    };
+  }, []);
+}
+
+/**
  * Master hook that sets up all Tauri event streams.
  * Call once from the app root to initialize all real-time subscriptions.
  */
@@ -241,4 +276,5 @@ export function useTauriEventBridge() {
   useHealthStream();
   useNewsStream();
   useAlertStream();
+  useCopilotWatchlistStream();
 }

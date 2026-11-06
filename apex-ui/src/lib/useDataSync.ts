@@ -4,7 +4,7 @@ import { useOrderStore } from '../stores/orderStore';
 import { useRiskStore } from '../stores/riskStore';
 import { useBrokerStore } from '../stores/brokerStore';
 import { useLiveStore } from '../stores/liveStore';
-import { getQuote, subscribeSymbols, unsubscribeSymbols, getPositions, getOpenOrders, getRiskStatus, getAccountBalance, listBrokerConnections, getLiveStatus } from './tauri';
+import { getQuote, subscribeSymbols, unsubscribeSymbols, setSymbolProvider, getPositions, getOpenOrders, getRiskStatus, getAccountBalance, listBrokerConnections, getLiveStatus } from './tauri';
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -25,6 +25,8 @@ export function useDataSync() {
   const activeBrokerId = useBrokerStore((s) => s.activeBrokerId);
   const setLiveStatus = useLiveStore((s) => s.setStatus);
   const subscribedRef = useRef<Set<string>>(new Set());
+  const appliedPrefsRef = useRef<Record<string, string>>({});
+  const providerPrefs = useMarketStore((s) => s.providerPrefs);
 
   // Keep backend subscriptions in step with the watchlist: new symbols are
   // subscribed as they are added, removed ones are released.
@@ -66,6 +68,22 @@ export function useDataSync() {
     const id = setInterval(poll, POLL_INTERVAL_MS);
     return () => clearInterval(id);
   }, [watchlist, updateQuote]);
+
+  // Re-apply pinned data feeds (the backend forgets them on restart).
+  useEffect(() => {
+    const applied = appliedPrefsRef.current;
+    for (const [symbol, adapter] of Object.entries(providerPrefs)) {
+      if (applied[symbol] === adapter) continue;
+      applied[symbol] = adapter;
+      setSymbolProvider(symbol, adapter).catch((err) => {
+        delete applied[symbol];
+        console.warn('[DataSync] could not pin data feed:', err);
+      });
+    }
+    for (const symbol of Object.keys(applied)) {
+      if (!(symbol in providerPrefs)) delete applied[symbol];
+    }
+  }, [providerPrefs]);
 
   // Poll live-trading safeguards (armed state, daily order budget, halt).
   useEffect(() => {

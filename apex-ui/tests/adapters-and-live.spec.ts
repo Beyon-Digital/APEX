@@ -17,6 +17,7 @@ test.describe('Adapter manager', () => {
 
   test('saving a key stores it without ever showing it again', async ({ page }) => {
     await openSettings(page);
+    await page.getByTestId('adapter-expand-zerodha').click();
     const key = page.getByTestId('adapter-field-zerodha-api_key');
     await expect(page.getByTestId('adapter-save-zerodha')).toBeDisabled();
     await key.fill('kite-key-123');
@@ -31,6 +32,7 @@ test.describe('Adapter manager', () => {
 
   test('remove clears the stored credentials', async ({ page }) => {
     await openSettings(page);
+    await page.getByTestId('adapter-expand-binance').click();
     await page.getByTestId('adapter-field-binance-api_key').fill('b-key');
     await page.getByTestId('adapter-field-binance-api_secret').fill('b-secret');
     await page.getByTestId('adapter-save-binance').click();
@@ -42,6 +44,7 @@ test.describe('Adapter manager', () => {
 
   test('locking the vault disables editing', async ({ page }) => {
     await openSettings(page);
+    await page.getByTestId('adapter-expand-zerodha').click();
     await page.getByTestId('vault-lock').click();
     await expect(page.getByTestId('vault-state')).toContainText('locked');
     await expect(page.getByTestId('adapter-field-zerodha-api_key')).toBeDisabled();
@@ -53,6 +56,7 @@ test.describe('Live trading safeguards', () => {
     await page.goto('/');
     await page.waitForLoadState('networkidle');
     await page.getByTestId('open-settings').click();
+    await page.getByTestId('session-tokens-details').locator('summary').click();
     await page.getByTestId('broker-token-zerodha').fill('session-token');
     await page.getByTestId('broker-connect-zerodha').click();
     await expect(page.getByTestId('broker-card-zerodha')).toContainText(/connected/i, { timeout: 5000 });
@@ -86,5 +90,87 @@ test.describe('Live trading safeguards', () => {
     await page.getByTestId('kill-switch').click();
     await expect(page.getByTestId('live-message')).toContainText('Kill switch');
     await expect(page.getByTestId('live-arm-toggle')).toContainText('off');
+  });
+});
+
+test.describe('Settings layout', () => {
+  test('is split into short tabs instead of one long page', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    await page.getByTestId('open-settings').click();
+    for (const tab of ['accounts', 'data', 'ai', 'trading', 'general']) {
+      await expect(page.getByTestId(`settings-tab-${tab}`)).toBeVisible();
+    }
+    // Only the active tab's content is mounted.
+    await expect(page.getByTestId('adapter-manager')).toBeVisible();
+    await expect(page.getByTestId('chatgpt-card')).toHaveCount(0);
+    await page.getByTestId('settings-tab-ai').click();
+    await expect(page.getByTestId('chatgpt-card')).toBeVisible();
+    await expect(page.getByTestId('adapter-manager')).toHaveCount(0);
+    // The panel itself no longer needs a long scroll to reach anything.
+    const overflow = await page.getByTestId('settings-panel').evaluate((el) => el.scrollHeight - el.clientHeight);
+    expect(overflow).toBeLessThanOrEqual(1);
+  });
+
+  test('the dead placeholder controls are gone', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    await page.getByTestId('open-settings').click();
+    await page.getByTestId('settings-tab-trading').click();
+    await expect(page.getByTestId('live-summary')).toContainText('OFF');
+    await expect(page.getByText('Enable Confirmations')).toHaveCount(0);
+    await expect(page.getByText('Default Order Size')).toHaveCount(0);
+    await expect(page.getByTestId('settings-max-daily-loss')).toBeVisible();
+  });
+
+  test('market data tab explains how to choose a feed per ticker', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    await page.getByTestId('open-settings').click();
+    await page.getByTestId('settings-tab-data').click();
+    await expect(page.getByTestId('settings-market-data-adapter')).toBeVisible();
+    await expect(page.getByTestId('data-feed-yahoo')).toContainText('delayed');
+    await expect(page.getByTestId('data-feed-zerodha_kite')).toContainText('Not connected');
+  });
+});
+
+test.describe('ChatGPT plan sign-in', () => {
+  test('signs in, then lets the copilot use the plan and pick a model', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    await page.getByTestId('open-settings').click();
+    await page.getByTestId('settings-tab-ai').click();
+    await expect(page.getByTestId('chatgpt-status')).toContainText('signed out');
+    await page.getByTestId('chatgpt-sign-in').click();
+    await expect(page.getByTestId('chatgpt-status')).toContainText('connected', { timeout: 8000 });
+    // A model is chosen automatically from the account's list.
+    await expect(page.getByTestId('chatgpt-model')).toHaveValue('gpt-demo', { timeout: 8000 });
+    await page.getByTestId('chatgpt-use-plan').check();
+    await expect(page.getByTestId('chatgpt-use-plan')).toBeChecked();
+    await page.getByTestId('chatgpt-model').selectOption('gpt-demo-mini');
+    await expect(page.getByTestId('chatgpt-model')).toHaveValue('gpt-demo-mini');
+    await page.getByTestId('chatgpt-sign-out').click();
+    await expect(page.getByTestId('chatgpt-status')).toContainText('signed out');
+  });
+});
+
+test.describe('Per-ticker data feed', () => {
+  test('the SRC badge opens a picker that explains unavailable feeds and can pin one', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    const badge = page.getByTestId('feed-badge-TCS.NS');
+    await expect(badge).toBeVisible();
+    await badge.click();
+    await expect(page.getByTestId('feed-menu')).toBeVisible();
+    // Zerodha covers the symbol but is not connected, so it is shown disabled with the reason.
+    await expect(page.getByTestId('feed-option-zerodha_kite')).toBeDisabled();
+    await expect(page.getByTestId('feed-option-zerodha_kite')).toContainText('Not connected');
+    await page.getByTestId('feed-option-yahoo').click();
+    await expect(page.getByTestId('feed-menu')).toHaveCount(0);
+    await expect(badge).toHaveAttribute('title', /pinned/);
+    // Back to automatic.
+    await badge.click();
+    await page.getByTestId('feed-auto').click();
+    await expect(badge).toHaveAttribute('title', /automatic/);
   });
 });

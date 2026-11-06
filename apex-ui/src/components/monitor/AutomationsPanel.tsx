@@ -1,3 +1,4 @@
+import { SymbolField } from '../common/SymbolField';
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   createAutomation,
@@ -141,7 +142,7 @@ export const AutomationsPanel: React.FC = () => {
 
       <form onSubmit={(e) => void submit(e)} className="px-3 py-2 border-b border-[var(--border-color)] grid grid-cols-2 gap-2" data-testid="automation-form">
         <input className={inputCls} placeholder="Name (optional)" value={name} onChange={(e) => setName(e.target.value)} data-testid="automation-name" />
-        <input className={inputCls} placeholder="Symbol *" value={symbol} onChange={(e) => setSymbol(e.target.value)} required data-testid="automation-symbol" />
+        <SymbolField className={inputCls} placeholder="Symbol *" value={symbol} onChange={setSymbol} required testId="automation-symbol" />
         <select className={inputCls} value={modelId} onChange={(e) => setModelId(e.target.value)} required data-testid="automation-model">
           {models.length === 0 && <option value="">— train a model first (ML Workbench) —</option>}
           {models.map((m) => (

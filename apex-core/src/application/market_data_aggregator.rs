@@ -15,6 +15,16 @@ use crate::ports::market_data::AdapterHealth;
 use crate::ports::market_data::MarketDataPort;
 use crate::ports::storage::StoragePort;
 
+/// One selectable data feed for a symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedOption {
+    pub adapter_id: String,
+    /// The feed covers this symbol's instrument namespace.
+    pub supports: bool,
+    /// The feed is connected and able to stream (for example, authenticated).
+    pub ready: bool,
+}
+
 /// How long a feed keeps a symbol after its last tick before lower-priority
 /// feeds may take over again.
 const SOURCE_HOLD: Duration = Duration::from_secs(10);
@@ -56,6 +66,10 @@ pub struct MarketDataAggregator {
     /// Highest-priority feed seen per symbol and when, so a delayed fallback
     /// feed cannot overwrite quotes from a live broker feed.
     source_priority: Arc<DashMap<String, (u8, std::time::Instant)>>,
+    /// User's chosen feed per symbol (adapter id). Absent = automatic.
+    provider_overrides: Arc<DashMap<String, String>>,
+    /// The feed that most recently supplied each symbol's quote.
+    symbol_sources: Arc<DashMap<String, String>>,
     data_quality_checker: Arc<DataQualityChecker>,
 }
 
@@ -74,6 +88,8 @@ impl MarketDataAggregator {
             subscribed_symbols: Arc::new(DashMap::new()),
             flush_task_started: Arc::new(AtomicBool::new(false)),
             source_priority: Arc::new(DashMap::new()),
+            provider_overrides: Arc::new(DashMap::new()),
+            symbol_sources: Arc::new(DashMap::new()),
             data_quality_checker: Arc::new(DataQualityChecker::new()),
         }
     }
@@ -109,6 +125,44 @@ impl MarketDataAggregator {
             return Ok(());
         }
         self.start(&symbols).await
+    }
+
+    /// Pin `symbol` to one feed (by adapter id), or `None` to return to automatic.
+    pub fn set_provider_override(&self, symbol: &str, adapter_id: Option<&str>) {
+        match adapter_id {
+            Some(id) => {
+                self.provider_overrides.insert(symbol.to_string(), id.to_string());
+            }
+            None => {
+                self.provider_overrides.remove(symbol);
+            }
+        }
+        // Let the new choice take effect right away instead of waiting out the hold.
+        self.source_priority.remove(symbol);
+    }
+
+    /// The feed pinned for `symbol`, if any.
+    pub fn provider_override(&self, symbol: &str) -> Option<String> {
+        self.provider_overrides.get(symbol).map(|v| v.clone())
+    }
+
+    /// The feed currently supplying `symbol`'s quotes.
+    pub fn quote_source(&self, symbol: &str) -> Option<String> {
+        self.symbol_sources.get(symbol).map(|v| v.clone())
+    }
+
+    /// Every registered feed with whether it can serve `symbol` right now.
+    pub fn feed_options(&self, symbol: &Symbol) -> Vec<FeedOption> {
+        self.adapters
+            .read()
+            .expect("adapters lock poisoned")
+            .iter()
+            .map(|adapter| FeedOption {
+                adapter_id: adapter.adapter_id().to_string(),
+                supports: adapter.supports_symbol(symbol),
+                ready: adapter.subscription_ready(),
+            })
+            .collect()
     }
 
     /// Stop tracking symbols: they are no longer re-subscribed on new adapters and
@@ -247,14 +301,26 @@ impl MarketDataAggregator {
             let data_quality_checker = self.data_quality_checker.clone();
             let subscribed_symbols = self.subscribed_symbols.clone();
             let source_priority = self.source_priority.clone();
+            let provider_overrides = self.provider_overrides.clone();
+            let symbol_sources = self.symbol_sources.clone();
             let priority = adapter.priority();
 
             // Spawn a task per adapter to read from its tick stream
             tokio::spawn(async move {
                 while let Some(tick) = tick_stream.recv().await {
                     let symbol_key = tick.symbol.0.clone();
-                    if !claim_symbol(&source_priority, &symbol_key, priority) {
+                    // The user's chosen feed outranks everything while it is ticking; if
+                    // it goes quiet the normal hold timeout lets another feed fill in.
+                    let chosen = provider_overrides
+                        .get(&symbol_key)
+                        .map(|v| v.as_str() == adapter_id)
+                        .unwrap_or(false);
+                    let effective = if chosen { u8::MAX } else { priority };
+                    if !claim_symbol(&source_priority, &symbol_key, effective) {
                         continue; // a higher-priority feed is live for this symbol
+                    }
+                    if symbol_sources.get(&symbol_key).map(|v| v.as_str() != adapter_id).unwrap_or(true) {
+                        symbol_sources.insert(symbol_key.clone(), adapter_id.clone());
                     }
                     let span =
                         info_span!("tick_pipeline", symbol = %symbol_key, source = %adapter_id);
@@ -666,5 +732,21 @@ mod tests {
             (1, std::time::Instant::now() - SOURCE_HOLD - Duration::from_secs(1)),
         );
         assert!(claim_symbol(&owners, "RELIANCE.NS", 0));
+    }
+
+    #[test]
+    fn pinning_a_feed_beats_priority_and_clears_the_hold() {
+        let agg = MarketDataAggregator::new(Arc::new(MessageBus::new()));
+        assert_eq!(agg.provider_override("AAPL"), None);
+        agg.set_provider_override("AAPL", Some("yahoo"));
+        assert_eq!(agg.provider_override("AAPL").as_deref(), Some("yahoo"));
+        agg.source_priority
+            .insert("AAPL".into(), (1, std::time::Instant::now()));
+        // Pinning drops any hold a previous owner had so the change is instant.
+        agg.set_provider_override("AAPL", Some("zerodha_kite"));
+        assert!(agg.source_priority.get("AAPL").is_none());
+        agg.set_provider_override("AAPL", None);
+        assert_eq!(agg.provider_override("AAPL"), None);
+        assert_eq!(agg.quote_source("AAPL"), None);
     }
 }
