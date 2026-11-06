@@ -347,9 +347,13 @@ export interface MLTrainingRequestDto {
   data_path: string;
   target_column: string;
   feature_columns: string[];
-  hyperparams: Record<string, number | string>;
+  hyperparams: Record<string, number | string | boolean | null>;
   n_splits: number;
   lag_periods: number[];
+  /** Name of a dataset built in the workbench; when set it supplies `data_path`. */
+  dataset?: string;
+  /** Column holding each row's forward return, used to score trading performance. */
+  return_column?: string;
 }
 
 export interface MLTrainingResultDto {
@@ -357,6 +361,7 @@ export interface MLTrainingResultDto {
   metrics: Record<string, number>;
   feature_names: string[];
   status: string;
+  duration_secs?: number;
 }
 
 // Health Monitor types
@@ -487,6 +492,8 @@ export interface ToolCallTraceDto {
   name: string;
   detail: string;
   ok: boolean;
+  /** Set when the call created or changed something the user can open (a strategy file, model, dataset or automation). */
+  artifact?: { kind: 'strategy' | 'model' | 'dataset' | 'automation'; id: string } | null;
 }
 
 export interface PendingApprovalDto {
@@ -705,4 +712,154 @@ export interface SymbolFeedDto {
   /** The feed the user pinned (null = automatic). */
   preferred: string | null;
   options: FeedOptionDto[];
+}
+
+// ── Activity / audit and live artifact updates ───────────────────────
+
+export type ArtifactKind = 'strategy' | 'model' | 'automation' | 'dataset';
+export type ActivityActor = 'user' | 'copilot' | 'automation' | 'system';
+
+/** Payload of the `artifacts-changed` event: something was created, changed or deleted. */
+export interface ArtifactEventDto {
+  kind: ArtifactKind;
+  id: string;
+  /** e.g. "strategy.save", "model.train", "automation.create" */
+  action: string;
+  actor: ActivityActor;
+}
+
+export interface ActivityDto {
+  id: string;
+  ts: string;
+  actor: ActivityActor;
+  action: string;
+  kind: ArtifactKind | 'order' | 'system';
+  target_id: string;
+  summary: string;
+  ok: boolean;
+  details: string | null;
+}
+
+// ── ML workbench: datasets, richer models, run audit ─────────────────
+
+export interface FeatureDefDto {
+  id: string;
+  label: string;
+  /** "Price" | "Trend" | "Momentum" | "Volatility" | "Volume" */
+  group: string;
+  description: string;
+  /** Bars needed before the first valid value. */
+  warmup_bars: number;
+}
+
+export interface LabelSpecDto {
+  /** Look this many bars ahead. */
+  horizon_bars: number;
+  /** "direction": 1 if the forward return is positive, else 0.
+   *  "return_threshold": 1 above +threshold, -1 below -threshold, else 0. */
+  kind: 'direction' | 'return_threshold';
+  threshold_pct: number;
+}
+
+export interface BuildDatasetRequestDto {
+  name: string;
+  symbols: string[];
+  timeframe: string;
+  bars: number;
+  features: string[];
+  label: LabelSpecDto;
+}
+
+export interface DatasetInfoDto {
+  name: string;
+  /** Path usable as `data_path` when training. */
+  path: string;
+  rows: number;
+  symbols: string[];
+  timeframe: string;
+  features: string[];
+  label: LabelSpecDto;
+  class_counts: Record<string, number>;
+  created_at: string;
+  first_time: string | null;
+  last_time: string | null;
+  source: ActivityActor;
+}
+
+export interface DatasetPreviewDto extends DatasetInfoDto {
+  columns: string[];
+  /** First rows as strings/numbers, in `columns` order. */
+  sample: (string | number)[][];
+}
+
+export interface CvFoldDto {
+  fold: number;
+  train_rows: number;
+  test_rows: number;
+  accuracy: number;
+  f1: number;
+  precision: number;
+  recall: number;
+  /** Accuracy of always predicting the most common class in this fold's test rows. */
+  baseline_accuracy: number | null;
+  /** Return from trading the fold's predicted signals on its test rows (null without returns). */
+  trade_return_pct: number | null;
+  hit_rate: number | null;
+  trades: number | null;
+}
+
+export interface TradingSummaryDto {
+  strategy_return_pct: number;
+  buy_hold_return_pct: number;
+  hit_rate: number;
+  trades: number;
+  max_drawdown_pct: number;
+  sharpe: number;
+}
+
+export interface ModelUsageDto {
+  kind: 'automation';
+  id: string;
+  name: string;
+  enabled: boolean;
+  symbol: string;
+}
+
+export interface ModelDetailDto extends MLModelDto {
+  display_name: string;
+  notes: string;
+  tags: string[];
+  source: ActivityActor | 'unknown';
+  hyperparams: Record<string, unknown>;
+  n_splits: number;
+  lag_periods: number[];
+  dataset: string | null;
+  symbols: string[];
+  timeframe: string | null;
+  label: LabelSpecDto | null;
+  rows: number | null;
+  duration_secs: number | null;
+  artifact_bytes: number | null;
+  library_versions: Record<string, string>;
+  /** Empty for models trained before per-fold results were recorded. */
+  cv_folds: CvFoldDto[];
+  /** Empty when the algorithm exposes no importances. */
+  feature_importance: { feature: string; importance: number }[];
+  trading: TradingSummaryDto | null;
+  /** Last lines of the training output. */
+  log_tail: string;
+  used_by: ModelUsageDto[];
+}
+
+export interface ModelSignalPointDto {
+  time: string;
+  close: number;
+  signal: number;
+  probability: number | null;
+}
+
+export interface ModelSignalHistoryDto {
+  model_id: string;
+  symbol: string;
+  points: ModelSignalPointDto[];
 }

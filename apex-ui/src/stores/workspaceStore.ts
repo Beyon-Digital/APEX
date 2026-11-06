@@ -15,8 +15,6 @@ interface WorkspaceState {
   commandSymbol: string | null;
   /** Tab requested by CommandBar — Workspace picks this up */
   commandTab: string | null;
-  /** Copilot dock visibility — toggled by pill, :COPILOT command, or header controls */
-  copilotOpen: boolean;
   /** "tiles" shows a draggable multi-panel grid; "focus" shows one panel at a time. */
   viewMode: 'tiles' | 'focus';
   tiles: TileItem[];
@@ -34,7 +32,6 @@ interface WorkspaceState {
   getLayouts: () => WorkspaceLayout[];
   setCommandSymbol: (symbol: string | null) => void;
   setCommandTab: (tab: string | null) => void;
-  setCopilotOpen: (open: boolean) => void;
 }
 
 export const useWorkspaceStore = create<WorkspaceState>()(
@@ -44,7 +41,6 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       currentLayout: null,
       commandSymbol: null,
       commandTab: null,
-      copilotOpen: false,
       viewMode: 'tiles',
       tiles: PRESETS.trading.tiles,
       highlightedTile: null,
@@ -106,7 +102,6 @@ export const useWorkspaceStore = create<WorkspaceState>()(
 
       setCommandSymbol: (symbol) => set({ commandSymbol: symbol }),
       setCommandTab: (tab) => set({ commandTab: tab }),
-      setCopilotOpen: (open) => set({ copilotOpen: open }),
     }),
     {
       name: 'workspace-storage',

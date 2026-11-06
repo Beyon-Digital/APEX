@@ -1,7 +1,10 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { approveCopilotTools, copilotChat, type CopilotMode } from '../../lib/tauri';
-import type { CopilotMessageDto, ToolCallTraceDto } from '../../lib/types';
+import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
+import { approveCopilotTools, copilotChat } from '../../lib/tauri';
+import type { CopilotMessageDto } from '../../lib/types';
 import { useCopilotMode, useCopilotSessions, type ChatEntry } from '../../stores/copilotSessions';
+import { CopyButton, Markdown } from './Markdown';
+import { ToolGroup } from './ToolGroup';
+import { TOOL_LABELS } from './toolLabels';
 
 const SUGGESTIONS = [
   'Summarize my open positions and session P&L',
@@ -14,65 +17,12 @@ const SUGGESTIONS = [
   'Create an automation that trades my model on RELIANCE.NS every 5 minutes',
 ];
 
-const TOOL_LABELS: Record<string, string> = {
-  get_quote: 'Quote',
-  get_ohlcv: 'OHLCV',
-  get_quant_stats: 'Quant stats',
-  get_regression: 'Regression',
-  run_scan: 'Scan',
-  get_news: 'News',
-  list_strategies: 'Strategies',
-  read_strategy: 'Read file',
-  save_strategy: 'Write file',
-  run_backtest: 'Backtest',
-  export_bars_csv: 'CSV export',
-  list_ml_models: 'Models',
-  train_ml_model: 'Train model',
-  get_model_signal: 'Signal',
-  get_positions: 'Positions',
-  get_open_orders: 'Open orders',
-  list_orders: 'Orders',
-  place_order: 'Place order',
-  cancel_order: 'Cancel order',
-  create_automation: 'New automation',
-  list_automations: 'Automations',
-  set_automation_enabled: 'Toggle rule',
-  delete_automation: 'Delete rule',
-  create_alert: 'New alert',
-  list_alerts: 'Alerts',
-  remove_alert: 'Remove alert',
-  get_system_status: 'System status',
-  list_brokers: 'Brokers',
-  get_account_balance: 'Balance',
-  get_holdings: 'Holdings',
-  search_symbols: 'Symbol search',
-  add_to_watchlist: 'Add to watchlist',
-  remove_from_watchlist: 'Remove from watchlist',
-  list_strategy_sessions: 'Sessions',
-  get_strategy_session: 'Session',
-  start_strategy: 'Run strategy',
-  stop_strategy: 'Stop strategy',
-  modify_order: 'Modify order',
-  kill_switch: 'KILL SWITCH',
-  web_fetch: 'Web page',
-  compute_indicator: 'Indicator',
-  get_order_book: 'Order book',
-  get_correlations: 'Correlations',
-  search_news: 'News search',
-  get_system_health: 'System health',
-  get_symbol_feeds: 'Data feeds',
-  set_symbol_provider: 'Pin data feed',
-  list_notebooks: 'Notebooks',
-  read_notebook: 'Read notebook',
-  write_notebook: 'Write notebook',
-  run_notebook_cell: 'Run cell',
-};
+/** Composer grows to about six lines, then scrolls. */
+const COMPOSER_MAX_PX = 136;
+/** Closer than this to the bottom counts as "following the conversation". */
+const FOLLOW_THRESHOLD_PX = 48;
 
-const MODES: { id: CopilotMode; label: string; description: string }[] = [
-  { id: 'ask', label: 'Ask', description: 'Read-only: answers from data, changes nothing' },
-  { id: 'review', label: 'Review', description: 'Asks before each change' },
-  { id: 'agent', label: 'Agent', description: 'Acts on its own; live-broker actions still ask you' },
-];
+const EMPTY: ChatEntry[] = [];
 
 const ApprovalCard: React.FC<{
   entry: ChatEntry;
@@ -119,49 +69,66 @@ const ApprovalCard: React.FC<{
   );
 };
 
-const ToolTrace: React.FC<{ calls: ToolCallTraceDto[] }> = ({ calls }) => (
-  <div className="mt-1.5 space-y-0.5" data-testid="copilot-tool-trace">
-    {calls.map((c, i) => (
-      <div
-        key={i}
-        className={`flex items-center gap-1.5 rounded border px-1.5 py-0.5 text-[10px] font-mono ${
-          c.ok ? 'border-[var(--border-color)] text-text-muted' : 'border-bear/40 text-bear'
-        }`}
-      >
-        <span className={c.ok ? 'text-accent' : 'text-bear'}>{c.ok ? '▸' : '✕'}</span>
-        <span className="font-medium">{TOOL_LABELS[c.name] ?? c.name}</span>
-        {c.detail && <span className="truncate opacity-80">{c.detail}</span>}
+const MessageRow: React.FC<{
+  entry: ChatEntry;
+  canRetry: boolean;
+  onApprove: (entry: ChatEntry) => void;
+  onDeny: (entry: ChatEntry) => void;
+  onRetry: (entry: ChatEntry) => void;
+}> = ({ entry, canRetry, onApprove, onDeny, onRetry }) => {
+  if (entry.role === 'user') {
+    return (
+      <div className="flex justify-end">
+        <div
+          className="max-w-[88%] whitespace-pre-wrap break-words border border-accent/30 bg-accent/10 px-3 py-1.5 text-[13px] text-text-primary"
+          data-testid="copilot-user-msg"
+        >
+          {entry.content}
+        </div>
       </div>
-    ))}
-  </div>
-);
-
-const EMPTY: ChatEntry[] = [];
-
-const ModeSwitch: React.FC = () => {
-  const mode = useCopilotMode((s) => s.mode);
-  const setMode = useCopilotMode((s) => s.setMode);
-  const active = MODES.find((m) => m.id === mode) ?? MODES[0];
+    );
+  }
   return (
-    <div className="px-3 pt-2 border-t border-[var(--border-color)]">
-      <div className="flex border border-[var(--border-color)] rounded overflow-hidden" role="group" aria-label="Copilot mode">
-        {MODES.map((m) => (
-          <button
-            key={m.id}
-            type="button"
-            onClick={() => setMode(m.id)}
-            aria-pressed={mode === m.id}
-            title={m.description}
-            className={`flex-1 px-2 py-1 text-[11px] font-mono uppercase tracking-wide border-r last:border-r-0 border-[var(--border-color)] ${
-              mode === m.id ? 'bg-accent/20 text-accent' : 'text-text-muted hover:bg-surface-3'
-            }`}
-            data-testid={`copilot-mode-${m.id}`}
-          >
-            {m.label}
-          </button>
-        ))}
+    <div className="group flex flex-col items-start gap-0.5">
+      <div className="font-mono text-[10px] uppercase tracking-widest text-accent">Copilot</div>
+      <div
+        className={`w-full min-w-0 border-l-2 pl-3 ${entry.error ? 'border-bear text-bear' : 'border-[var(--border-color)]'}`}
+        data-testid="copilot-assistant-msg"
+      >
+        {entry.toolCalls && entry.toolCalls.length > 0 && <ToolGroup calls={entry.toolCalls} />}
+        {entry.pendingApprovals && entry.pendingApprovals.length > 0 && (
+          <ApprovalCard entry={entry} onApprove={onApprove} onDeny={onDeny} />
+        )}
+        {entry.error ? (
+          <p className="whitespace-pre-wrap break-words text-[13px]">{entry.content}</p>
+        ) : (
+          <Markdown text={entry.content} />
+        )}
+        {entry.usedMode && (
+          <div className="mt-1 text-[10px] text-warning font-mono" data-testid="copilot-used-mode">
+            ran in {entry.usedMode} mode
+          </div>
+        )}
+        {(entry.model || entry.provider) && entry.model !== 'mock' && (
+          <div className="mt-1 text-[10px] text-text-muted font-mono">
+            {entry.provider && entry.provider !== 'copilot' ? `${entry.provider} · ` : ''}
+            {entry.model}
+          </div>
+        )}
       </div>
-      <p className="mt-1 text-[10px] text-text-muted" data-testid="copilot-mode-desc">{active.description}</p>
+      <div className="flex items-center gap-1.5 pl-3">
+        {!entry.error && <CopyButton text={entry.content} testId="copilot-copy-msg" />}
+        {entry.error && canRetry && (
+          <button
+            type="button"
+            onClick={() => onRetry(entry)}
+            className="rounded border border-bear/50 px-1.5 py-px font-mono text-[10px] text-bear hover:bg-bear/10"
+            data-testid="copilot-retry"
+          >
+            Retry
+          </button>
+        )}
+      </div>
     </div>
   );
 };
@@ -172,10 +139,44 @@ export const CopilotPanel: React.FC = () => {
   const busy = useCopilotSessions((s) => !!s.busy[s.activeId]);
   const [input, setInput] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  /** True while the user is at (or near) the bottom: new messages then scroll into view. */
+  const followRef = useRef(true);
+  const lastSessionRef = useRef(activeId);
+  const [showJump, setShowJump] = useState(false);
 
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [entries, busy, activeId]);
+  const scrollToEnd = useCallback((smooth = false) => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+    followRef.current = true;
+    setShowJump(false);
+  }, []);
+
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < FOLLOW_THRESHOLD_PX;
+    followRef.current = atEnd;
+    setShowJump(!atEnd);
+  }, []);
+
+  // New content scrolls into view only if the user was following; otherwise offer "jump to latest".
+  useLayoutEffect(() => {
+    const switched = lastSessionRef.current !== activeId;
+    lastSessionRef.current = activeId;
+    if (switched || followRef.current) scrollToEnd();
+    else setShowJump(true);
+  }, [entries.length, busy, activeId, scrollToEnd]);
+
+  // Grow the composer with its content, up to about six lines.
+  useLayoutEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, COMPOSER_MAX_PX)}px`;
+    el.style.overflowY = el.scrollHeight > COMPOSER_MAX_PX ? 'auto' : 'hidden';
+  }, [input]);
 
   // Always targets an explicit session: the reply is appended to the session that
   // asked, even if the user switches or starts another chat while it is in flight.
@@ -205,6 +206,7 @@ export const CopilotPanel: React.FC = () => {
     if (!replay) {
       store.append(sessionId, { role: 'user', content: message });
       setInput('');
+      followRef.current = true;
     }
     store.setBusy(sessionId, true);
     try {
@@ -226,6 +228,7 @@ export const CopilotPanel: React.FC = () => {
         role: 'assistant',
         content: typeof err === 'string' ? err : err instanceof Error ? err.message : 'Copilot request failed',
         error: true,
+        prompt: message,
       });
     } finally {
       store.setBusy(sessionId, false);
@@ -253,97 +256,108 @@ export const CopilotPanel: React.FC = () => {
     store.updateEntry(store.activeId, entry.id, { approvalState: 'denied' });
   }, []);
 
+  // Retry drops the error reply and replays the user message it answered.
+  const handleRetry = useCallback((entry: ChatEntry) => {
+    const store = useCopilotSessions.getState();
+    const sessionId = store.activeId;
+    const session = store.sessions.find((s) => s.id === sessionId);
+    if (!session || store.busy[sessionId]) return;
+    const idx = session.entries.findIndex((e) => e.id === entry.id);
+    const prompt = entry.prompt
+      ?? [...session.entries.slice(0, Math.max(idx, 0))].reverse().find((e) => e.role === 'user')?.content;
+    if (!prompt) return;
+    store.removeEntry(sessionId, entry.id);
+    void send(sessionId, prompt, true);
+  }, [send]);
+
+  const lastEntry = entries[entries.length - 1];
+
   return (
-    <div className="flex flex-col h-full" data-testid="copilot-panel">
-      <div ref={scrollRef} className="flex-1 overflow-auto px-3 py-2 space-y-3">
+    <div className="relative flex h-full min-h-0 flex-col" data-testid="copilot-panel">
+      <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-3 py-3" data-testid="copilot-scroll">
         {entries.length === 0 ? (
-          <div className="space-y-2" data-testid="copilot-empty">
-            <p className="text-xs text-text-muted">
-              Ask about positions, quotes, scans — or have it place paper orders, set alerts,
+          <div className="space-y-3" data-testid="copilot-empty">
+            <p className="text-xs leading-relaxed text-text-muted">
+              Ask about positions, quotes, scans, or have it place paper orders, set alerts,
               write strategy files, run backtests, train models, and create automations that
               trade a model's signal on a schedule.
             </p>
-            {SUGGESTIONS.map((s) => (
-              <button
-                key={s}
-                onClick={() => void send(activeId, s, false)}
-                className="block w-full text-left px-2 py-1.5 text-xs bg-surface-2 hover:bg-surface-3 border border-[var(--border-color)] rounded text-text-secondary"
-                data-testid="copilot-suggestion"
-              >
-                {s}
-              </button>
-            ))}
+            <div className="flex flex-wrap gap-1.5">
+              {SUGGESTIONS.map((s) => (
+                <button
+                  key={s}
+                  onClick={() => void send(activeId, s, false)}
+                  className="border border-[var(--border-color)] bg-surface-2 px-2 py-1 text-left text-[11px] text-text-secondary hover:border-accent hover:text-accent"
+                  data-testid="copilot-suggestion"
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
           </div>
         ) : (
           entries.map((entry) => (
-            <div
+            <MessageRow
               key={entry.id}
-              className={entry.role === 'user' ? 'flex justify-end' : 'flex justify-start'}
-              data-testid={entry.role === 'user' ? 'copilot-user-msg' : 'copilot-assistant-msg'}
-            >
-              <div
-                className={`max-w-[85%] rounded px-3 py-2 text-sm whitespace-pre-wrap ${
-                  entry.role === 'user'
-                    ? 'bg-primary-500/20 text-text-primary'
-                    : entry.error
-                      ? 'bg-bear/10 text-bear border border-bear/30'
-                      : 'bg-surface-2 text-text-primary'
-                }`}
-              >
-                {entry.toolCalls && entry.toolCalls.length > 0 && (
-                  <ToolTrace calls={entry.toolCalls} />
-                )}
-                {entry.pendingApprovals && entry.pendingApprovals.length > 0 && (
-                  <ApprovalCard entry={entry} onApprove={handleApprove} onDeny={handleDeny} />
-                )}
-                {entry.content}
-                {entry.usedMode && (
-                  <div className="mt-1 text-[10px] text-warning font-mono" data-testid="copilot-used-mode">
-                    ran in {entry.usedMode} mode
-                  </div>
-                )}
-                {(entry.model || entry.provider) && entry.model !== 'mock' && (
-                  <div className="mt-1 text-[10px] text-text-muted font-mono">
-                    {entry.provider && entry.provider !== 'copilot' ? `${entry.provider} · ` : ''}
-                    {entry.model}
-                  </div>
-                )}
-              </div>
-            </div>
+              entry={entry}
+              canRetry={entry === lastEntry && !busy}
+              onApprove={handleApprove}
+              onDeny={handleDeny}
+              onRetry={handleRetry}
+            />
           ))
         )}
         {busy && (
-          <div className="flex justify-start">
-            <div className="bg-surface-2 rounded px-3 py-2 text-sm text-text-muted" data-testid="copilot-thinking">
-              Working… (may call tools)
-            </div>
+          <div className="font-mono text-xs text-text-muted" data-testid="copilot-thinking">
+            <span className="mr-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
+            Working… (may call tools)
           </div>
         )}
       </div>
 
-      <ModeSwitch />
+      {showJump && (
+        <button
+          type="button"
+          onClick={() => scrollToEnd(true)}
+          className="absolute bottom-[4.5rem] right-4 z-10 border border-accent/60 bg-surface-2 px-2 py-1 font-mono text-[10px] text-accent shadow-lg hover:bg-surface-3"
+          data-testid="copilot-jump-latest"
+        >
+          Jump to latest ↓
+        </button>
+      )}
+
       <form
         onSubmit={(e) => {
           e.preventDefault();
           void send(activeId, input, false);
         }}
-        className="px-3 py-2 flex items-center gap-2"
+        className="flex shrink-0 items-end gap-2 border-t border-[var(--border-color)] bg-surface-1 px-3 py-2"
       >
-        <input
-          type="text"
+        <textarea
+          ref={composerRef}
+          rows={1}
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask — or ask it to build & test a strategy…"
-          className="flex-1 min-w-0 px-3 py-2 text-sm bg-surface-0 border border-[var(--border-color)] rounded focus:border-accent focus:outline-none"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              void send(activeId, input, false);
+            }
+          }}
+          placeholder="Ask, or build and test a strategy…"
+          title="Enter sends. Shift+Enter adds a line."
+          className="min-w-0 flex-1 resize-none border border-[var(--border-color)] bg-surface-0 px-2.5 py-1.5 text-[13px] leading-5 focus:border-accent focus:outline-none"
+          style={{ maxHeight: COMPOSER_MAX_PX }}
           data-testid="copilot-input"
         />
         <button
           type="submit"
           disabled={busy || !input.trim()}
-          className="px-3 py-2 text-xs bg-primary-500 hover:bg-primary-600 text-white rounded disabled:opacity-50"
+          title={busy ? 'Wait for the current reply' : 'Send (Enter)'}
+          className="h-8 shrink-0 border border-accent bg-accent/20 px-3 text-xs font-medium text-accent hover:bg-accent/30 disabled:opacity-40"
           data-testid="copilot-send"
         >
-          Send
+          {busy ? 'Working…' : 'Send'}
         </button>
       </form>
     </div>

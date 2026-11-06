@@ -1,5 +1,7 @@
 import { AdapterManager } from '../settings/AdapterManager';
 import { ChatGptCard } from '../settings/ChatGptCard';
+import { CopilotTile } from '../copilot/CopilotTile';
+import { ActivityPanel } from '../activity/ActivityPanel';
 import { ProviderKeyField } from '../settings/ProviderKeyField';
 import { SymbolField } from '../common/SymbolField';
 import { DataFeedsOverview } from '../settings/DataFeedsOverview';
@@ -64,6 +66,8 @@ const CENTER_TABS: { id: CenterTab; label: string }[] = [
   { id: 'data', label: 'Stored Data' },
   { id: 'automations', label: 'Automations' },
   { id: 'notebook', label: 'Notebook' },
+  { id: 'activity', label: 'Activity' },
+  { id: 'copilot', label: 'Copilot' },
   { id: 'health', label: 'Health' },
 ];
 
@@ -238,17 +242,13 @@ export const Workspace: React.FC = () => {
     }
   }, [commandSymbol, setCommandSymbol]);
 
-  const setCopilotOpen = useWorkspaceStore((s) => s.setCopilotOpen);
-
   useEffect(() => {
     if (!commandTab) return;
-    if (commandTab === 'copilot') {
-      setCopilotOpen(true);
-    } else if ((VALID_TABS as readonly string[]).includes(commandTab)) {
+    if ((VALID_TABS as readonly string[]).includes(commandTab)) {
       selectTab(commandTab as CenterTab);
     }
     setCommandTab(null);
-  }, [commandTab, selectTab, setCommandTab, setCopilotOpen]);
+  }, [commandTab, selectTab, setCommandTab]);
 
   const refreshBrokerConnections = useCallback(async () => {
     try {
@@ -462,6 +462,8 @@ export const Workspace: React.FC = () => {
       case 'notebook': return <NotebookEditor />;
       case 'ml': return <MLWorkbench />;
       case 'health': return <HealthMonitor />;
+      case 'copilot': return <CopilotTile />;
+      case 'activity': return <ActivityPanel />;
       case 'strategy':
         return (
           <React.Suspense fallback={<div className="p-4 text-xs text-text-muted">Loading strategy workspace…</div>}>
@@ -1281,11 +1283,20 @@ export const Workspace: React.FC = () => {
         ))}
         <button
           type="button"
+          onClick={() => setCommandTab('copilot')}
+          title="Open the Copilot as a tile (or focus it if it is already open)"
+          data-testid="copilot-launch"
+          className="ml-auto shrink-0 border border-accent/60 bg-accent/10 px-3 py-1.5 text-xs font-medium text-accent hover:bg-accent/20"
+        >
+          ✦ Copilot
+        </button>
+        <button
+          type="button"
           onClick={() => setViewMode(viewMode === 'tiles' ? 'focus' : 'tiles')}
           aria-pressed={viewMode === 'tiles'}
           title={viewMode === 'tiles' ? 'Switch to single-panel focus view' : 'Switch to tiled multi-panel view'}
           data-testid="view-mode-toggle"
-          className="ml-auto shrink-0 border border-[var(--border-color)] px-3 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-accent"
+          className="shrink-0 border border-[var(--border-color)] px-3 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-accent"
         >
           {viewMode === 'tiles' ? 'Tiles ▦' : 'Focus ▭'}
         </button>
@@ -1360,6 +1371,14 @@ export const Workspace: React.FC = () => {
           ) : centerTab === 'notebook' ? (
             <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
               <NotebookEditor />
+            </div>
+          ) : centerTab === 'copilot' ? (
+            <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
+              <CopilotTile />
+            </div>
+          ) : centerTab === 'activity' ? (
+            <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">
+              <ActivityPanel />
             </div>
           ) : (
             <div className="flex-1 bg-surface-1 rounded-lg border border-[var(--border-color)] overflow-hidden">

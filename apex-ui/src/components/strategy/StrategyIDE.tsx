@@ -15,6 +15,8 @@ import {
 } from '../../lib/tauri';
 import type { StrategyBacktestRequestDto, StrategyBacktestResultDto, StrategyExecutionResultDto, StrategySessionInfoDto } from '../../lib/types';
 import { useBrokerStore } from '../../stores/brokerStore';
+import { touchedKey, useArtifactStore } from '../../stores/artifactStore';
+import { useNavStore } from '../../stores/navStore';
 import { SymbolField } from '../common/SymbolField';
 
 type EditorInstance = editor.IStandaloneCodeEditor;
@@ -128,8 +130,22 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
   onSave,
   metrics,
 }) => {
-  const [files, setFiles] = useState<StrategyFile[]>(initialFiles ?? DEFAULT_FILES);
-  const [activeFileIndex, setActiveFileIndex] = useState(0);
+  const [files, rawSetFiles] = useState<StrategyFile[]>(initialFiles ?? DEFAULT_FILES);
+  const [activeFileIndex, rawSetActiveFileIndex] = useState(0);
+  // The latest files / selection, updated in the same tick as the state. Background refreshes read these
+  // (React may not have re-rendered yet when a refetch lands) so they never merge into a stale list.
+  const filesRef = useRef(files);
+  const activeIndexRef = useRef(activeFileIndex);
+  const setFiles = useCallback((update: StrategyFile[] | ((prev: StrategyFile[]) => StrategyFile[])) => {
+    const next = typeof update === 'function' ? update(filesRef.current) : update;
+    filesRef.current = next;
+    rawSetFiles(next);
+  }, []);
+  const setActiveFileIndex = useCallback((update: number | ((prev: number) => number)) => {
+    const next = typeof update === 'function' ? update(activeIndexRef.current) : update;
+    activeIndexRef.current = next;
+    rawSetActiveFileIndex(next);
+  }, []);
   const [activeSessions, setActiveSessions] = useState<string[]>([]);
   const runningPathRef = useRef<string | null>(null);
   const [runState, setRunState] = useState<RunState>('idle');
@@ -155,6 +171,15 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     return () => clearTimeout(timer);
   }, [liveRunPending]);
   const [output, setOutput] = useState<string[]>([]);
+  /** Last content known to be on disk, per path. A file whose text differs from it has unsaved edits. */
+  const diskRef = useRef<Record<string, string>>({});
+  /** Paths whose on-disk text changed while the user had unsaved edits, mapped to the new disk text. */
+  const [changedOnDisk, setChangedOnDisk] = useState<Record<string, string>>({});
+  const strategyVersion = useArtifactStore((s) => s.versions.strategy);
+  const touched = useArtifactStore((s) => s.copilotTouched);
+  const dismissTouched = useArtifactStore((s) => s.dismissTouched);
+  const navRequest = useNavStore((s) => s.request);
+  const clearNav = useNavStore((s) => s.clear);
   const [saveConfirm, setSaveConfirm] = useState(false);
   const [isLoadingFiles, setIsLoadingFiles] = useState(!initialFiles);
   const [strategyError, setStrategyError] = useState<string | null>(null);
@@ -205,7 +230,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
       next[index] = file;
       return next;
     });
-  }, []);
+  }, [setFiles]);
 
   const currentEditorFile = useCallback(() => {
     if (!activeFile) return null;
@@ -218,6 +243,13 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
 
   const persistFile = useCallback(async (file: StrategyFile, showConfirmation = false) => {
     const saved = await saveStrategyFile(file.path, file.content);
+    diskRef.current[saved.path] = saved.content;
+    setChangedOnDisk((prev) => {
+      if (!(saved.path in prev)) return prev;
+      const next = { ...prev };
+      delete next[saved.path];
+      return next;
+    });
     replaceFileInState(saved);
     onSave?.(saved);
     if (showConfirmation) {
@@ -261,6 +293,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
 
   useEffect(() => {
     if (initialFiles) {
+      diskRef.current = Object.fromEntries(initialFiles.map((f) => [f.path, f.content]));
       setFiles(initialFiles);
       setActiveFileIndex(0);
       setIsLoadingFiles(false);
@@ -276,6 +309,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         if (cancelled) return;
 
         if (loadedFiles.length > 0) {
+          diskRef.current = Object.fromEntries(loadedFiles.map((f) => [f.path, f.content]));
           setFiles(loadedFiles);
           setActiveFileIndex((current) => Math.min(current, loadedFiles.length - 1));
         } else {
@@ -298,7 +332,127 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [initialFiles]);
+  }, [initialFiles, setFiles, setActiveFileIndex]);
+
+  /**
+   * Merge the files now on disk into the open list without disturbing the user:
+   * new files are added, clean files pick up outside changes silently, and a file with unsaved
+   * edits is never overwritten (the banner offers Reload / Keep mine instead). The selected file
+   * is followed by path, so inserting or removing other files never moves the selection.
+   */
+  const reconcileFiles = useCallback(async (): Promise<StrategyFile[] | null> => {
+    let fetched: StrategyFile[];
+    try {
+      fetched = await listStrategyFiles();
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(fetched)) return null;
+    const current = filesRef.current;
+    const activePath = current[activeIndexRef.current]?.path;
+    const disk = diskRef.current;
+    const remote = new Map(fetched.map((f) => [f.path, f]));
+    const merged: StrategyFile[] = [];
+    const conflicts: Record<string, string> = {};
+    let changed = false;
+
+    for (const file of current) {
+      const onDisk = remote.get(file.path);
+      const known = file.path in disk;
+      const base = known ? disk[file.path] : file.content;
+      if (!onDisk) {
+        // Gone from disk. Keep it if it was never saved or has unsaved edits; otherwise drop it.
+        if (!known || file.content !== base) merged.push(file);
+        else { changed = true; delete disk[file.path]; }
+        continue;
+      }
+      remote.delete(file.path);
+      if (onDisk.content === base) { merged.push(file); continue; }
+      disk[file.path] = onDisk.content;
+      if (file.content === base) {
+        merged.push({ ...file, content: onDisk.content });
+        changed = true;
+      } else {
+        merged.push(file);
+        if (file.content !== onDisk.content) conflicts[file.path] = onDisk.content;
+      }
+    }
+    for (const file of remote.values()) {
+      disk[file.path] = file.content;
+      merged.push(file);
+      changed = true;
+    }
+
+    if (changed) {
+      setFiles(merged);
+      const nextIndex = activePath ? merged.findIndex((f) => f.path === activePath) : -1;
+      setActiveFileIndex(nextIndex >= 0 ? nextIndex : Math.min(activeIndexRef.current, Math.max(merged.length - 1, 0)));
+    }
+    setChangedOnDisk((prev) => {
+      // Keep conflicts the user has not resolved yet; add or refresh the new ones.
+      const next: Record<string, string> = {};
+      for (const [path, text] of Object.entries(prev)) {
+        const f = merged.find((x) => x.path === path);
+        if (f && f.content !== text) next[path] = text;
+      }
+      Object.assign(next, conflicts);
+      const same = Object.keys(next).length === Object.keys(prev).length
+        && Object.entries(next).every(([k, v]) => prev[k] === v);
+      return same ? prev : next;
+    });
+    return merged;
+  }, [setFiles, setActiveFileIndex]);
+
+  // Strategy files changed elsewhere (the Copilot, another panel): refetch. No polling.
+  const seenVersionRef = useRef(strategyVersion);
+  useEffect(() => {
+    if (strategyVersion === seenVersionRef.current) return;
+    seenVersionRef.current = strategyVersion;
+    if (initialFiles) return;
+    void reconcileFiles();
+  }, [strategyVersion, initialFiles, reconcileFiles]);
+
+  const openFileAt = useCallback((index: number) => {
+    setActiveFileIndex(index);
+    const path = filesRef.current[index]?.path;
+    if (path) dismissTouched('strategy', path);
+  }, [dismissTouched, setActiveFileIndex]);
+
+  // "Open" from the Copilot or the Activity panel: select that file (adding it if it just appeared).
+  const handledNavRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!navRequest || navRequest.kind !== 'strategy' || isLoadingFiles) return;
+    if (handledNavRef.current === navRequest.nonce) return;
+    handledNavRef.current = navRequest.nonce;
+    const { id, nonce } = navRequest;
+    if (!id) { clearNav(nonce); return; }
+    const select = (list: StrategyFile[]) => {
+      const index = list.findIndex((f) => f.path === id);
+      if (index >= 0) openFileAt(index);
+    };
+    if (files.some((f) => f.path === id)) {
+      select(files);
+      clearNav(nonce);
+    } else {
+      void reconcileFiles().then((list) => {
+        if (list) select(list);
+        clearNav(nonce);
+      });
+    }
+  }, [navRequest, isLoadingFiles, files, clearNav, openFileAt, reconcileFiles]);
+
+  const resolveChange = useCallback((path: string, reload: boolean) => {
+    const text = changedOnDisk[path];
+    if (reload && text !== undefined) {
+      setFiles((prev) => prev.map((f) => (f.path === path ? { ...f, content: text } : f)));
+      diskRef.current[path] = text;
+    }
+    setChangedOnDisk((prev) => {
+      const next = { ...prev };
+      delete next[path];
+      return next;
+    });
+  }, [changedOnDisk, setFiles]);
 
   const handleEditorMount: OnMount = useCallback((editor) => {
     editorRef.current = editor;
@@ -316,7 +470,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         return next;
       });
     },
-    [activeFileIndex],
+    [activeFileIndex, setFiles],
   );
 
   const appendOutput = useCallback((line: string) => {
@@ -416,7 +570,8 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
       const finalName = name.endsWith('.py') ? name : `${name}.py`;
       try {
         const newFile = await createStrategyFile(`strategies/${finalName}`, DEFAULT_TEMPLATE);
-        setFiles((prev) => [...prev, newFile]);
+        diskRef.current[newFile.path] = newFile.content;
+        setFiles((prev) => [...prev.filter((f) => f.path !== newFile.path), newFile]);
         setActiveFileIndex(files.length);
         setNewFileName('');
         setShowNewFileInput(false);
@@ -427,7 +582,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
     } else {
       setShowNewFileInput(true);
     }
-  }, [files.length, showNewFileInput, newFileName]);
+  }, [files.length, showNewFileInput, newFileName, setFiles, setActiveFileIndex]);
 
   // Auto-scroll output
   useEffect(() => {
@@ -540,6 +695,35 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
         <div className="px-3 py-1 text-xs text-bull bg-bull/10" data-testid="save-confirmation">File saved</div>
       )}
 
+      {activeFile && changedOnDisk[activeFile.path] !== undefined && (
+        <div
+          className="flex items-center gap-3 border-b border-warning/40 bg-warning/10 px-3 py-1 text-xs text-warning"
+          data-testid="copilot-changed-banner"
+        >
+          <span className="min-w-0 flex-1 truncate">
+            Changed by Copilot: {activeFile.name} was updated on disk, and you have unsaved edits.
+          </span>
+          <button
+            type="button"
+            onClick={() => resolveChange(activeFile.path, true)}
+            className="shrink-0 border border-warning/60 px-2 py-px font-mono text-[10px] hover:bg-warning/20"
+            title="Discard your edits and load the new version"
+            data-testid="copilot-changed-reload"
+          >
+            Reload
+          </button>
+          <button
+            type="button"
+            onClick={() => resolveChange(activeFile.path, false)}
+            className="shrink-0 border border-[var(--border-color)] px-2 py-px font-mono text-[10px] text-text-secondary hover:bg-surface-3"
+            title="Keep your edits; saving will overwrite the new version"
+            data-testid="copilot-changed-keep"
+          >
+            Keep mine
+          </button>
+        </div>
+      )}
+
 
 
       <div className="flex flex-1 min-h-0">
@@ -587,7 +771,7 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
               <button
                 key={file.path}
                 type="button"
-                onClick={() => setActiveFileIndex(idx)}
+                onClick={() => openFileAt(idx)}
                 data-testid={`file-${file.name}`}
                 aria-current={idx === activeFileIndex ? 'true' : undefined}
                 className={`w-full text-left px-3 py-2 text-xs font-mono rounded truncate transition-colors strategy-file-item ${
@@ -596,7 +780,18 @@ const StrategyIDEInner: React.FC<StrategyIDEProps> = ({
                     : 'text-text-secondary hover:bg-surface-2'
                 }`}
               >
-                {file.name}{activeSessions.includes(file.path) ? ' · running' : ''}
+                <span className="flex items-center gap-1.5">
+                  <span className="min-w-0 truncate">{file.name}{activeSessions.includes(file.path) ? ' · running' : ''}</span>
+                  {touched[touchedKey('strategy', file.path)] !== undefined && (
+                    <span
+                      className="shrink-0 border border-accent/60 bg-accent/10 px-1 text-[9px] font-semibold uppercase tracking-wider text-accent"
+                      title="Created or changed by the Copilot"
+                      data-testid={`copilot-badge-${file.name}`}
+                    >
+                      Copilot
+                    </span>
+                  )}
+                </span>
               </button>
             ))}
           </div>

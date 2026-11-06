@@ -158,6 +158,7 @@ interface SessionsState {
   /** Appends to the given session, never "the active one", so late replies land where they were asked. */
   append: (sessionId: string, entry: Omit<ChatEntry, 'id'>) => void;
   updateEntry: (sessionId: string, entryId: number, patch: Partial<ChatEntry>) => void;
+  removeEntry: (sessionId: string, entryId: number) => void;
   setBusy: (sessionId: string, busy: boolean) => void;
 }
 
@@ -223,6 +224,14 @@ export const useCopilotSessions = create<SessionsState>((set, get) => ({
     set((st) => ({
       sessions: st.sessions.map((s) =>
         s.id === sessionId ? { ...s, entries: s.entries.map((e) => (e.id === entryId ? { ...e, ...patch } : e)) } : s,
+      ),
+    }));
+  },
+
+  removeEntry: (sessionId, entryId) => {
+    set((st) => ({
+      sessions: st.sessions.map((s) =>
+        s.id === sessionId ? { ...s, entries: s.entries.filter((e) => e.id !== entryId) } : s,
       ),
     }));
   },

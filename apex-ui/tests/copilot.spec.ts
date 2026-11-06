@@ -21,7 +21,7 @@ async function chatCalls(page: Page) {
 async function openCopilot(page: Page) {
   await page.goto('/');
   await page.waitForLoadState('networkidle');
-  await page.getByTestId('copilot-dock-toggle').click();
+  await page.getByTestId('copilot-launch').click();
   await expect(page.getByTestId('copilot-panel')).toBeVisible();
 }
 
@@ -62,7 +62,7 @@ test.describe('Copilot modes', () => {
 
     await page.reload();
     await page.waitForLoadState('networkidle');
-    await page.getByTestId('copilot-dock-toggle').click();
+    await page.getByTestId('copilot-launch').click();
     await expect(page.getByTestId('copilot-mode-ask')).toHaveAttribute('aria-pressed', 'true');
     await expect(page.getByTestId('copilot-mode-agent')).toHaveAttribute('aria-pressed', 'false');
 
@@ -161,7 +161,7 @@ test.describe('Copilot sessions', () => {
 
     await page.reload();
     await page.waitForLoadState('networkidle');
-    await page.getByTestId('copilot-dock-toggle').click();
+    await page.getByTestId('copilot-launch').click();
     await expect(page.getByTestId('copilot-user-msg')).toHaveText(['and me']);
     await openSessions(page);
     await expect(page.getByTestId('copilot-session-item')).toHaveCount(2);
@@ -186,7 +186,7 @@ test.describe('Copilot sessions', () => {
 
     await page.reload();
     await page.waitForLoadState('networkidle');
-    await page.getByTestId('copilot-dock-toggle').click();
+    await page.getByTestId('copilot-launch').click();
     await expect(page.getByTestId('copilot-session-title')).toHaveText('Renamed chat');
   });
 
@@ -245,7 +245,7 @@ test.describe('Copilot sessions', () => {
     });
     await page.reload();
     await page.waitForLoadState('networkidle');
-    await page.getByTestId('copilot-dock-toggle').click();
+    await page.getByTestId('copilot-launch').click();
     await expect(page.getByTestId('copilot-user-msg')).toHaveText(['legacy question about RELIANCE']);
     await expect(page.getByTestId('copilot-assistant-msg')).toHaveText(['legacy answer']);
     await openSessions(page);
@@ -256,7 +256,7 @@ test.describe('Copilot sessions', () => {
     // A second reload must not migrate again or duplicate.
     await page.reload();
     await page.waitForLoadState('networkidle');
-    await page.getByTestId('copilot-dock-toggle').click();
+    await page.getByTestId('copilot-launch').click();
     await openSessions(page);
     await expect(page.getByTestId('copilot-session-item')).toHaveCount(1);
   });
@@ -301,13 +301,11 @@ test.describe('Copilot sessions', () => {
     await expect(page.getByTestId('copilot-assistant-msg')).not.toContainText('SLOWREPLY');
   });
 
-  test('dock header controls still minimize and close', async ({ page }) => {
+  test('the history list opens and closes from the header', async ({ page }) => {
     await openCopilot(page);
     await page.getByTestId('copilot-sessions-toggle').click();
-    await page.getByTestId('copilot-dock-minimize').click();
-    await expect(page.getByTestId('copilot-dock-toggle')).toBeVisible();
-    await page.getByTestId('copilot-dock-toggle').click();
-    await page.getByTestId('copilot-dock-close').click();
-    await expect(page.getByTestId('copilot-dock-toggle')).toBeVisible();
+    await expect(page.getByTestId('copilot-sessions')).toBeVisible();
+    await page.getByTestId('copilot-sessions-toggle').click();
+    await expect(page.getByTestId('copilot-sessions')).toHaveCount(0);
   });
 });

@@ -1,4 +1,5 @@
-import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, StrategySessionInfoDto, ChatGptStatusDto, ChatGptModelDto, SymbolFeedDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto } from './types';
+import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, StrategySessionInfoDto, ChatGptStatusDto, ChatGptModelDto, SymbolFeedDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto, ActivityDto, BuildDatasetRequestDto, DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, ModelDetailDto, ModelSignalHistoryDto } from './types';
+import { handleMlMock, recordMockActivity } from './mockMl';
 
 const IS_TAURI = typeof window !== 'undefined' && '__TAURI__' in window;
 
@@ -23,7 +24,6 @@ const mockApprovalPaused = new Set<string>();
 
 const mockPositions: PositionDto[] = [];
 const mockOrders: OrderDto[] = [];
-let mockModels: MLModelDto[] = [];
 let mockAlertRules: AlertRuleDto[] = [];
 let mockStrategyFiles: StrategyFileDto[] = [
   {
@@ -53,7 +53,6 @@ let mockNotebooks: NotebookDocumentDto[] = [
     ],
   },
 ];
-let mockTrainingCounter = 0;
 let mockAutomations: AutomationDto[] = [];
 const mockFeedPrefs = new Map<string, string>();
 let mockChatGpt: ChatGptStatusDto = { state: 'signed_out', email: null, plan_usage: false, message: null, use_for_copilot: false, model: null };
@@ -365,6 +364,8 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   // Web-mode test hook: specs can opt in by defining `window.__ipcLog = []`.
   const ipcLog = (globalThis as { __ipcLog?: unknown }).__ipcLog;
   if (Array.isArray(ipcLog)) ipcLog.push({ cmd, args });
+  const mlResult = handleMlMock(cmd, args, () => mockAutomations);
+  if (mlResult !== undefined) return mlResult as any;
   if (cmd === 'list_strategy_sessions' || cmd === 'list_strategy_session_details') return [] as any;
   if (cmd === 'list_automations') return [...mockAutomations] as any;
   if (cmd === 'create_automation') {
@@ -375,16 +376,21 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
       broker_id: req.broker_id ?? 'paper', enabled: true, created_at: new Date().toISOString(), last_run_at: null, last_result: null, orders_today: 0,
     };
     mockAutomations.push(created);
+    recordMockActivity('user', 'automation.create', 'automation', created.id, `Created automation ${created.name}`);
     return created as any;
   }
   if (cmd === 'set_automation_enabled') {
     const rule = mockAutomations.find((a) => a.id === args?.id);
-    if (rule) rule.enabled = Boolean(args?.enabled);
+    if (rule) {
+      rule.enabled = Boolean(args?.enabled);
+      recordMockActivity('user', 'automation.toggle', 'automation', rule.id, `${rule.enabled ? 'Enabled' : 'Paused'} automation ${rule.name}`);
+    }
     return Boolean(rule) as any;
   }
   if (cmd === 'delete_automation') {
     const before = mockAutomations.length;
     mockAutomations = mockAutomations.filter((a) => a.id !== args?.id);
+    if (mockAutomations.length < before) recordMockActivity('user', 'automation.delete', 'automation', String(args?.id), `Deleted automation ${String(args?.id)}`);
     return (mockAutomations.length < before) as any;
   }
   if (cmd === 'get_symbol_feeds') {
@@ -652,6 +658,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     const content = (args?.content as string | undefined) ?? DEFAULT_STRATEGY_TEMPLATE;
     const created: StrategyFileDto = { name, path, content };
     mockStrategyFiles = [...mockStrategyFiles.filter((file) => file.path !== path), created];
+    recordMockActivity('user', 'strategy.create', 'strategy', path, `Created ${name}`);
     return created as any;
   }
   if (cmd === 'save_strategy_file') {
@@ -665,12 +672,14 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     } else {
       mockStrategyFiles = [...mockStrategyFiles, saved];
     }
+    recordMockActivity('user', 'strategy.save', 'strategy', path, `Saved ${name}`);
     return saved as any;
   }
   if (cmd === 'delete_strategy_file') {
     const path = args?.path as string;
     const before = mockStrategyFiles.length;
     mockStrategyFiles = mockStrategyFiles.filter((file) => file.path !== path);
+    if (before !== mockStrategyFiles.length) recordMockActivity('user', 'strategy.delete', 'strategy', path, `Deleted ${path}`);
     return (before !== mockStrategyFiles.length) as any;
   }
   if (cmd === 'run_strategy_file') {
@@ -708,29 +717,6 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
     return (mockAlertRules.length < before) as any;
   }
   if (cmd === 'get_alert_rules') return [...mockAlertRules] as any;
-  if (cmd === 'list_ml_models') return [...mockModels] as any;
-  if (cmd === 'train_ml_model') {
-    const req = args?.request as MLTrainingRequestDto;
-    mockTrainingCounter++;
-    const modelId = `model_${mockTrainingCounter}`;
-    const model: MLModelDto = {
-      model_id: modelId,
-      algorithm: req?.algorithm ?? 'random_forest',
-      status: 'completed',
-      metrics: { accuracy: 0.72, f1: 0.68, precision: 0.74, recall: 0.65 },
-      feature_names: req?.feature_columns ?? ['sma_20', 'rsi_14', 'volume_lag_1'],
-      created_at: new Date().toISOString(),
-      data_path: req?.data_path ?? 'data/sample.csv',
-      target_column: req?.target_column ?? 'signal',
-    };
-    mockModels.push(model);
-    return { model_id: modelId, metrics: model.metrics, feature_names: model.feature_names, status: 'completed' } as any;
-  }
-  if (cmd === 'delete_ml_model') {
-    const id = args?.modelId as string;
-    mockModels = mockModels.filter(m => m.model_id !== id);
-    return true as any;
-  }
   if (cmd === 'list_broker_connections') {
     return [...mockBrokerConnections] as any;
   }
@@ -857,12 +843,31 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
         pending_approvals: [{ key: `mock-${turnId}`, name: 'place_order', detail: '[LIVE zerodha] BUY 1 RELIANCE.NS' }],
       } as CopilotReplyDto as any;
     }
+    // "MAKESTRATEGY" acts like the real tool: the file is created through the same path as
+    // window.__apexMock.createStrategyAsCopilot, so the IDE and activity log pick it up.
+    const toolCalls: CopilotReplyDto['tool_calls'] = [];
+    if (message.includes('MAKESTRATEGY')) {
+      const hooks = (window as unknown as { __apexMock?: { createStrategyAsCopilot?: (name?: string) => string } }).__apexMock;
+      const path = hooks?.createStrategyAsCopilot?.('copilot_strategy.py') ?? 'strategies/copilot_strategy.py';
+      toolCalls.push({ name: 'save_strategy', detail: path, ok: true, artifact: { kind: 'strategy', id: path } });
+    }
+    // "MARKDOWN" returns formatted text, "RAWHTML" returns text containing HTML, "FAILREPLY" fails once per message text.
+    let replyText = `[mock] mode=${mode}: ${message}`;
+    if (message.includes('MARKDOWN')) {
+      replyText = '# Plan\n\nUse **bold**, *italic* and `inline` code.\n\n- first item\n- second item\n\n1. one\n2. two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```python\nprint("hi")\n```\n\n[docs](https://example.com/docs) and [bad](javascript:alert(1))';
+    } else if (message.includes('RAWHTML')) {
+      replyText = 'Before <img src=x onerror="window.__xss=1"> <b id="rawhtml-b">bold?</b> <script>window.__xss=1</script> after';
+    }
+    if (message.includes('FAILREPLY') && !mockApprovalPaused.has(`fail-${message}`)) {
+      mockApprovalPaused.add(`fail-${message}`);
+      throw new Error('mock request failed');
+    }
     return {
-      reply: `[mock] mode=${mode}: ${message}`,
+      reply: replyText,
       model: 'mock',
       provider: 'mock',
       mode,
-      tool_calls: [],
+      tool_calls: toolCalls,
       pending_approvals: [],
     } as CopilotReplyDto as any;
   }
@@ -973,6 +978,21 @@ export async function getAlertRules(): Promise<AlertRuleDto[]> { return invoke<A
 
 // ML Workbench
 export async function listMLModels(): Promise<MLModelDto[]> { return invoke<MLModelDto[]>('list_ml_models'); }
+export async function getMlModel(modelId: string): Promise<ModelDetailDto> { return invoke<ModelDetailDto>('get_ml_model', { modelId }); }
+export async function updateMlModel(modelId: string, patch: { displayName?: string; notes?: string; tags?: string[] }): Promise<ModelDetailDto> {
+  return invoke<ModelDetailDto>('update_ml_model', { modelId, ...patch });
+}
+export async function modelSignalHistory(modelId: string, symbol: string, bars = 60): Promise<ModelSignalHistoryDto> {
+  return invoke<ModelSignalHistoryDto>('model_signal_history', { modelId, symbol, bars });
+}
+export async function listFeatureCatalog(): Promise<FeatureDefDto[]> { return invoke<FeatureDefDto[]>('list_feature_catalog'); }
+export async function buildDataset(request: BuildDatasetRequestDto): Promise<DatasetInfoDto> { return invoke<DatasetInfoDto>('build_dataset', { request }); }
+export async function listDatasets(): Promise<DatasetInfoDto[]> { return invoke<DatasetInfoDto[]>('list_datasets'); }
+export async function previewDataset(name: string): Promise<DatasetPreviewDto> { return invoke<DatasetPreviewDto>('preview_dataset', { name }); }
+export async function deleteDataset(name: string): Promise<boolean> { return invoke<boolean>('delete_dataset', { name }); }
+export async function listActivity(filter: { limit?: number; kind?: string; targetId?: string } = {}): Promise<ActivityDto[]> {
+  return invoke<ActivityDto[]>('list_activity', filter);
+}
 export async function trainMLModel(r: MLTrainingRequestDto): Promise<MLTrainingResultDto> { return invoke<MLTrainingResultDto>('train_ml_model', { request: r }); }
 export async function deleteMLModel(id: string): Promise<boolean> { return invoke<boolean>('delete_ml_model', { modelId: id }); }
 export async function predictModelSignal(modelId: string, symbol: string): Promise<ModelSignalDto> { return invoke<ModelSignalDto>('predict_model_signal', { modelId, symbol }); }
@@ -1102,4 +1122,34 @@ export async function openExternalUrl(url: string): Promise<void> {
 export async function getSymbolFeeds(symbols: string[]): Promise<SymbolFeedDto[]> { return invoke<SymbolFeedDto[]>('get_symbol_feeds', { symbols }); }
 export async function setSymbolProvider(symbol: string, adapterId: string | null): Promise<void> {
   return invoke<void>('set_symbol_provider', { symbol, adapterId });
+}
+
+// Web-mode test hook: lets a spec act "as the Copilot" and watch the open panels refresh.
+if (typeof window !== 'undefined') {
+  const hooks = ((window as unknown as { __apexMock?: Record<string, unknown> }).__apexMock ??= {});
+  hooks.createStrategyAsCopilot = (name = 'copilot_strategy.py') => {
+    const path = `strategies/${name}`;
+    mockStrategyFiles = [...mockStrategyFiles.filter((f) => f.path !== path), { name, path, content: DEFAULT_STRATEGY_TEMPLATE }];
+    recordMockActivity('copilot', 'strategy.save', 'strategy', path, `Saved ${name}`);
+    return path;
+  };
+  hooks.createAutomationAsCopilot = (name = 'Copilot automation', modelId = '') => {
+    const id = `auto_${mockAutomations.length + 1}`;
+    mockAutomations.push({
+      id, name, kind: 'model_signal', symbol: 'RELIANCE.NS', model_id: modelId, interval_secs: 300, quantity: 1, threshold: 0.5,
+      broker_id: 'paper', enabled: true, created_at: new Date().toISOString(), last_run_at: null, last_result: null, orders_today: 0,
+    });
+    recordMockActivity('copilot', 'automation.create', 'automation', id, `Created automation ${name}`);
+    return id;
+  };
+  // Act as the Copilot rewriting a strategy file with specific content (the IDE's reload / conflict paths).
+  hooks.writeStrategyAsCopilot = (name: string, content: string) => {
+    const path = `strategies/${name}`;
+    const next = { name, path, content };
+    mockStrategyFiles = mockStrategyFiles.some((f) => f.path === path)
+      ? mockStrategyFiles.map((f) => (f.path === path ? next : f))
+      : [...mockStrategyFiles, next];
+    recordMockActivity('copilot', 'strategy.save', 'strategy', path, `Saved ${name}`);
+    return path;
+  };
 }

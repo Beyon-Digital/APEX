@@ -44,8 +44,8 @@ interface Suggestion {
 /** Delay in ms before deactivating command bar on blur, to allow click events */
 const BLUR_DELAY_MS = 200;
 
-/** Map from command keywords to tab identifiers ('copilot' opens the dock, not a tab) */
-const PANEL_MAP: Record<string, CenterTab | 'copilot'> = {
+/** Map from command keywords to tab identifiers (COPILOT / AI add and highlight the Copilot tile) */
+const PANEL_MAP: Record<string, CenterTab> = {
   CHART: 'chart',
   STRATEGY: 'strategy',
   ML: 'ml',

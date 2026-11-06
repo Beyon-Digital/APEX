@@ -1,5 +1,5 @@
 import { SymbolField } from '../common/SymbolField';
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   createAutomation,
   deleteAutomation,
@@ -8,6 +8,8 @@ import {
   setAutomationEnabled,
 } from '../../lib/tauri';
 import type { AutomationDto, MLModelDto } from '../../lib/types';
+import { touchedKey, useArtifactStore } from '../../stores/artifactStore';
+import { openItem, useNavStore } from '../../stores/navStore';
 
 const POLL_MS = 5000;
 
@@ -35,6 +37,15 @@ export const AutomationsPanel: React.FC = () => {
   const [models, setModels] = useState<MLModelDto[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [highlightId, setHighlightId] = useState<string | null>(null);
+  const automationVersion = useArtifactStore((s) => s.versions.automation);
+  const modelVersion = useArtifactStore((s) => s.versions.model);
+  const touched = useArtifactStore((s) => s.copilotTouched);
+  const dismissTouched = useArtifactStore((s) => s.dismissTouched);
+  const navRequest = useNavStore((s) => s.request);
+  const clearNav = useNavStore((s) => s.clear);
+  const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const handledNavRef = useRef<number | null>(null);
 
   // form state
   const [name, setName] = useState('');
@@ -45,26 +56,61 @@ export const AutomationsPanel: React.FC = () => {
   const [threshold, setThreshold] = useState('0.5');
   const [brokerId, setBrokerId] = useState('paper');
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<AutomationDto[] | null> => {
     try {
       const [r, m] = await Promise.all([listAutomations(), listMLModels()]);
       setRules(r);
       setModels(m.filter((x) => x.status === 'completed'));
       setError(null);
+      return r;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      return null;
     }
   }, []);
 
+  // Rules also change by themselves (last run, orders today), hence the slow poll; creations,
+  // deletions and new models arrive through the artifact counters below.
   useEffect(() => {
-    void refresh();
     const id = setInterval(() => void refresh(), POLL_MS);
     return () => clearInterval(id);
   }, [refresh]);
 
+  // Initial load, and again whenever an automation or a model is created, changed or deleted.
   useEffect(() => {
-    if (!modelId && models.length > 0) setModelId(models[0].model_id);
+    void refresh();
+  }, [refresh, automationVersion, modelVersion]);
+
+  // Keep the dropdown on a model that exists: pick the first when empty, move off a deleted one.
+  useEffect(() => {
+    if (models.length === 0) {
+      if (modelId) setModelId('');
+    } else if (!models.some((m) => m.model_id === modelId)) {
+      setModelId(models[0].model_id);
+    }
   }, [models, modelId]);
+
+  // "Open" from the Copilot / Activity: scroll to the rule and highlight it briefly.
+  useEffect(() => {
+    if (!navRequest || navRequest.kind !== 'automation') return;
+    if (handledNavRef.current === navRequest.nonce) return;
+    handledNavRef.current = navRequest.nonce;
+    const { id, nonce } = navRequest;
+    if (!id) { clearNav(nonce); return; }
+    void refresh().then((list) => {
+      clearNav(nonce);
+      if (!list?.some((r) => r.id === id)) return;
+      setHighlightId(id);
+      dismissTouched('automation', id);
+    });
+  }, [navRequest, clearNav, refresh, dismissTouched]);
+
+  useEffect(() => {
+    if (!highlightId) return;
+    rowRefs.current[highlightId]?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    const timer = setTimeout(() => setHighlightId(null), 2500);
+    return () => clearTimeout(timer);
+  }, [highlightId]);
 
   const submit = useCallback(
     async (e: React.FormEvent) => {
@@ -167,13 +213,33 @@ export const AutomationsPanel: React.FC = () => {
           </div>
         ) : (
           rules.map((r) => (
-            <div key={r.id} className="rounded border border-[var(--border-color)] bg-surface-1 px-3 py-2" data-testid="automation-row">
+            <div
+              key={r.id}
+              ref={(el) => { rowRefs.current[r.id] = el; }}
+              className={`rounded border bg-surface-1 px-3 py-2 transition-colors ${
+                highlightId === r.id ? 'border-accent shadow-[0_0_0_1px_var(--color-accent)]' : 'border-[var(--border-color)]'
+              }`}
+              data-testid="automation-row"
+              data-rule-id={r.id}
+              data-highlighted={highlightId === r.id ? 'true' : 'false'}
+            >
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <span className={`inline-block h-1.5 w-1.5 rounded-full ${r.enabled ? 'bg-bull' : 'bg-text-muted'}`} />
                     <span className="text-xs font-medium text-text-primary truncate">{r.name}</span>
                     <span className="text-[10px] font-mono text-text-muted uppercase">{r.kind}</span>
+                    {touched[touchedKey('automation', r.id)] !== undefined && (
+                      <button
+                        type="button"
+                        onClick={() => dismissTouched('automation', r.id)}
+                        title="Created by the Copilot. Click to dismiss."
+                        className="shrink-0 border border-accent/60 bg-accent/10 px-1 text-[9px] font-semibold uppercase tracking-wider text-accent"
+                        data-testid="automation-copilot-badge"
+                      >
+                        Created by Copilot
+                      </button>
+                    )}
                   </div>
                   <div className="mt-0.5 text-[11px] font-mono text-text-secondary">
                     {r.model_id} on {r.symbol} · every {fmtInterval(r.interval_secs)} · qty {r.quantity} @ {r.broker_id} · p≥{r.threshold}
@@ -184,6 +250,16 @@ export const AutomationsPanel: React.FC = () => {
                   </div>
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
+                  {r.model_id && (
+                    <button
+                      onClick={() => openItem('model', r.model_id)}
+                      className="px-2 py-0.5 text-[10px] font-mono rounded border border-[var(--border-color)] text-text-secondary hover:border-accent hover:text-accent"
+                      title={`Open ${r.model_id} in the ML Workbench`}
+                      data-testid="automation-open-model"
+                    >
+                      Open model
+                    </button>
+                  )}
                   <button
                     onClick={() => void toggle(r.id, r.enabled)}
                     className={`px-2 py-0.5 text-[10px] font-mono rounded border ${

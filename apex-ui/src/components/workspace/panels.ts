@@ -31,6 +31,8 @@ export const PANEL_DEFS: PanelDef[] = [
   { id: 'automations', title: 'Automations', w: 6, h: 12 },
   { id: 'notebook', title: 'Notebook', w: 8, h: 14 },
   { id: 'health', title: 'Health', w: 6, h: 12 },
+  { id: 'copilot', title: 'Copilot', w: 4, h: 20 },
+  { id: 'activity', title: 'Activity', w: 5, h: 12 },
 ];
 
 export const PANEL_TITLES: Record<string, string> = Object.fromEntries(PANEL_DEFS.map((p) => [p.id, p.title]));
@@ -68,6 +70,14 @@ export const PRESETS: Record<string, { label: string; tiles: TileItem[] }> = {
       tile('news', 0, 12, 4, 12),
       tile('scanner', 4, 12, 4, 12),
       tile('watchlist', 8, 12, 4, 12),
+    ],
+  },
+  build: {
+    label: 'Build',
+    tiles: [
+      tile('chart', 0, 0, 8, 12),
+      tile('strategy', 0, 12, 8, 12),
+      tile('copilot', 8, 0, 4, 24),
     ],
   },
   monitor: {
