@@ -1,4 +1,4 @@
-import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, StrategySessionInfoDto, ChatGptStatusDto, ChatGptModelDto, SymbolFeedDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto, ActivityDto, BuildDatasetRequestDto, DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, ModelDetailDto, ModelSignalHistoryDto, ExpressionCheckDto, SymbolDataDto, AlgorithmDto, EstimatorFileDto } from './types';
+import type { QuoteDto, OrderDto, PositionDto, NewOrderRequestDto, RiskStatusDto, MLModelDto, MLTrainingRequestDto, MLTrainingResultDto, SystemHealthDto, AdapterHealthDto, AlertRuleDto, StrategyFileDto, StrategyExecutionResultDto, StrategyBacktestRequestDto, StrategyBacktestResultDto, AccountBalanceDto, BrokerConnectionDto, AppSettingsDto, AppSettingsUpdateDto, NotebookCellExecutionDto, NotebookDocumentDto, NotebookRunRequestDto, NotebookSummaryDto, OHLCVDto, NewsItemDto, NewsFeedDto, OrderBookDto, GraphDto, ScanOutputDto, ScanRequestDto, CopilotMessageDto, CopilotReplyDto, IndicatorResultDto, QuantStatsDto, RegressionDto, ModelSignalDto, AutomationDto, CreateAutomationDto, StrategySessionInfoDto, ChatGptStatusDto, ChatGptModelDto, SymbolFeedDto, VaultStatusDto, AdapterSchemaDto, AdapterConfigDto, SaveAdapterConfigRequest, AdapterTestResultDto, EnvImportResultDto, LiveStatusDto, OrderPreviewDto, KillSwitchResultDto, SymbolSearchResultDto, ActivityDto, BuildDatasetRequestDto, DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, ModelDetailDto, ModelSignalHistoryDto, ExpressionCheckDto, SymbolDataDto, AlgorithmDto, EstimatorFileDto, RecipeDto, RecipeCheckDto, BuildingBlocksDto } from './types';
 import { handleMlMock, recordMockActivity } from './mockMl';
 
 const IS_TAURI = typeof window !== 'undefined' && '__TAURI__' in window;
@@ -1037,6 +1037,13 @@ export async function listAlgorithms(): Promise<AlgorithmDto[]> { return invoke<
 export async function listEstimatorFiles(): Promise<EstimatorFileDto[]> { return invoke<EstimatorFileDto[]>('list_estimator_files'); }
 export async function saveEstimatorFile(name: string, content: string): Promise<EstimatorFileDto> { return invoke<EstimatorFileDto>('save_estimator_file', { name, content }); }
 export async function deleteEstimatorFile(name: string): Promise<boolean> { return invoke<boolean>('delete_estimator_file', { name }); }
+
+// Algorithm recipes
+export async function listRecipes(): Promise<RecipeDto[]> { return invoke<RecipeDto[]>('list_recipes'); }
+export async function saveRecipe(recipe: RecipeDto): Promise<RecipeDto> { return invoke<RecipeDto>('save_recipe', { recipe }); }
+export async function deleteRecipe(name: string): Promise<boolean> { return invoke<boolean>('delete_recipe', { name }); }
+export async function validateRecipe(recipe: RecipeDto): Promise<RecipeCheckDto> { return invoke<RecipeCheckDto>('validate_recipe', { recipe }); }
+export async function recipeBuildingBlocks(): Promise<BuildingBlocksDto> { return invoke<BuildingBlocksDto>('recipe_building_blocks'); }
 /** Starter source for a custom estimator file (the backend owns the template text). */
 export async function estimatorTemplate(): Promise<string> {
   const r = await invoke<unknown>('estimator_template');

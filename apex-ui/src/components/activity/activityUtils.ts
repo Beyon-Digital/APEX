@@ -20,6 +20,8 @@ const ACTION_LABEL: Record<string, string> = {
   'automation.short': 'Changed automation shorting',
   'dataset.build': 'Built dataset',
   'dataset.delete': 'Deleted dataset',
+  'recipe.save': 'Saved algorithm recipe',
+  'recipe.delete': 'Deleted algorithm recipe',
 };
 
 export const actionLabel = (action: string): string => ACTION_LABEL[action] ?? action.replace(/[._]/g, ' ');

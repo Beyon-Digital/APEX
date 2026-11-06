@@ -7,14 +7,22 @@ import {
   applyPreset, exportPresetsJson, loadPresets, nameProblem, newPresetId, parsePresetImport, persistPresets, snapshotPreset, uniqueName,
   type TrainingPreset,
 } from '../components/ml/trainingPresets';
+import { editSnapshot, type EditRecipe } from '../components/ml/recipeModel';
 import {
-  deleteEstimatorFile, getMlModel, listAlgorithms, listDatasets, listEstimatorFiles, listFeatureCatalog, listMLModels, saveEstimatorFile,
-  trainMLModel,
+  deleteEstimatorFile, deleteRecipe, getMlModel, listAlgorithms, listDatasets, listEstimatorFiles, listFeatureCatalog, listMLModels, listRecipes,
+  recipeBuildingBlocks, saveEstimatorFile, trainMLModel,
 } from '../lib/tauri';
 import type {
-  AlgorithmDto, DatasetInfoDto, EstimatorFileDto, FeatureDefDto, MLModelDto, MLTrainingRequestDto, ModelDetailDto, TradeMode,
-  TradingSummaryDto,
+  AlgorithmDto, BuildingBlocksDto, DatasetInfoDto, EstimatorFileDto, FeatureDefDto, MLModelDto, MLTrainingRequestDto, ModelDetailDto,
+  RecipeDto, TradeMode, TradingSummaryDto,
 } from '../lib/types';
+
+/** The algorithm id of every saved recipe in the training request. */
+export const RECIPE_ALGORITHM_ID = 'recipe';
+/** Compare-queue entries for saved recipes look like "recipe:<name>". */
+export const RECIPE_QUEUE_PREFIX = 'recipe:';
+export const recipeQueueId = (name: string) => `${RECIPE_QUEUE_PREFIX}${name}`;
+export const isRecipeQueueId = (id: string) => id.startsWith(RECIPE_QUEUE_PREFIX);
 
 /* ---------- Training settings (remembered between sessions) ---------- */
 
@@ -46,6 +54,8 @@ export interface TrainSettings {
   randomState: string;
   /** Custom estimator file used when the algorithm is "custom". */
   estimatorFile: string;
+  /** Name of the saved recipe used when the algorithm is "recipe". */
+  recipe: string;
 }
 
 export const MAX_SPLITS = 20;
@@ -71,6 +81,7 @@ export const DEFAULT_SETTINGS: TrainSettings = {
   holdoutPct: '0',
   randomState: '',
   estimatorFile: '',
+  recipe: '',
 };
 
 const SETTINGS_KEY = 'apex-ml-train-settings';
@@ -128,12 +139,31 @@ export interface TrainContext {
   algorithms: AlgorithmDto[];
   /** Saved estimator file names; `undefined` while not loaded (the existence check is skipped). */
   estimatorNames?: string[];
+  /** Saved recipe names; `undefined` while not loaded (the existence check is skipped). */
+  recipeNames?: string[];
 }
 
 const DEFAULT_CONTEXT: TrainContext = { algorithms: BUILTIN_ALGORITHMS };
 
 function isBlank(text: string) {
   return text.trim() === '';
+}
+
+/**
+ * The recipe name when `algorithm` stands for a saved recipe ("recipe" means the one selected in the
+ * form, "recipe:<name>" a compare-queue entry), `''` when none is chosen, or `null` for a normal algorithm.
+ */
+export function recipeNameFor(settings: Pick<TrainSettings, 'recipe'>, algorithm: string): string | null {
+  if (algorithm === RECIPE_ALGORITHM_ID) return settings.recipe;
+  if (isRecipeQueueId(algorithm)) return algorithm.slice(RECIPE_QUEUE_PREFIX.length);
+  return null;
+}
+
+/** Whether a training run can be started for this algorithm id (built-in, custom, or an existing recipe). */
+export function isTrainable(algorithm: string, settings: Pick<TrainSettings, 'recipe'>, ctx: TrainContext): boolean {
+  const recipe = recipeNameFor(settings, algorithm);
+  if (recipe !== null) return recipe !== '' && (!ctx.recipeNames || ctx.recipeNames.includes(recipe));
+  return Boolean(findAlgorithm(ctx.algorithms, algorithm));
 }
 
 /** Everything wrong with the current settings, in the order the form shows it. Empty when ready. */
@@ -165,6 +195,12 @@ export function validateSettings(
     const rs = Number(settings.randomState);
     if (!/^\d+$/.test(settings.randomState.trim()) || rs > MAX_RANDOM_STATE) problems.push(`random_state must be an integer from 0 to ${MAX_RANDOM_STATE}`);
   }
+  const recipeName = recipeNameFor(settings, algorithm);
+  if (recipeName !== null) {
+    if (recipeName === '') problems.push('Choose a saved algorithm, or build one.');
+    else if (ctx.recipeNames && !ctx.recipeNames.includes(recipeName)) problems.push(`The saved algorithm "${recipeName}" no longer exists. Choose another or build it again.`);
+    return problems;
+  }
   if (!findAlgorithm(ctx.algorithms, algorithm)) problems.push(`Algorithm "${algorithm}" is not available.`);
   const defs = paramDefsFor(ctx.algorithms, algorithm);
   problems.push(...Object.values(validateParams(defs, settings.hyperparams[algorithm] ?? {})));
@@ -184,15 +220,17 @@ export function validateSettings(
 export function buildRequest(
   settings: TrainSettings, datasets: DatasetInfoDto[], algorithm: string = settings.algorithm, ctx: TrainContext = DEFAULT_CONTEXT,
 ): MLTrainingRequestDto {
-  const defs = paramDefsFor(ctx.algorithms, algorithm);
-  const hyperparams = mergeParams(defs, settings.hyperparams[algorithm] ?? {}, settings.advanced[algorithm]).params;
+  const recipeName = recipeNameFor(settings, algorithm);
+  const defs = recipeName === null ? paramDefsFor(ctx.algorithms, algorithm) : [];
+  const hyperparams = recipeName === null ? mergeParams(defs, settings.hyperparams[algorithm] ?? {}, settings.advanced[algorithm]).params : {};
   const base: MLTrainingRequestDto = {
-    algorithm, hyperparams, n_splits: Number(settings.nSplits),
+    algorithm: recipeName === null ? algorithm : RECIPE_ALGORITHM_ID, hyperparams, n_splits: Number(settings.nSplits),
     trade_mode: settings.tradeMode, holdout_pct: Number(settings.holdoutPct),
     data_path: '', target_column: '', feature_columns: [], lag_periods: parseList(settings.lagPeriods).map(Number),
   };
   if (!isBlank(settings.randomState)) base.random_state = Number(settings.randomState);
   if (algorithm === CUSTOM_ALGORITHM_ID) base.estimator_file = settings.estimatorFile.trim();
+  if (recipeName !== null) base.recipe = recipeName;
   if (settings.mode === 'dataset') {
     const { info, features } = datasetFeatures(settings, datasets);
     return {
@@ -234,6 +272,23 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : typeof err === 'string' ? err : 'Training failed';
 }
 
+/** The algorithm builder's working copy. */
+export interface BuilderState {
+  /** Loaded into `edit` once the building blocks are known; `null` means a blank recipe. */
+  source: RecipeDto | null;
+  edit: EditRecipe | null;
+  /** `editSnapshot` of the last saved (or freshly loaded) state; the draft is dirty when it differs. */
+  baseline: string;
+  /** Name of the saved recipe being edited, or `null` for a new one. */
+  savedName: string | null;
+  /** Bumped when a template replaces the draft, so the view can reset its local state. */
+  epoch: number;
+}
+
+export function isBuilderDirty(b: BuilderState | null): boolean {
+  return Boolean(b && b.edit && editSnapshot(b.edit) !== b.baseline);
+}
+
 interface MLState {
   models: MLModelDto[];
   datasets: DatasetInfoDto[];
@@ -246,6 +301,15 @@ interface MLState {
   estimatorFiles: EstimatorFileDto[];
   /** Your saved training configurations. */
   presets: TrainingPreset[];
+  /** Saved algorithm recipes, by name. */
+  recipes: RecipeDto[];
+  recipesLoaded: boolean;
+  /** Building blocks for the algorithm builder (steps, member algorithms, limits). */
+  blocks: BuildingBlocksDto | null;
+  blocksStatus: 'idle' | 'loading' | 'ready' | 'error';
+  blocksError: string | null;
+  /** The algorithm builder's draft, or `null` while it is closed. */
+  builder: BuilderState | null;
 
   isTraining: boolean;
   /** Epoch ms when the running job (or comparison) started. */
@@ -268,6 +332,18 @@ interface MLState {
   loadAlgorithms: () => Promise<void>;
   fetchAlgorithms: () => Promise<void>;
   refreshEstimators: () => Promise<void>;
+  refreshRecipes: () => Promise<void>;
+  loadBlocks: (force?: boolean) => Promise<void>;
+  /** Delete a saved recipe; resolves to an error message, or `null` on success. */
+  removeRecipe: (name: string) => Promise<string | null>;
+  /** Open the builder on a recipe to edit (`savedName` set), or on a draft (a template or blank). */
+  openBuilder: (source: RecipeDto | null, savedName?: string | null) => void;
+  /** Replace the draft contents (the builder converts `source` once the building blocks are known). */
+  initBuilder: (edit: EditRecipe, baseline: string) => void;
+  editBuilder: (update: (edit: EditRecipe) => EditRecipe) => void;
+  /** `savedEdit` was saved under `savedName`: it becomes the baseline. The draft itself is left as the user has it. */
+  markBuilderSaved: (edit: EditRecipe, savedName: string) => void;
+  closeBuilder: () => void;
   /** Save a file; resolves to an error message, or `null` on success. */
   saveEstimator: (name: string, content: string) => Promise<{ file: EstimatorFileDto | null; error: string | null }>;
   removeEstimator: (name: string) => Promise<string | null>;
@@ -307,8 +383,12 @@ async function trainOne(settings: TrainSettings, datasets: DatasetInfoDto[], alg
 }
 
 /** The algorithm list and estimator names to validate against. */
-export function trainContext(state: Pick<MLState, 'algorithms' | 'estimatorFiles'>): TrainContext {
-  return { algorithms: state.algorithms, estimatorNames: state.estimatorFiles.length > 0 ? state.estimatorFiles.map((f) => f.name) : undefined };
+export function trainContext(state: Pick<MLState, 'algorithms' | 'estimatorFiles' | 'recipes' | 'recipesLoaded'>): TrainContext {
+  return {
+    algorithms: state.algorithms,
+    estimatorNames: state.estimatorFiles.length > 0 ? state.estimatorFiles.map((f) => f.name) : undefined,
+    recipeNames: state.recipesLoaded ? state.recipes.map((r) => r.name) : undefined,
+  };
 }
 
 let algorithmsLoading: Promise<void> | null = null;
@@ -322,6 +402,12 @@ export const useMLStore = create<MLState>((set, get) => ({
   algorithmsNotice: null,
   estimatorFiles: [],
   presets: loadPresets(),
+  recipes: [],
+  recipesLoaded: false,
+  blocks: null,
+  blocksStatus: 'idle',
+  blocksError: null,
+  builder: null,
 
   isTraining: false,
   trainingStartedAt: null,
@@ -373,7 +459,7 @@ export const useMLStore = create<MLState>((set, get) => ({
       if (!Array.isArray(algorithms) || algorithms.length === 0) throw new Error('empty');
       set({ algorithms, algorithmsNotice: null });
       const { settings } = get();
-      if (!algorithms.some((a) => a.id === settings.algorithm)) {
+      if (settings.algorithm !== RECIPE_ALGORITHM_ID && !algorithms.some((a) => a.id === settings.algorithm)) {
         get().patchSettings({ algorithm: algorithms.some((a) => a.id === 'random_forest') ? 'random_forest' : algorithms[0].id });
       }
     } catch {
@@ -386,6 +472,56 @@ export const useMLStore = create<MLState>((set, get) => ({
       if (Array.isArray(files)) set({ estimatorFiles: files });
     } catch { /* backend may not be available */ }
   },
+  refreshRecipes: async () => {
+    try {
+      const recipes = await listRecipes();
+      if (Array.isArray(recipes)) set({ recipes, recipesLoaded: true });
+    } catch { /* backend may not be available */ }
+  },
+  loadBlocks: async (force = false) => {
+    const { blocksStatus } = get();
+    if (blocksStatus === 'loading' || (blocksStatus === 'ready' && !force)) return;
+    set({ blocksStatus: 'loading', blocksError: null });
+    try {
+      const blocks = await recipeBuildingBlocks();
+      if (!blocks || !Array.isArray(blocks.steps) || !Array.isArray(blocks.members)) throw new Error('The backend returned no building blocks.');
+      set({ blocks, blocksStatus: 'ready', blocksError: null });
+    } catch (err) {
+      set({ blocksStatus: 'error', blocksError: errorText(err) });
+    }
+  },
+  removeRecipe: async (name) => {
+    try {
+      await deleteRecipe(name);
+      set((state) => ({ recipes: state.recipes.filter((r) => r.name !== name) }));
+      const { settings } = get();
+      const queueId = recipeQueueId(name);
+      const patch: Partial<TrainSettings> = {};
+      if (settings.algorithm === RECIPE_ALGORITHM_ID && settings.recipe === name) { patch.algorithm = 'random_forest'; patch.recipe = ''; }
+      if (settings.compareAlgos.includes(queueId)) patch.compareAlgos = settings.compareAlgos.filter((a) => a !== queueId);
+      if (Object.keys(patch).length > 0) get().patchSettings(patch);
+      return null;
+    } catch (err) {
+      return errorText(err);
+    }
+  },
+  openBuilder: (source, savedName = null) => {
+    const previous = get().builder;
+    set({ builder: { source, edit: null, baseline: '', savedName, epoch: (previous?.epoch ?? 0) + 1 } });
+  },
+  initBuilder: (edit, baseline) => {
+    const b = get().builder;
+    if (b) set({ builder: { ...b, edit, baseline } });
+  },
+  editBuilder: (update) => {
+    const b = get().builder;
+    if (b && b.edit) set({ builder: { ...b, edit: update(b.edit) } });
+  },
+  markBuilderSaved: (edit, savedName) => {
+    const b = get().builder;
+    if (b) set({ builder: { ...b, baseline: editSnapshot(edit), savedName } });
+  },
+  closeBuilder: () => set({ builder: null }),
   saveEstimator: async (name, content) => {
     try {
       const file = await saveEstimatorFile(name, content);
@@ -471,6 +607,25 @@ export const useMLStore = create<MLState>((set, get) => ({
   },
   prefillFromModel: (detail) => {
     const { algorithms } = get();
+    if (detail.algorithm === RECIPE_ALGORITHM_ID && detail.recipe) {
+      // The model keeps its own copy of the recipe; training again uses the saved recipe of that name (if it still exists).
+      get().patchSettings({
+        mode: detail.dataset ? 'dataset' : 'csv',
+        dataset: detail.dataset ?? '',
+        dataPath: detail.dataset ? get().settings.dataPath : detail.data_path,
+        targetColumn: detail.dataset ? get().settings.targetColumn : detail.target_column,
+        featuresText: detail.dataset ? get().settings.featuresText : baseFeatureNames(detail.feature_names, detail.lag_periods).join(', '),
+        lagPeriods: detail.lag_periods?.join(', ') ?? '',
+        algorithm: RECIPE_ALGORITHM_ID,
+        recipe: detail.recipe.name,
+        nSplits: String(detail.n_splits),
+        selectedFeatures: detail.dataset ? baseFeatureNames(detail.feature_names, detail.lag_periods) : null,
+        tradeMode: detail.trade_mode === 'long_short' ? 'long_short' : 'long_flat',
+        holdoutPct: String(detail.holdout && detail.rows ? Math.min(MAX_HOLDOUT_PCT, Math.max(1, Math.round((100 * detail.holdout.rows) / detail.rows))) : 0),
+        randomState: '',
+      });
+      return;
+    }
     const algorithm = findAlgorithm(algorithms, detail.algorithm) ? detail.algorithm : 'random_forest';
     const stored = valuesFromStored(paramDefsFor(algorithms, algorithm), detail.hyperparams);
     const fromDataset = Boolean(detail.dataset);
@@ -503,7 +658,7 @@ export const useMLStore = create<MLState>((set, get) => ({
     const ctx = trainContext(get());
     if (validateSettings(settings, datasets, settings.algorithm, ctx).length > 0) return;
     set({
-      isTraining: true, trainingStartedAt: Date.now(), trainingLabel: settings.algorithm,
+      isTraining: true, trainingStartedAt: Date.now(), trainingLabel: settings.algorithm === RECIPE_ALGORITHM_ID ? `recipe ${settings.recipe}` : settings.algorithm,
       trainingError: null, lastResult: null, leaderboard: [],
     });
     const result = await trainOne(settings, datasets, settings.algorithm, ctx);
@@ -518,7 +673,7 @@ export const useMLStore = create<MLState>((set, get) => ({
     if (get().isTraining) return;
     const { settings, datasets } = get();
     const ctx = trainContext(get());
-    const algos = settings.compareAlgos.filter((a) => findAlgorithm(ctx.algorithms, a));
+    const algos = settings.compareAlgos.filter((a) => isTrainable(a, settings, ctx));
     if (algos.length === 0) return;
     if (algos.some((a) => validateSettings(settings, datasets, a, ctx).length > 0)) return;
     set({

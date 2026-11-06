@@ -76,9 +76,11 @@ test.describe('ML training form', () => {
     const select = page.getByTestId('ml-algorithm-select');
     await expect(select).toHaveValue('random_forest');
     await expect(page.getByTestId('ml-algorithms-notice')).toHaveCount(0);
-    await expect(select.locator('option')).toHaveText([
+    await expect(page.getByTestId('ml-algorithm-group-builtin').locator('option')).toHaveText([
       'Random forest', 'Extra trees', 'Gradient boosting', 'Histogram gradient boosting', 'Logistic regression', 'XGBoost', 'Custom estimator (Python file)',
     ]);
+    // Saved algorithms get their own group, which always ends with the entry that opens the builder.
+    await expect(page.getByTestId('ml-algorithm-group-recipes').locator('option')).toHaveText(['Build an algorithm...']);
     await expect(page.getByTestId('ml-algorithm-desc')).toContainText('decision trees');
     for (const k of ['n_estimators', 'max_depth', 'min_samples_leaf', 'class_weight', 'bootstrap', 'criterion']) await expect(page.getByTestId(`ml-hp-${k}`)).toBeVisible();
     await expect(page.getByTestId('ml-hp-learning_rate')).toHaveCount(0);

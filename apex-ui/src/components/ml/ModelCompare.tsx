@@ -1,7 +1,8 @@
 import React, { useMemo, useState } from 'react';
-import type { ModelDetailDto } from '../../lib/types';
+import type { ModelDetailDto, RecipeDto } from '../../lib/types';
 import {
-  SERIES_COLORS, algorithmLabel, baselineAccuracy, bestIndexes, displayName, fmtValue, labelText, meanOf, num, paramRows, pct, signedPct, tradeModeLabel,
+  SERIES_COLORS, baselineAccuracy, bestIndexes, calibrationText, describeMember, describeModelKind, describeStep, displayName,
+  fmtValue, isRecipeModel, labelText, meanOf, modelAlgorithmLabel, num, paramRows, pct, signedPct, tradeModeLabel,
 } from './modelUtils';
 
 export interface ModelCompareProps {
@@ -47,7 +48,7 @@ export const ModelCompare: React.FC<ModelCompareProps> = ({ models, onClose, onO
 
   const configRows = useMemo(() => {
     const rows: { id: string; label: string; values: string[] }[] = [
-      { id: 'algorithm', label: 'Algorithm', values: models.map((m) => algorithmLabel(m.algorithm)) },
+      { id: 'algorithm', label: 'Algorithm', values: models.map((m) => modelAlgorithmLabel(m)) },
       { id: 'dataset', label: 'Dataset', values: models.map((m) => m.dataset ?? m.data_path) },
       { id: 'symbols', label: 'Symbols', values: models.map((m) => (m.symbols.length ? m.symbols.join(', ') : 'n/a')) },
       { id: 'timeframe', label: 'Timeframe', values: models.map((m) => m.timeframe ?? 'n/a') },
@@ -63,6 +64,18 @@ export const ModelCompare: React.FC<ModelCompareProps> = ({ models, onClose, onO
       { id: 'lags', label: 'Lag periods', values: models.map((m) => (m.lag_periods.length ? m.lag_periods.join(', ') : 'none')) },
       { id: 'features', label: 'Features', values: models.map((m) => m.feature_names.join(', ')) },
     ];
+    if (models.some(isRecipeModel)) {
+      // Only recipe models have a pipeline; for the others the rows read "n/a" so the differences still show.
+      const ofRecipe = (m: ModelDetailDto, f: (r: RecipeDto) => string): string => (isRecipeModel(m) ? (m.recipe ? f(m.recipe) : 'not recorded') : 'n/a');
+      const at = rows.findIndex((r) => r.id === 'algorithm') + 1;
+      rows.splice(at, 0,
+        { id: 'recipe-steps', label: 'Recipe steps', values: models.map((m) => ofRecipe(m, (r) => (r.steps.length ? r.steps.map((s, i) => `${i + 1}. ${describeStep(s)}`).join('\n') : 'none'))) },
+        { id: 'recipe-model', label: 'Recipe model', values: models.map((m) => ofRecipe(m, (r) => describeModelKind(r))) },
+        { id: 'recipe-members', label: 'Recipe members', values: models.map((m) => ofRecipe(m, (r) => (r.model.kind === 'single' ? describeMember({ algorithm: r.model.algorithm, params: r.model.params }) : r.model.members.map((x) => describeMember(x, r.model.kind === 'voting')).join('\n')))) },
+        { id: 'recipe-final', label: 'Recipe final estimator', values: models.map((m) => ofRecipe(m, (r) => (r.model.kind === 'stacking' ? describeMember(r.model.final) : 'none'))) },
+        { id: 'recipe-calibration', label: 'Recipe calibration', values: models.map((m) => ofRecipe(m, (r) => calibrationText(r.calibrate))) },
+      );
+    }
     const keys = new Set<string>();
     models.forEach((m) => paramRows(m.algorithm, m.hyperparams).forEach((p) => keys.add(p.key)));
     [...keys].sort().forEach((key) => {
@@ -94,7 +107,10 @@ export const ModelCompare: React.FC<ModelCompareProps> = ({ models, onClose, onO
               <span className="inline-block h-2 w-2 shrink-0" style={{ background: SERIES_COLORS[i] }} />
               <button type="button" className="truncate font-mono text-text-primary hover:text-accent" title={m.model_id} onClick={() => onOpen(m.model_id)} data-testid={`compare-open-${m.model_id}`}>{displayName(m)}</button>
             </div>
-            <div className="text-[10px] text-text-muted">{algorithmLabel(m.algorithm)}</div>
+            <div className="flex items-center gap-1 text-[10px] text-text-muted">
+              <span data-testid={`compare-algorithm-${m.model_id}`}>{modelAlgorithmLabel(m)}</span>
+              {isRecipeModel(m) && <span className="border border-accent/40 bg-accent/10 px-1 font-mono text-[9px] uppercase text-accent" data-testid={`compare-recipe-badge-${m.model_id}`}>recipe</span>}
+            </div>
           </div>
         ))}
       </div>

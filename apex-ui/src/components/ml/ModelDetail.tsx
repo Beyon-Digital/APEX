@@ -1,21 +1,25 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { SymbolField } from '../common/SymbolField';
 import {
-  createAutomation, listActivity, listAutomations, listBrokerConnections, modelSignalHistory, predictModelSignal,
+  createAutomation, listActivity, listAutomations, listBrokerConnections, listRecipes, modelSignalHistory, predictModelSignal, recipeBuildingBlocks,
+  saveRecipe,
 } from '../../lib/tauri';
+import { useMLStore } from '../../stores/mlStore';
 import { openItem } from '../../stores/navStore';
 import { useArtifactStore } from '../../stores/artifactStore';
 import type {
-  ActivityDto, AutomationDto, BrokerConnectionDto, ModelDetailDto, ModelSignalDto, ModelSignalHistoryDto,
+  ActivityDto, AutomationDto, BrokerConnectionDto, ModelDetailDto, ModelSignalDto, ModelSignalHistoryDto, RecipeDto,
 } from '../../lib/types';
 import {
   ChartLegend, FoldAccuracyChart, FoldReturnChart, HorizontalBars, SignalChart,
 } from './ModelCharts';
 import {
-  HOLDOUT_GAP_PTS, SOURCE_LABEL, TRADE_MODE_HINT, algorithmLabel, baselineAccuracy, bytesLabel, classMeaning, displayName, exactTime, fmtValue,
-  holdoutVerdict, isLegacyModel, labelText, modelVerdict, num, paramRows, pct, relativeTime, shortingContext, signedPct, tradeModeLabel,
+  HOLDOUT_GAP_PTS, SOURCE_LABEL, TRADE_MODE_HINT, baselineAccuracy, bytesLabel, classMeaning, displayName, exactTime, fmtValue,
+  holdoutVerdict, importanceReason, isLegacyModel, isRecipeModel, isValidRecipeName, labelText, modelAlgorithmLabel, modelVerdict, num,
+  paramRows, pct, recipeStatus, relativeTime, retrainDetailFor, shortingContext, signedPct, suggestRecipeName, tradeModeLabel,
 } from './modelUtils';
-import type { ShortingContext } from './modelUtils';
+import type { RecipeStatus, ShortingContext } from './modelUtils';
+import { RecipeSummary } from './RecipeSummary';
 
 export interface ModelPatch {
   displayName?: string;
@@ -441,6 +445,89 @@ const ModelActivity: React.FC<{ modelId: string }> = ({ modelId }) => {
   );
 };
 
+/** Where the saved recipe of this name stands compared with the copy the model carries. */
+function useSavedRecipeStatus(copy: RecipeDto | null): { status: RecipeStatus | 'unknown' } {
+  const version = useArtifactStore((s) => s.activityVersion);
+  const [saved, setSaved] = useState<RecipeDto[] | null>(null);
+  // The trained copy has every step's default parameters written out; the building blocks supply them for the saved side.
+  const blocks = useMLStore((s) => s.blocks);
+  const blocksStatus = useMLStore((s) => s.blocksStatus);
+  const loadBlocks = useMLStore((s) => s.loadBlocks);
+  useEffect(() => { if (copy) void loadBlocks(); }, [copy?.name, loadBlocks]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!copy) return undefined;
+    let live = true;
+    void listRecipes().then((r) => { if (live) setSaved(r); }).catch(() => { if (live) setSaved(null); });
+    return () => { live = false; };
+  }, [copy?.name, version]); // eslint-disable-line react-hooks/exhaustive-deps
+  const ready = Boolean(blocks) || blocksStatus === 'error';
+  return useMemo(() => (copy && saved && ready ? recipeStatus(copy, saved, blocks) : { status: 'unknown' as const }), [copy, saved, ready, blocks]);
+}
+
+const STATUS_TEXT: Record<RecipeStatus | 'unknown', string> = {
+  same: 'The saved recipe with this name is unchanged since this model was trained.',
+  edited: 'The saved recipe with this name has been edited since this model was trained.',
+  missing: 'The saved recipe with this name has been deleted.',
+  unknown: 'Checking the saved recipe...',
+};
+
+interface RetrainPlan { status: 'edited' | 'missing'; current: RecipeDto | null; taken: string[] }
+
+/** Shown when the recipe a model was built from is no longer saved as it was: offer to save the model's copy first. */
+const RecipeRetrainPrompt: React.FC<{
+  detail: ModelDetailDto; copy: RecipeDto; plan: RetrainPlan; onCancel: () => void; onRetrain: (d: ModelDetailDto) => void;
+}> = ({ detail, copy, plan, onCancel, onRetrain }) => {
+  const [name, setName] = useState(() => suggestRecipeName(copy.name, plan.taken));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const trimmed = name.trim();
+  const problem = !isValidRecipeName(trimmed)
+    ? 'Use lowercase letters, digits and underscores, starting with a letter (up to 41 characters).'
+    : plan.taken.includes(trimmed) ? `A recipe named ${trimmed} already exists.` : null;
+
+  const saveAndRetrain = async () => {
+    if (problem) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const { created_at: _c, updated_at: _u, ...rest } = copy;
+      const saved = await saveRecipe({ ...rest, name: trimmed, label: `${copy.label || copy.name} (copy)` });
+      onRetrain(retrainDetailFor(detail, saved));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="border border-warning/40 bg-warning/10 px-3 py-2 text-[11px]" data-testid="recipe-retrain-prompt" data-status={plan.status}>
+      <p className="text-warning" data-testid="recipe-retrain-message">
+        {plan.status === 'edited'
+          ? `The recipe “${copy.name}” was edited after this model was trained. The model keeps its own copy of the original.`
+          : `The recipe “${copy.name}” this model was built from has been deleted. The model keeps its own copy.`}
+      </p>
+      <p className="mt-1 text-text-secondary">Save the model's copy as a recipe to train with the same algorithm again.</p>
+      <div className="mt-1.5 flex flex-wrap items-center gap-2">
+        <input
+          className={`${inputCls} w-56 font-mono`} value={name} maxLength={41} aria-label="Name for the saved copy"
+          onChange={(e) => setName(e.target.value)} data-testid="recipe-retrain-name"
+        />
+        <button type="button" className={accentBtn} disabled={busy || problem !== null} onClick={() => void saveAndRetrain()} data-testid="recipe-retrain-save">
+          {busy ? 'Saving…' : 'Save copy and retrain'}
+        </button>
+        {plan.status === 'edited' && plan.current && (
+          <button type="button" className={btnCls} disabled={busy} onClick={() => plan.current && onRetrain(retrainDetailFor(detail, plan.current))} data-testid="recipe-retrain-use-saved">
+            Retrain with the edited recipe
+          </button>
+        )}
+        <button type="button" className={btnCls} disabled={busy} onClick={onCancel} data-testid="recipe-retrain-cancel">Cancel</button>
+      </div>
+      {problem && <p className="mt-1 text-bear" data-testid="recipe-retrain-problem">{problem}</p>}
+      {error && <p className="mt-1 text-bear" data-testid="recipe-retrain-error">Could not save: {error}</p>}
+    </div>
+  );
+};
+
 export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetrain, onDelete, onClose, onChanged }) => {
   const rootRef = useRef<HTMLDivElement>(null);
   const [logOpen, setLogOpen] = useState(false);
@@ -450,6 +537,32 @@ export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetr
   const baseline = baselineAccuracy(detail.cv_folds);
   const t = detail.trading;
   const m = detail.metrics;
+  const recipeModel = isRecipeModel(detail);
+  const recipeCopy = recipeModel ? detail.recipe : null;
+  const savedStatus = useSavedRecipeStatus(recipeCopy);
+  const [retrainPlan, setRetrainPlan] = useState<RetrainPlan | null>(null);
+  const [retrainError, setRetrainError] = useState<string | null>(null);
+  useEffect(() => { setRetrainPlan(null); setRetrainError(null); }, [detail.model_id]);
+  const algorithmName = modelAlgorithmLabel(detail);
+  const noImportanceText = recipeModel
+    ? (importanceReason(recipeCopy) ?? 'Feature importances could not be worked out for this recipe.')
+    : 'This algorithm does not expose feature importances.';
+  const selectionNote = recipeCopy?.steps.some((s) => s.kind === 'select_k_best' || s.kind === 'variance_threshold')
+    ? 'Only the features kept by the selection steps are listed.' : null;
+
+  const startRetrain = async () => {
+    if (!recipeCopy) { onRetrain(detail); return; }
+    setRetrainError(null);
+    try {
+      const saved = await listRecipes();
+      const blocks = useMLStore.getState().blocks ?? await recipeBuildingBlocks().catch(() => null);
+      const relation = recipeStatus(recipeCopy, saved, blocks);
+      if (relation.status === 'same') { setRetrainPlan(null); onRetrain(retrainDetailFor(detail, relation.current)); return; }
+      setRetrainPlan({ status: relation.status, current: relation.current, taken: saved.map((r) => r.name) });
+    } catch (e) {
+      setRetrainError(e instanceof Error ? e.message : String(e));
+    }
+  };
   const params = useMemo(() => paramRows(detail.algorithm, detail.hyperparams), [detail.algorithm, detail.hyperparams]);
   const changedCount = params.filter((p) => p.changed).length;
   const maxImportance = Math.max(...detail.feature_importance.map((f) => f.importance), 1e-9);
@@ -458,8 +571,8 @@ export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetr
     rootRef.current?.querySelector(`#model-sec-${id}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' });
   }, []);
   const sections: [string, string][] = [
-    ['overview', 'Overview'], ['cv', 'Folds'], ['features', 'Features'], ['config', 'Config'], ['provenance', 'Audit'],
-    ['usedby', 'Used by'], ['try', 'Try it'], ['log', 'Log'], ['activity', 'History'],
+    ['overview', 'Overview'], ['cv', 'Folds'], ['features', 'Features'], ...(recipeModel ? [['recipe', 'Recipe'] as [string, string]] : []),
+    ['config', 'Config'], ['provenance', 'Audit'], ['usedby', 'Used by'], ['try', 'Try it'], ['log', 'Log'], ['activity', 'History'],
   ];
   const toneCls = { good: 'border-bull/40 bg-bull/10 text-bull', warn: 'border-warning/40 bg-warning/10 text-warning', bad: 'border-bear/40 bg-bear/10 text-bear', info: 'border-[var(--border-color)] bg-surface-2 text-text-secondary' }[verdict.tone];
 
@@ -469,16 +582,24 @@ export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetr
         <div className="flex flex-wrap items-start justify-between gap-2">
           <NameEditor key={detail.model_id} detail={detail} onSave={onSave} />
           <div className="flex shrink-0 items-center gap-1">
-            <button type="button" className={accentBtn} onClick={() => onRetrain(detail)} data-testid="model-retrain" title="Open the Train tab with these settings">Retrain with these settings</button>
+            <button type="button" className={accentBtn} onClick={() => void startRetrain()} data-testid="model-retrain" title="Open the Train tab with these settings">Retrain with these settings</button>
             <button type="button" className={`${btnCls} hover:text-bear`} onClick={() => onDelete(detail)} data-testid="model-delete">Delete</button>
             <button type="button" className={btnCls} onClick={onClose} aria-label="Close detail" data-testid="model-detail-close">×</button>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2 text-[11px] text-text-muted">
           <SourceBadge source={detail.source} />
-          <span className="font-mono">{algorithmLabel(detail.algorithm)}</span>
+          <span className="font-mono" data-testid="model-algorithm">{algorithmName}</span>
+          {recipeModel && <span className="border border-accent/40 bg-accent/10 px-1.5 py-px font-mono text-[10px] uppercase text-accent" data-testid="model-recipe-badge">recipe</span>}
           <span title={exactTime(detail.created_at)} data-testid="model-created">{relativeTime(detail.created_at)}</span>
         </div>
+        {retrainError && <div className="text-[11px] text-bear" data-testid="model-retrain-error">Could not check the saved recipes: {retrainError}</div>}
+        {retrainPlan && recipeCopy && (
+          <RecipeRetrainPrompt
+            key={detail.model_id} detail={detail} copy={recipeCopy} plan={retrainPlan}
+            onCancel={() => setRetrainPlan(null)} onRetrain={(d) => { setRetrainPlan(null); onRetrain(d); }}
+          />
+        )}
         <TagEditor key={`tags-${detail.model_id}`} detail={detail} onSave={onSave} />
         <nav className="flex flex-wrap gap-x-3 gap-y-0.5 pt-0.5" aria-label="Sections" data-testid="model-nav">
           {sections.map(([id, label]) => (
@@ -577,20 +698,41 @@ export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetr
         <Section id="features" title="Feature importance">
           {detail.feature_importance.length === 0 ? (
             <p className="text-[11px] text-text-muted" data-testid="features-empty">
-              {legacy ? 'Feature importance was recorded before detailed run data was kept.' : 'This algorithm does not expose feature importances.'}
+              {legacy ? 'Feature importance was recorded before detailed run data was kept.' : noImportanceText}
             </p>
           ) : (
-            <HorizontalBars
-              testId="feature-bars"
-              items={[...detail.feature_importance].sort((a, b) => b.importance - a.importance).map((f) => ({ label: f.feature, value: f.importance }))}
-              max={maxImportance}
-            />
+            <>
+              {selectionNote && <p className="mb-1 text-[11px] text-text-muted" data-testid="features-selection-note">{selectionNote}</p>}
+              <HorizontalBars
+                testId="feature-bars"
+                items={[...detail.feature_importance].sort((a, b) => b.importance - a.importance).map((f) => ({ label: f.feature, value: f.importance }))}
+                max={maxImportance}
+              />
+            </>
           )}
         </Section>
 
+        {recipeModel && (
+          <Section id="recipe" title="Recipe">
+            {recipeCopy ? (
+              <div className="space-y-2">
+                <RecipeSummary recipe={recipeCopy} />
+                <p className="border border-[var(--border-color)] bg-surface-0 px-2 py-1 text-[11px] text-text-secondary" data-testid="recipe-saved-copy-note">
+                  This is a saved copy of the recipe as it was when the model was trained. Editing or deleting the recipe later does not change this model.
+                </p>
+                <p className={`text-[11px] ${savedStatus.status === 'same' || savedStatus.status === 'unknown' ? 'text-text-muted' : 'text-warning'}`} data-testid="recipe-saved-status" data-status={savedStatus.status}>
+                  {STATUS_TEXT[savedStatus.status]}
+                </p>
+              </div>
+            ) : (
+              <p className="text-[11px] text-warning" data-testid="recipe-missing-copy">This model was built from a recipe, but the recipe was not recorded with it, so it cannot be shown or reused.</p>
+            )}
+          </Section>
+        )}
+
         <Section id="config" title="Configuration">
           <dl className="grid grid-cols-[8rem_1fr] gap-x-3 gap-y-1 text-[11px]" data-testid="model-config">
-            <dt className="text-text-muted">Algorithm</dt><dd className="font-mono" data-testid="config-algorithm">{algorithmLabel(detail.algorithm)}</dd>
+            <dt className="text-text-muted">Algorithm</dt><dd className="font-mono" data-testid="config-algorithm">{recipeModel ? `${algorithmName} (recipe)` : algorithmName}</dd>
             <dt className="text-text-muted">CV splits</dt><dd className="font-mono" data-testid="config-splits">{detail.n_splits}</dd>
             <dt className="text-text-muted">Lag periods</dt><dd className="font-mono" data-testid="config-lags">{detail.lag_periods.length ? detail.lag_periods.join(', ') : 'none'}</dd>
             <dt className="text-text-muted">Label</dt><dd data-testid="config-label">{labelText(detail.label)}</dd>
@@ -638,21 +780,27 @@ export const ModelDetail: React.FC<ModelDetailProps> = ({ detail, onSave, onRetr
               </ul>
             </div>
           )}
-          <div className="mt-2 text-[10px] uppercase text-text-muted">Hyperparameters ({changedCount} changed from defaults)</div>
-          <table className="mt-0.5 w-full text-[11px]" data-testid="hyper-table">
-            <thead><tr className="text-left text-[10px] uppercase text-text-muted"><th className="px-1.5 py-0.5 font-normal">Parameter</th><th className="px-1.5 py-0.5 font-normal">Used</th><th className="px-1.5 py-0.5 font-normal">Default</th><th className="px-1.5 py-0.5 font-normal" /></tr></thead>
-            <tbody className="font-mono">
-              {params.map((p) => (
-                <tr key={p.key} className={`border-t border-[var(--border-color)] ${p.changed ? 'text-accent' : 'text-text-secondary'}`} data-testid={`hyper-row-${p.key}`} data-changed={p.changed}>
-                  <td className="px-1.5 py-0.5">{p.key}</td>
-                  <td className="px-1.5 py-0.5">{fmtValue(p.value)}</td>
-                  <td className="px-1.5 py-0.5">{p.hasDefault ? fmtValue(p.def) : 'n/a'}</td>
-                  <td className="px-1.5 py-0.5 text-[10px] uppercase">{p.changed ? 'changed' : 'default'}</td>
-                </tr>
-              ))}
-              {params.length === 0 && <tr><td className="px-1.5 py-0.5 text-text-muted" colSpan={4}>No tunable parameters recorded.</td></tr>}
-            </tbody>
-          </table>
+          {recipeModel ? (
+            <p className="mt-2 text-[11px] text-text-muted" data-testid="config-recipe-params">
+              The parameters of each step and model are part of the recipe. See the Recipe section above.
+            </p>
+          ) : (<>
+            <div className="mt-2 text-[10px] uppercase text-text-muted">Hyperparameters ({changedCount} changed from defaults)</div>
+            <table className="mt-0.5 w-full text-[11px]" data-testid="hyper-table">
+              <thead><tr className="text-left text-[10px] uppercase text-text-muted"><th className="px-1.5 py-0.5 font-normal">Parameter</th><th className="px-1.5 py-0.5 font-normal">Used</th><th className="px-1.5 py-0.5 font-normal">Default</th><th className="px-1.5 py-0.5 font-normal" /></tr></thead>
+              <tbody className="font-mono">
+                {params.map((p) => (
+                  <tr key={p.key} className={`border-t border-[var(--border-color)] ${p.changed ? 'text-accent' : 'text-text-secondary'}`} data-testid={`hyper-row-${p.key}`} data-changed={p.changed}>
+                    <td className="px-1.5 py-0.5">{p.key}</td>
+                    <td className="px-1.5 py-0.5">{fmtValue(p.value)}</td>
+                    <td className="px-1.5 py-0.5">{p.hasDefault ? fmtValue(p.def) : 'n/a'}</td>
+                    <td className="px-1.5 py-0.5 text-[10px] uppercase">{p.changed ? 'changed' : 'default'}</td>
+                  </tr>
+                ))}
+                {params.length === 0 && <tr><td className="px-1.5 py-0.5 text-text-muted" colSpan={4}>No tunable parameters recorded.</td></tr>}
+              </tbody>
+            </table>
+          </>)}
         </Section>
 
         <Section id="provenance" title="Provenance and audit">

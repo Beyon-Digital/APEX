@@ -1,15 +1,19 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { openItem } from '../../stores/navStore';
 import {
-  DATASET_RETURN_COLUMN, MAX_HOLDOUT_PCT, MAX_SPLITS, allDatasetFeatures, datasetFeatures, trainContext, useMLStore, validateSettings,
+  DATASET_RETURN_COLUMN, MAX_HOLDOUT_PCT, MAX_SPLITS, RECIPE_ALGORITHM_ID, allDatasetFeatures, datasetFeatures, isRecipeQueueId, isTrainable,
+  recipeNameFor, recipeQueueId, trainContext, useMLStore, validateSettings,
   type RunResult, type TrainSettings,
 } from '../../stores/mlStore';
 import type { TradeMode } from '../../lib/types';
+import { AlgorithmBuilder } from './AlgorithmBuilder';
 import { EstimatorEditor } from './EstimatorEditor';
 import { ParamEditor } from './ParamEditor';
 import {
   CUSTOM_ALGORITHM_ID, PRESETS, changedCount, findAlgorithm, hasQuickFill, mergeParams, paramDefsFor, presetValues, type PresetId,
 } from './hyperparams';
+import { RecipeDiagram } from './RecipeDiagram';
+import { TEMPLATES, nodesFromRecipe, summarizeRecipe } from './recipeModel';
 import { presetSlug } from './trainingPresets';
 
 const inputCls =
@@ -41,6 +45,9 @@ function useElapsed(startedAt: number | null): number {
 }
 
 const slug = presetSlug;
+
+/** Value of the "Build an algorithm..." entry in the algorithm select. */
+const BUILD_OPTION = '__build__';
 
 /** Your saved training configurations: save, load, rename, delete, export, import. */
 const PresetPanel: React.FC = () => {
@@ -176,24 +183,37 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
   const leaderboard = useMLStore((s) => s.leaderboard);
   const train = useMLStore((s) => s.train);
   const compare = useMLStore((s) => s.compare);
+  const recipes = useMLStore((s) => s.recipes);
+  const recipesLoaded = useMLStore((s) => s.recipesLoaded);
+  const blocks = useMLStore((s) => s.blocks);
+  const builder = useMLStore((s) => s.builder);
+  const refreshRecipes = useMLStore((s) => s.refreshRecipes);
+  const loadBlocks = useMLStore((s) => s.loadBlocks);
+  const openBuilder = useMLStore((s) => s.openBuilder);
 
-  useEffect(() => { void loadAlgorithms(); void refreshEstimators(); }, [loadAlgorithms, refreshEstimators]);
+  useEffect(() => { void loadAlgorithms(); void refreshEstimators(); void refreshRecipes(); void loadBlocks(); }, [loadAlgorithms, refreshEstimators, refreshRecipes, loadBlocks]);
 
   const elapsed = useElapsed(startedAt);
   const algorithm = settings.algorithm;
+  const isRecipe = algorithm === RECIPE_ALGORITHM_ID;
+  const selectedRecipe = isRecipe ? recipes.find((r) => r.name === settings.recipe) : undefined;
   const algo = findAlgorithm(algorithms, algorithm);
   const defs = paramDefsFor(algorithms, algorithm);
   const values = settings.hyperparams[algorithm] ?? {};
   const advanced = settings.advanced[algorithm] ?? '';
-  const ctx = useMemo(() => trainContext({ algorithms, estimatorFiles }), [algorithms, estimatorFiles]);
+  const ctx = useMemo(() => trainContext({ algorithms, estimatorFiles, recipes, recipesLoaded }), [algorithms, estimatorFiles, recipes, recipesLoaded]);
   const problems = useMemo(() => validateSettings(settings, datasets, settings.algorithm, ctx), [settings, datasets, ctx]);
   const { info, features } = datasetFeatures(settings, datasets);
   const allFeatures = info ? allDatasetFeatures(info) : [];
   const customNames = new Set((info?.custom_features ?? []).map((c) => c.name));
   const comparing = leaderboard.length > 0;
-  const labelOf = (id: string) => findAlgorithm(algorithms, id)?.label ?? id;
+  const labelOf = (id: string) => {
+    const recipeName = isRecipeQueueId(id) ? recipeNameFor(settings, id) : null;
+    if (recipeName !== null) return recipes.find((r) => r.name === recipeName)?.label || recipeName;
+    return findAlgorithm(algorithms, id)?.label ?? id;
+  };
 
-  const queue = useMemo(() => settings.compareAlgos.filter((a) => findAlgorithm(algorithms, a)), [settings.compareAlgos, algorithms]);
+  const queue = useMemo(() => settings.compareAlgos.filter((a) => isTrainable(a, settings, ctx)), [settings, ctx]);
   const compareProblems = useMemo(
     () => queue.flatMap((a) => validateSettings(settings, datasets, a, ctx)),
     [queue, settings, datasets, ctx],
@@ -218,6 +238,13 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
   const toggleCompare = (id: string) =>
     set('compareAlgos', settings.compareAlgos.includes(id) ? settings.compareAlgos.filter((a) => a !== id) : [...settings.compareAlgos, id]);
 
+  const selectValue = isRecipe ? recipeQueueId(settings.recipe) : algorithm;
+  const chooseAlgorithm = (value: string) => {
+    if (value === BUILD_OPTION) { openBuilder(null, null); return; }
+    if (isRecipeQueueId(value)) patch({ algorithm: RECIPE_ALGORITHM_ID, recipe: recipeNameFor(settings, value) ?? '' });
+    else patch({ algorithm: value });
+  };
+
   const holdoutNumber = Number(settings.holdoutPct);
   const holdoutShown = Number.isFinite(holdoutNumber) && settings.holdoutPct.trim() !== '' ? holdoutNumber : 0;
 
@@ -234,6 +261,8 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
 
   return (
     <div className="space-y-3 max-w-4xl" data-testid="ml-training-form">
+      {builder && <AlgorithmBuilder />}
+      <div className={`space-y-3 ${builder ? 'hidden' : ''}`} data-testid="ml-training-sections">
       <PresetPanel />
 
       {/* Data */}
@@ -314,14 +343,50 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
       <section className={sectionCls} data-testid="ml-train-algorithm">
         <div className={headCls}>2. Algorithm</div>
         {algorithmsNotice && <div className="border border-warning/40 bg-warning/10 px-2 py-1 text-[11px] text-warning" data-testid="ml-algorithms-notice">{algorithmsNotice}</div>}
-        <select className={`${inputCls} block w-72`} value={algorithm} onChange={(e) => set('algorithm', e.target.value)} data-testid="ml-algorithm-select" aria-label="Algorithm">
-          {!algo && <option value={algorithm}>{algorithm}</option>}
-          {algorithms.map((a) => <option key={a.id} value={a.id} title={a.description}>{a.label}</option>)}
+        <select className={`${inputCls} block w-72`} value={selectValue} onChange={(e) => chooseAlgorithm(e.target.value)} data-testid="ml-algorithm-select" aria-label="Algorithm">
+          {!isRecipe && !algo && <option value={algorithm}>{algorithm}</option>}
+          <optgroup label="Built-in algorithms" data-testid="ml-algorithm-group-builtin">
+            {algorithms.filter((a) => a.id !== RECIPE_ALGORITHM_ID).map((a) => <option key={a.id} value={a.id} title={a.description}>{a.label}</option>)}
+          </optgroup>
+          <optgroup label="My algorithms" data-testid="ml-algorithm-group-recipes">
+            {isRecipe && !selectedRecipe && <option value={selectValue}>{settings.recipe || 'No algorithm chosen'} (missing)</option>}
+            {recipes.map((r) => <option key={r.name} value={recipeQueueId(r.name)} title={r.description}>{r.label || r.name}</option>)}
+            <option value={BUILD_OPTION}>Build an algorithm...</option>
+          </optgroup>
         </select>
-        <div className="text-[11px] text-text-muted" data-testid="ml-algorithm-desc">{algo?.description}</div>
+        <div className="text-[11px] text-text-muted" data-testid="ml-algorithm-desc">{isRecipe ? selectedRecipe?.description : algo?.description}</div>
+
+        {recipesLoaded && recipes.length === 0 && (
+          <div className="space-y-1 border border-dashed border-[var(--border-color)] p-2" data-testid="ml-recipe-empty">
+            <div className="text-[11px] text-text-muted">No saved algorithms yet. Build one from parts, no code needed. Start from an example:</div>
+            <div className="flex flex-wrap gap-1">
+              {TEMPLATES.map((t) => (
+                <button key={t.id} type="button" className={btnCls} title={t.blurb} onClick={() => openBuilder(t.recipe, null)} data-testid={`ml-recipe-template-${t.id}`}>{t.title}</button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {algorithm === CUSTOM_ALGORITHM_ID && <EstimatorEditor />}
 
+        {isRecipe ? (
+          selectedRecipe ? (
+            <div className="space-y-2 border border-[var(--border-color)] bg-surface-0 p-2" data-testid="ml-recipe-summary">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="min-w-0 truncate text-xs font-semibold text-text-primary" title={selectedRecipe.label} data-testid="ml-recipe-label">{selectedRecipe.label || selectedRecipe.name}</span>
+                <span className="font-mono text-[10px] text-text-muted" data-testid="ml-recipe-name">{selectedRecipe.name}</span>
+                <button type="button" className={`${btnCls} ml-auto`} onClick={() => openBuilder(selectedRecipe, selectedRecipe.name)} data-testid="ml-recipe-edit">Edit recipe</button>
+              </div>
+              <RecipeDiagram nodes={nodesFromRecipe(selectedRecipe, blocks, algorithms)} />
+              <RecipeLines recipe={selectedRecipe} />
+              <div className="text-[11px] text-text-muted">The pipeline is fitted on training rows only. Its settings live in the recipe, so there are no parameters to set here.</div>
+            </div>
+          ) : (
+            <div className="border border-warning/40 bg-warning/10 px-2 py-1 text-[11px] text-warning" data-testid="ml-recipe-missing">
+              {settings.recipe ? `The saved algorithm "${settings.recipe}" no longer exists.` : 'No saved algorithm is chosen.'} Pick another from the list, or build one.
+            </div>
+          )
+        ) : (
         <ParamEditor
           defs={defs}
           values={values}
@@ -337,6 +402,7 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
             </>
           ) : null}
         />
+        )}
       </section>
 
       {/* Evaluation */}
@@ -428,6 +494,16 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
               </label>
             );
           })}
+          {recipes.map((r) => {
+            const id = recipeQueueId(r.name);
+            return (
+              <label key={id} className="flex cursor-pointer items-center gap-1 text-xs text-text-primary">
+                <input type="checkbox" className="accent-[rgb(var(--color-accent-rgb))]" checked={settings.compareAlgos.includes(id)} onChange={() => toggleCompare(id)} data-testid={`ml-compare-algo-${id}`} />
+                <span className="max-w-[12rem] truncate" title={r.label || r.name}>{r.label || r.name}</span>
+                <span className="text-[10px] text-text-muted" data-testid={`ml-compare-params-${id}`}>my algorithm</span>
+              </label>
+            );
+          })}
           <button type="button" className={primaryBtnCls} disabled={isTraining || queue.length === 0 || compareProblems.length > 0} onClick={() => void compare()} data-testid="ml-compare-run">
             {isTraining && comparing ? 'Comparing...' : 'Compare'}
           </button>
@@ -463,8 +539,27 @@ export const TrainingForm: React.FC<TrainingFormProps> = ({ onOpenData }) => {
           </table>
         )}
       </section>
-
+      </div>
     </div>
+  );
+};
+
+/** Plain-words lines under the diagram: steps, model, calibration. */
+const RecipeLines: React.FC<{ recipe: import('../../lib/types').RecipeDto }> = ({ recipe }) => {
+  const blocks = useMLStore((s) => s.blocks);
+  const algorithms = useMLStore((s) => s.algorithms);
+  const text = summarizeRecipe(recipe, blocks, algorithms);
+  return (
+    <ol className="list-decimal space-y-0.5 pl-5 text-[11px] text-text-secondary" data-testid="ml-recipe-lines">
+      {text.steps.map((line, i) => <li key={`${line}-${i}`} data-testid={`ml-recipe-step-${i}`}>{line}</li>)}
+      <li data-testid="ml-recipe-model">
+        {text.model}
+        {text.members.length > 0 && (
+          <ul className="list-disc pl-5 text-text-muted">{text.members.map((m, i) => <li key={`${m}-${i}`}>{m}</li>)}</ul>
+        )}
+      </li>
+      <li data-testid="ml-recipe-calibration">{text.calibration}</li>
+    </ol>
   );
 };
 

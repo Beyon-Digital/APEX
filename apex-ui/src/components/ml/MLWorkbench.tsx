@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useArtifactStore } from '../../stores/artifactStore';
-import { useMLStore } from '../../stores/mlStore';
+import { isBuilderDirty, useMLStore } from '../../stores/mlStore';
 import { openItem, useNavStore, type NavKind } from '../../stores/navStore';
 import { getMlModel } from '../../lib/tauri';
 import type { ModelDetailDto } from '../../lib/types';
@@ -38,6 +38,11 @@ export const MLWorkbench: React.FC = React.memo(() => {
   const loadCatalog = useMLStore((s) => s.loadCatalog);
   const prefillFromModel = useMLStore((s) => s.prefillFromModel);
   const patchSettings = useMLStore((s) => s.patchSettings);
+  const refreshRecipes = useMLStore((s) => s.refreshRecipes);
+  const builderDirty = useMLStore((s) => isBuilderDirty(s.builder));
+  const closeBuilder = useMLStore((s) => s.closeBuilder);
+  /** A move to another tab that waits for the user to confirm leaving unsaved algorithm changes. */
+  const [pendingLeave, setPendingLeave] = useState<{ tab: Tab; run?: () => void } | null>(null);
 
   const modelVersion = useArtifactStore((s) => s.versions.model);
   const datasetVersion = useArtifactStore((s) => s.versions.dataset);
@@ -47,19 +52,27 @@ export const MLWorkbench: React.FC = React.memo(() => {
   useEffect(() => { void loadCatalog(); }, [loadCatalog]);
   useEffect(() => { void refreshModels(); }, [refreshModels, modelVersion]);
   useEffect(() => { void refreshDatasets(); }, [refreshDatasets, datasetVersion]);
+  useEffect(() => { if (tab === 'train') void refreshRecipes(); }, [tab, refreshRecipes]);
+
+  /** Switch tabs, asking first when that would leave an unsaved algorithm draft behind. */
+  const go = useCallback((next: Tab, run?: () => void) => {
+    if (builderDirty && tab === 'train' && next !== 'train') { setPendingLeave({ tab: next, run }); return; }
+    run?.();
+    setTab(next);
+  }, [builderDirty, tab]);
 
   useEffect(() => {
     if (!navRequest) return;
     if (navRequest.kind === 'model') {
-      setModelRequest({ id: navRequest.id, nonce: navRequest.nonce });
-      setTab('models');
+      const { id, nonce } = navRequest;
+      go('models', () => setModelRequest({ id, nonce }));
       clearNav(navRequest.nonce);
     } else if (navRequest.kind === 'dataset') {
-      setDatasetRequest({ name: navRequest.id, nonce: navRequest.nonce });
-      setTab('data');
+      const { id: name, nonce } = navRequest;
+      go('data', () => setDatasetRequest({ name, nonce }));
       clearNav(navRequest.nonce);
     }
-  }, [navRequest, clearNav]);
+  }, [navRequest, clearNav, go]);
 
   // A navigation request is for one visit to the Models tab. Leaving the tab unmounts it, so drop
   // the request or the next visit would select the old model again.
@@ -69,15 +82,29 @@ export const MLWorkbench: React.FC = React.memo(() => {
     previousTab.current = tab;
   }, [tab]);
 
+  /** An open builder replaces the whole Train form, so a clean one is closed to show the form that was just filled in. */
+  const showTrainForm = useCallback(() => {
+    const s = useMLStore.getState();
+    if (!isBuilderDirty(s.builder)) s.closeBuilder();
+    setTab('train');
+  }, []);
   const onRetrain = useCallback((detail: ModelDetailDto) => {
     prefillFromModel(detail);
-    setTab('train');
-  }, [prefillFromModel]);
+    showTrainForm();
+  }, [prefillFromModel, showTrainForm]);
+  const leaveConfirmed = () => {
+    const pending = pendingLeave;
+    setPendingLeave(null);
+    if (!pending) return;
+    closeBuilder();
+    pending.run?.();
+    setTab(pending.tab);
+  };
 
   const useDatasetForTraining = useCallback((name: string) => {
     patchSettings({ mode: 'dataset', dataset: name, selectedFeatures: null });
-    setTab('train');
-  }, [patchSettings]);
+    showTrainForm();
+  }, [patchSettings, showTrainForm]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || '__TAURI__' in window) return;
@@ -85,10 +112,12 @@ export const MLWorkbench: React.FC = React.memo(() => {
       retrain: async (modelId: string) => onRetrain(await getMlModel(modelId)),
       /** Same as another panel calling `openItem(kind, id)`. */
       open: (kind: NavKind, id: string) => openItem(kind, id),
+      /** Reload the saved recipes (specs seed some through `__apexMock` first). */
+      refreshRecipes: () => refreshRecipes(),
     };
     (window as unknown as { __apexMlTest?: typeof hook }).__apexMlTest = hook;
     return () => { delete (window as unknown as { __apexMlTest?: typeof hook }).__apexMlTest; };
-  }, [onRetrain]);
+  }, [onRetrain, refreshRecipes]);
 
   return (
     <div className="h-full flex flex-col" data-testid="ml-workbench">
@@ -99,7 +128,7 @@ export const MLWorkbench: React.FC = React.memo(() => {
             type="button"
             role="tab"
             aria-selected={tab === t.id}
-            onClick={() => setTab(t.id)}
+            onClick={() => go(t.id)}
             data-testid={`ml-tab-${t.id}`}
             className={`px-3 py-1 text-xs font-mono border transition-colors ${
               tab === t.id
@@ -114,19 +143,27 @@ export const MLWorkbench: React.FC = React.memo(() => {
         ))}
       </div>
 
+      {pendingLeave && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-warning/40 bg-warning/10 px-3 py-1.5 text-xs text-warning" data-testid="ml-leave-guard" role="alertdialog" aria-label="Unsaved algorithm changes">
+          You have unsaved changes in the algorithm builder. Leave and lose them?
+          <button type="button" className="px-2 py-0.5 text-xs font-mono border border-[var(--border-color)] bg-surface-2 text-text-primary hover:border-accent" onClick={leaveConfirmed} data-testid="ml-leave-confirm">Leave</button>
+          <button type="button" className="px-2 py-0.5 text-xs font-mono border border-[var(--border-color)] bg-surface-2 text-text-primary hover:border-accent" onClick={() => setPendingLeave(null)} data-testid="ml-leave-stay">Stay</button>
+        </div>
+      )}
+
       <div className="flex-1 overflow-auto p-3">
         <div className={tab === 'data' ? '' : 'hidden'} data-testid="ml-panel-data">
           <DatasetBuilder focusDataset={datasetRequest} onUseForTraining={useDatasetForTraining} />
         </div>
         <div className={tab === 'train' ? '' : 'hidden'} data-testid="ml-panel-train">
-          <TrainingForm onOpenData={() => setTab('data')} />
+          <TrainingForm onOpenData={() => go('data')} />
         </div>
         {tab === 'models' && (
           <ModelsTab
             key={modelRequest?.nonce ?? 0}
             initialModelId={modelRequest?.id}
             onRetrain={onRetrain}
-            onOpenTrain={() => setTab('train')}
+            onOpenTrain={() => go('train')}
           />
         )}
       </div>

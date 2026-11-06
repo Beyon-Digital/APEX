@@ -1,5 +1,6 @@
 import type {
-  ActivityActor, AutomationDto, BrokerConnectionDto, CvFoldDto, LabelSpecDto, MLModelDto, ModelDetailDto, TradeMode,
+  ActivityActor, AutomationDto, BrokerConnectionDto, BuildingBlocksDto, CvFoldDto, LabelSpecDto, MLModelDto, ModelDetailDto, RecipeDto,
+  RecipeMemberDto, RecipeStepDto, TradeMode,
 } from '../../lib/types';
 
 /** Pure helpers shared by the model registry, detail and compare views. */
@@ -22,6 +23,7 @@ export const ALGORITHM_LABEL: Record<string, string> = {
   extra_trees: 'Extra Trees',
   hist_gradient_boosting: 'Histogram Gradient Boosting',
   custom: 'Custom estimator',
+  recipe: 'Recipe',
 };
 
 export const algorithmLabel = (algorithm: string): string => ALGORITHM_LABEL[algorithm] ?? algorithm;
@@ -318,6 +320,7 @@ export function matchesQuery(row: RegistryRow, query: string): boolean {
   const d = row.detail;
   const hay = [
     row.summary.model_id, row.summary.algorithm, algorithmLabel(row.summary.algorithm),
+    ...(d?.recipe ? [d.recipe.name, d.recipe.label, ...recipeMembers(d.recipe).map((m) => algorithmLabel(m.algorithm))] : []),
     d?.display_name ?? '', d?.dataset ?? '', ...(d?.tags ?? []), ...(d?.symbols ?? []),
   ].join(' ').toLowerCase();
   return hay.includes(q);
@@ -325,3 +328,184 @@ export function matchesQuery(row: RegistryRow, query: string): boolean {
 
 /** Series colours for comparing up to three models. */
 export const SERIES_COLORS = ['var(--color-accent)', 'var(--color-warning)', '#b388ff'];
+
+// ── Algorithm recipes ───────────────────────────────────────────────
+
+/** True when the model was built from a recipe (its summary says algorithm "recipe"). */
+export const isRecipeModel = (m: { algorithm: string }): boolean => m.algorithm === 'recipe';
+
+/** What to call a model's algorithm: the recipe's own label for recipe models, else the built-in name. */
+export function modelAlgorithmLabel(m: { algorithm: string; recipe?: RecipeDto | null }): string {
+  if (!isRecipeModel(m)) return algorithmLabel(m.algorithm);
+  return m.recipe?.label?.trim() || m.recipe?.name || 'Recipe';
+}
+
+/**
+ * Value of the algorithm filter for a model. Built-ins use their id; recipe models use
+ * "recipe:<name>" (or plain "recipe" while their recipe is not known yet).
+ */
+export function algorithmFilterKey(m: { algorithm: string }, detail: { recipe: RecipeDto | null } | null): string {
+  if (!isRecipeModel(m)) return m.algorithm;
+  return detail?.recipe?.name ? `recipe:${detail.recipe.name}` : 'recipe';
+}
+
+/** True when a model passes the algorithm filter ("recipe" matches every recipe model). */
+export function matchesAlgorithmFilter(filter: string, m: { algorithm: string }, detail: { recipe: RecipeDto | null } | null): boolean {
+  if (!filter) return true;
+  if (filter === 'recipe') return isRecipeModel(m);
+  return algorithmFilterKey(m, detail) === filter;
+}
+
+export interface AlgorithmOption { value: string; label: string; recipe: boolean }
+
+/** Options of the algorithm filter: built-ins first, then "all recipes" and each recipe by label. */
+export function algorithmFilterOptions(rows: RegistryRow[]): AlgorithmOption[] {
+  const builtIn = new Set<string>();
+  const recipes = new Map<string, string>();
+  let anyRecipe = false;
+  for (const { summary, detail } of rows) {
+    if (!isRecipeModel(summary)) { builtIn.add(summary.algorithm); continue; }
+    anyRecipe = true;
+    if (detail?.recipe?.name) recipes.set(detail.recipe.name, detail.recipe.label?.trim() || detail.recipe.name);
+  }
+  const out: AlgorithmOption[] = [...builtIn].sort().map((a) => ({ value: a, label: algorithmLabel(a), recipe: false }));
+  if (anyRecipe) out.push({ value: 'recipe', label: 'All recipes', recipe: true });
+  [...recipes.entries()].sort((a, b) => a[1].localeCompare(b[1]))
+    .forEach(([name, label]) => out.push({ value: `recipe:${name}`, label: `${label} (recipe)`, recipe: true }));
+  return out;
+}
+
+export const STEP_LABEL: Record<string, string> = {
+  standard_scaler: 'Standard scaler',
+  robust_scaler: 'Robust scaler',
+  minmax_scaler: 'Min-max scaler',
+  quantile_transformer: 'Quantile transformer',
+  power_transformer: 'Power transformer',
+  clip_outliers: 'Clip outliers',
+  variance_threshold: 'Drop flat features',
+  select_k_best: 'Keep the best k features',
+  pca: 'PCA',
+};
+
+/** Defaults of the step parameters, as in the building blocks, to tell which values a recipe changed. */
+export const STEP_DEFAULTS: Record<string, Record<string, unknown>> = {
+  standard_scaler: { with_mean: true, with_std: true },
+  quantile_transformer: { output_distribution: 'uniform', n_quantiles: 200 },
+  clip_outliers: { lower_pct: 1, upper_pct: 99 },
+  variance_threshold: { threshold: 0 },
+  select_k_best: { k: 10, score: 'f_classif' },
+  pca: { n_components: 0.95, whiten: false },
+};
+
+export const stepLabel = (kind: string): string => STEP_LABEL[kind] ?? kind;
+
+export interface RecipeParamView { key: string; text: string; changed: boolean }
+
+/** Parameters a step or member sets, each marked as changed when it differs from the default (or has none). */
+export function paramViews(params: Record<string, unknown> | undefined, defaults: Record<string, unknown> = {}): RecipeParamView[] {
+  return Object.entries(params ?? {}).map(([key, value]) => ({
+    key,
+    text: `${key} = ${fmtValue(value)}`,
+    changed: !(key in defaults) || fmtValue(defaults[key]) !== fmtValue(value),
+  }));
+}
+
+export const stepParamViews = (s: RecipeStepDto): RecipeParamView[] => paramViews(s.params, STEP_DEFAULTS[s.kind]);
+
+const paramText = (views: RecipeParamView[]): string => (views.length ? ` (${views.map((v) => v.text).join(', ')})` : '');
+
+/** One line per step, e.g. "PCA (n_components = 0.9)". */
+export const describeStep = (s: RecipeStepDto): string => `${stepLabel(s.kind)}${paramText(stepParamViews(s).filter((v) => v.changed))}`;
+
+/** All models a recipe fits: its members, plus the final estimator for stacking. */
+export function recipeMembers(r: RecipeDto): RecipeMemberDto[] {
+  const m = r.model;
+  if (!m) return [];
+  if (m.kind === 'single') return [{ algorithm: m.algorithm, params: m.params }];
+  return m.kind === 'stacking' ? [...m.members, m.final] : m.members;
+}
+
+export const KIND_LABEL: Record<string, string> = { single: 'Single model', voting: 'Voting ensemble', stacking: 'Stacking ensemble' };
+
+export function describeMember(m: RecipeMemberDto, withWeight = false): string {
+  const parts = paramViews(m.params).map((v) => v.text);
+  if (withWeight && (m.weight ?? 1) !== 1) parts.push(`weight ${m.weight}`);
+  return `${algorithmLabel(m.algorithm)}${parts.length ? ` (${parts.join(', ')})` : ''}`;
+}
+
+/** The model part of a recipe as a headline, e.g. "Voting ensemble, soft (3 models)". */
+export function describeModelKind(r: RecipeDto): string {
+  const m = r.model;
+  if (!m) return 'n/a';
+  if (m.kind === 'single') return KIND_LABEL.single;
+  if (m.kind === 'voting') return `${KIND_LABEL.voting}, ${m.voting} (${m.members.length} models)`;
+  return `${KIND_LABEL.stacking}, ${m.blocks} blocks (${m.members.length} models plus a final estimator)`;
+}
+
+export const calibrationText = (c: RecipeDto['calibrate'] | undefined): string => (c && c !== 'none' ? c : 'none');
+
+/** Why a recipe model may have no feature importances. Null when nothing in the recipe explains it. */
+export function importanceReason(r: RecipeDto | null): string | null {
+  if (!r) return null;
+  const reasons: string[] = [];
+  if (r.steps.some((s) => s.kind === 'pca')) reasons.push('PCA replaces the original features with combinations of them, so a score per original feature is not available.');
+  if (r.model?.kind === 'voting' && r.model.voting === 'hard') reasons.push('Hard voting only combines votes, and no importances could be averaged from its members.');
+  return reasons.length ? reasons.join(' ') : null;
+}
+
+const REGEX_NAME = /^[a-z][a-z0-9_]{0,40}$/;
+export const isValidRecipeName = (name: string): boolean => REGEX_NAME.test(name);
+
+/** A free name for a copy of a recipe: "<name>_copy", then "<name>_copy2", ... within the 41 character limit. */
+export function suggestRecipeName(name: string, taken: string[]): string {
+  const used = new Set(taken);
+  for (let i = 1; i < 1000; i += 1) {
+    const suffix = i === 1 ? '_copy' : `_copy${i}`;
+    const candidate = `${name.slice(0, 41 - suffix.length)}${suffix}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  return `${name.slice(0, 30)}_copy_${Date.now() % 100000}`;
+}
+
+/**
+ * Stable text of the parts of a recipe that decide how it trains (name, label, text and timestamps are ignored).
+ *
+ * The trainer stores the recipe with every step's default parameters written out, while a saved recipe keeps only
+ * what the user typed. Pass the building blocks so both forms are filled with the same step defaults first;
+ * without them a step that has parameters never matches its own trained copy.
+ */
+export function recipeFingerprint(r: RecipeDto, blocks?: BuildingBlocksDto | null): string {
+  const norm = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(norm);
+    if (v && typeof v === 'object') {
+      return Object.fromEntries(Object.entries(v as Record<string, unknown>).filter(([, x]) => x !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([k, x]) => [k, norm(x)]));
+    }
+    return v;
+  };
+  const withDefaults = (step: RecipeDto['steps'][number]) => {
+    const defaults = Object.fromEntries(
+      (blocks?.steps.find((k) => k.kind === step.kind)?.params ?? []).filter((p) => p.default !== null && p.default !== undefined).map((p) => [p.key, p.default]),
+    );
+    return { ...step, params: { ...defaults, ...(step.params ?? {}) } };
+  };
+  const model = r.model && 'members' in r.model
+    ? { ...r.model, members: r.model.members.map((m) => ({ ...m, weight: m.weight ?? 1 })) }
+    : r.model;
+  return JSON.stringify(norm({ steps: (r.steps ?? []).map(withDefaults), model, calibrate: r.calibrate ?? 'none' }));
+}
+
+export type RecipeStatus = 'same' | 'edited' | 'missing';
+
+export type RecipeRelation =
+  | { status: 'same' | 'edited'; current: RecipeDto }
+  | { status: 'missing'; current: null };
+
+/** How a model's recipe copy relates to the recipe saved under the same name now. */
+export function recipeStatus(copy: RecipeDto, saved: RecipeDto[], blocks?: BuildingBlocksDto | null): RecipeRelation {
+  const current = saved.find((r) => r.name === copy.name);
+  if (!current) return { status: 'missing', current: null };
+  return { status: recipeFingerprint(current, blocks) === recipeFingerprint(copy, blocks) ? 'same' : 'edited', current };
+}
+
+/** What the Train tab is handed to retrain a recipe model: the model's detail with the recipe to select. */
+export const retrainDetailFor = (detail: ModelDetailDto, recipe: RecipeDto): ModelDetailDto => ({ ...detail, algorithm: 'recipe', recipe });

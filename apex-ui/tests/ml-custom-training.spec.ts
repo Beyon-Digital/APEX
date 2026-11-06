@@ -187,9 +187,10 @@ test.describe('Algorithm list fallback', () => {
     await openWorkbench(page);
     await page.getByTestId('ml-tab-train').click();
     await expect(page.getByTestId('ml-algorithms-notice')).toContainText('built-in list');
-    await expect(page.getByTestId('ml-algorithm-select').locator('option')).toHaveText([
+    await expect(page.getByTestId('ml-algorithm-group-builtin').locator('option')).toHaveText([
       'Random Forest', 'Gradient Boosting', 'Logistic Regression', 'XGBoost', 'Custom estimator (Python file)',
     ]);
+    await expect(page.getByTestId('ml-algorithm-group-recipes').locator('option')).toHaveText(['Build an algorithm...']);
     await expect(page.getByTestId('ml-hp-n_estimators')).toBeVisible();
     await page.getByTestId('ml-tab-data').click();
     await buildAndTrainOn(page, 'ce-fallback');

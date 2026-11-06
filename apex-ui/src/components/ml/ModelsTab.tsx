@@ -6,7 +6,8 @@ import { ModelCompare } from './ModelCompare';
 import { ModelDetail, SourceBadge } from './ModelDetail';
 import type { ModelPatch } from './ModelDetail';
 import {
-  SOURCE_LABEL, algorithmLabel, displayName, exactTime, matchesQuery, pct, relativeTime, signedPct, sortRows,
+  SOURCE_LABEL, algorithmFilterOptions, displayName, exactTime, isRecipeModel, matchesAlgorithmFilter, matchesQuery, modelAlgorithmLabel, pct,
+  relativeTime, signedPct, sortRows,
 } from './modelUtils';
 import type { RegistryRow, SortKey } from './modelUtils';
 
@@ -124,14 +125,14 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({ initialModelId, onRetrain,
   }, [summaries, loaded]);
 
   const rows: RegistryRow[] = useMemo(() => summaries.map((s) => ({ summary: s, detail: details[s.model_id] ?? null })), [summaries, details]);
-  const algorithms = useMemo(() => [...new Set(summaries.map((s) => s.algorithm))].sort(), [summaries]);
+  const algorithmOptions = useMemo(() => algorithmFilterOptions(rows), [rows]);
   const allTags = useMemo(() => [...new Set(Object.values(details).flatMap((d) => d.tags))].sort(), [details]);
   const sources = useMemo(() => [...new Set(Object.values(details).map((d) => d.source))].sort(), [details]);
 
   const visible = useMemo(() => {
     const filtered = rows.filter((r) =>
       matchesQuery(r, query)
-      && (!algoFilter || r.summary.algorithm === algoFilter)
+      && matchesAlgorithmFilter(algoFilter, r.summary, r.detail)
       && (!sourceFilter || r.detail?.source === sourceFilter || (sourceFilter === 'unknown' && !r.detail))
       && (!tagFilter || r.detail?.tags.includes(tagFilter)));
     return sortRows(filtered, sort);
@@ -223,7 +224,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({ initialModelId, onRetrain,
         </select>
         <select className={selectCls} value={algoFilter} onChange={(e) => setAlgoFilter(e.target.value)} aria-label="Filter by algorithm" data-testid="ml-models-filter-algorithm">
           <option value="">All algorithms</option>
-          {algorithms.map((a) => <option key={a} value={a}>{algorithmLabel(a)}</option>)}
+          {algorithmOptions.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
         <select className={selectCls} value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)} aria-label="Filter by source" data-testid="ml-models-filter-source">
           <option value="">All sources</option>
@@ -310,7 +311,8 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({ initialModelId, onRetrain,
                         {isNew && <span className="shrink-0 border border-accent/60 bg-accent/20 px-1 font-mono text-[9px] uppercase text-accent" data-testid="ml-model-new-badge">new</span>}
                       </div>
                       <div className="flex items-center gap-1.5">
-                        <span className="truncate text-[10px] text-text-muted" data-testid="ml-model-algorithm">{algorithmLabel(s.algorithm)}</span>
+                        <span className="truncate text-[10px] text-text-muted" data-testid="ml-model-algorithm" title={isRecipeModel(s) ? 'Built from a recipe' : undefined}>{modelAlgorithmLabel({ algorithm: s.algorithm, recipe: d?.recipe })}</span>
+                        {isRecipeModel(s) && <span className="shrink-0 border border-accent/40 bg-accent/10 px-1 font-mono text-[9px] uppercase text-accent" data-testid="ml-model-recipe-badge">recipe</span>}
                         {split && d && <SourceBadge source={d.source} testId="ml-model-source" />}
                       </div>
                     </td>

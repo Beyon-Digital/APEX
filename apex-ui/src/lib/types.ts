@@ -363,6 +363,8 @@ export interface MLTrainingRequestDto {
   holdout_pct?: number;
   /** Required when algorithm is "custom": a file saved with saveEstimatorFile. */
   estimator_file?: string;
+  /** Required when algorithm is "recipe": the name of a saved recipe. Hyperparameters live in the recipe. */
+  recipe?: string;
   random_state?: number;
 }
 
@@ -892,6 +894,8 @@ export interface ModelDetailDto extends MLModelDto {
   fee_pct: number;
   /** Name of the custom estimator file when algorithm is "custom". */
   estimator_file: string | null;
+  /** The recipe this model was built from when algorithm is "recipe" (a copy: editing the saved recipe later does not change this model). */
+  recipe: RecipeDto | null;
 }
 
 export type TradeMode = 'long_flat' | 'long_short';
@@ -945,6 +949,74 @@ export interface AlgorithmDto {
   params: ParamDefDto[];
   /** Extra keys outside `params` are still validated against the estimator's constructor. */
   accepts_extra_params: boolean;
+}
+
+// ── Algorithm recipes: build an algorithm from parts, no code ─────────
+
+/** One preprocessing step, e.g. {kind: "standard_scaler", params: {}}. See recipeBuildingBlocks. */
+export interface RecipeStepDto {
+  kind: string;
+  params: Record<string, unknown>;
+}
+
+/** A member model. `algorithm` is a built-in id (never "custom" or "recipe"). */
+export interface RecipeMemberDto {
+  algorithm: string;
+  params: Record<string, unknown>;
+  /** Voting only; default 1. */
+  weight?: number;
+}
+
+export type RecipeModelDto =
+  | { kind: 'single'; algorithm: string; params: Record<string, unknown> }
+  | { kind: 'voting'; voting: 'soft' | 'hard'; members: RecipeMemberDto[] }
+  /** Time-aware stacking: members are fitted on expanding windows, their out-of-fold predictions train `final`. */
+  | { kind: 'stacking'; members: RecipeMemberDto[]; final: RecipeMemberDto; blocks: number };
+
+export interface RecipeDto {
+  /** [a-z][a-z0-9_]{0,40} */
+  name: string;
+  label: string;
+  description: string;
+  steps: RecipeStepDto[];
+  model: RecipeModelDto;
+  /** Rescale predicted probabilities so "70% sure" means about 70% of the time. */
+  calibrate: 'none' | 'sigmoid' | 'isotonic';
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface RecipeIssueDto {
+  /** Where in the recipe, e.g. "steps[1].params.k" or "model.members[2]". */
+  path: string;
+  message: string;
+}
+
+export interface RecipeCheckDto {
+  ok: boolean;
+  errors: RecipeIssueDto[];
+  warnings: string[];
+  steps: number;
+  /** Number of fitted models (members plus the final estimator for stacking). */
+  models: number;
+  /** Pessimistic size estimate for a typical dataset; null when unknown. */
+  est_model_mb: number | null;
+}
+
+export interface StepKindDto {
+  kind: string;
+  label: string;
+  description: string;
+  /** "scale" | "clean" | "select" | "reduce" */
+  group: string;
+  params: ParamDefDto[];
+}
+
+export interface BuildingBlocksDto {
+  steps: StepKindDto[];
+  /** Algorithms that may be members or the final estimator. */
+  members: { id: string; label: string; description: string }[];
+  limits: { max_steps: number; max_members: number; min_members: number; stacking_blocks: [number, number] };
 }
 
 export interface EstimatorFileDto {

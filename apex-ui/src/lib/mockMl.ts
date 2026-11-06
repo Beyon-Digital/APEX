@@ -12,6 +12,7 @@ import type {
   ActivityActor, ActivityDto, ArtifactEventDto, ArtifactKind, BuildDatasetRequestDto, CvFoldDto,
   DatasetInfoDto, DatasetPreviewDto, FeatureDefDto, MLModelDto, MLTrainingRequestDto, ModelDetailDto,
   ModelSignalHistoryDto, AlgorithmDto, EstimatorFileDto, ExpressionCheckDto, ParamDefDto, SymbolDataDto,
+  BuildingBlocksDto, RecipeCheckDto, RecipeDto, RecipeIssueDto, StepKindDto,
 } from './types';
 
 export const ARTIFACT_EVENT = 'apex:artifacts-changed';
@@ -118,6 +119,7 @@ export function createMockModel(req: Partial<MLTrainingRequestDto>, actor: Activ
     context_symbols: ds?.context_symbols ?? [],
     fee_pct: ds?.fee_pct ?? 0,
     estimator_file: req.estimator_file ?? null,
+    recipe: req.algorithm === 'recipe' && req.recipe ? (recipes.get(req.recipe) ?? null) : null,
   };
   details.set(id, detail);
   recordMockActivity(actor, 'model.train', 'model', id, `Trained ${detail.algorithm} on ${detail.dataset ?? detail.data_path}`);
@@ -129,6 +131,7 @@ export function mockUsage(modelId: string, automations: { id: string; name: stri
 }
 
 const fetched = new Map<string, number>();
+const recipes = new Map<string, RecipeDto>();
 const estimators = new Map<string, EstimatorFileDto>();
 
 /** Like the backend's canonical_timeframe: "d1" and "1d" are both stored and reported as "1d". */
@@ -149,6 +152,83 @@ function symbolData(symbol: string, timeframe: string): SymbolDataDto {
     symbol, timeframe: tf, bars,
     first_time: bars ? '2024-01-02T00:00:00Z' : null, last_time: bars ? '2026-01-02T00:00:00Z' : null,
   };
+}
+
+const step = (kind: string, label: string, group: string, description: string, params: ParamDefDto[] = []): StepKindDto =>
+  ({ kind, label, group, description, params });
+
+export const MOCK_BLOCKS: BuildingBlocksDto = {
+  steps: [
+    step('standard_scaler', 'Standard scaler', 'scale', 'Centre each feature and divide by its spread.', [
+      { key: 'with_mean', label: 'Centre', type: 'bool', default: true, help: 'Subtract the mean.' },
+      { key: 'with_std', label: 'Scale', type: 'bool', default: true, help: 'Divide by the standard deviation.' },
+    ]),
+    step('robust_scaler', 'Robust scaler', 'scale', 'Scale by the middle of the data, ignoring extreme values.'),
+    step('minmax_scaler', 'Min-max scaler', 'scale', 'Squeeze each feature into 0..1.'),
+    step('quantile_transformer', 'Quantile transformer', 'scale', 'Turn each feature into its rank, spread evenly or like a bell curve.', [
+      { key: 'output_distribution', label: 'Output', type: 'choice', default: 'uniform', choices: ['uniform', 'normal'], help: 'Shape of the result.' },
+      { key: 'n_quantiles', label: 'Quantiles', type: 'int', default: 200, min: 10, max: 2000, help: 'Resolution of the rank table.' },
+    ]),
+    step('power_transformer', 'Power transformer', 'scale', 'Make skewed features more bell-shaped (Yeo-Johnson).'),
+    step('clip_outliers', 'Clip outliers', 'clean', 'Cap each feature at chosen percentiles learned from the training rows.', [
+      { key: 'lower_pct', label: 'Lower percentile', type: 'float', default: 1, min: 0, max: 20, help: 'Values below this percentile are raised to it.' },
+      { key: 'upper_pct', label: 'Upper percentile', type: 'float', default: 99, min: 80, max: 100, help: 'Values above this percentile are lowered to it.' },
+    ]),
+    step('variance_threshold', 'Drop flat features', 'select', 'Remove features that barely change.', [
+      { key: 'threshold', label: 'Min variance', type: 'float', default: 0, min: 0, max: 100, help: 'Features with less variance are dropped.' },
+    ]),
+    step('select_k_best', 'Keep the best k features', 'select', 'Keep the k features most related to the label.', [
+      { key: 'k', label: 'k', type: 'int', default: 10, min: 1, max: 500, help: 'How many to keep.' },
+      { key: 'score', label: 'Score', type: 'choice', default: 'f_classif', choices: ['f_classif', 'mutual_info_classif'], help: 'How features are ranked.' },
+    ]),
+    step('pca', 'PCA', 'reduce', 'Replace features with a few uncorrelated combinations.', [
+      { key: 'n_components', label: 'Components', type: 'float', default: 0.95, min: 0.1, max: 200, help: 'Under 1: share of variance to keep. 1 or more: number of components.' },
+      { key: 'whiten', label: 'Whiten', type: 'bool', default: false, help: 'Give every component equal spread.' },
+    ]),
+  ],
+  members: [
+    { id: 'random_forest', label: 'Random forest', description: 'Many decision trees voting.' },
+    { id: 'extra_trees', label: 'Extra trees', description: 'Random-split trees; fast and smooth.' },
+    { id: 'gradient_boosting', label: 'Gradient boosting', description: 'Trees that fix each other\'s errors.' },
+    { id: 'hist_gradient_boosting', label: 'Histogram gradient boosting', description: 'Fast boosting for larger data.' },
+    { id: 'logistic_regression', label: 'Logistic regression', description: 'A linear model.' },
+    { id: 'xgboost', label: 'XGBoost', description: 'Boosted trees (when installed).' },
+  ],
+  limits: { max_steps: 8, max_members: 6, min_members: 2, stacking_blocks: [3, 8] },
+};
+
+/** Mock validation: structure and limits only (the backend also checks every parameter). */
+function checkMockRecipe(r: RecipeDto): RecipeCheckDto {
+  const errors: RecipeIssueDto[] = [];
+  const warnings: string[] = [];
+  const bad = (path: string, message: string) => errors.push({ path, message });
+  if (!r || typeof r !== 'object') return { ok: false, errors: [{ path: '', message: 'recipe is required' }], warnings, steps: 0, models: 0, est_model_mb: null };
+  if (!/^[a-z][a-z0-9_]{0,40}$/.test(r.name ?? '')) bad('name', 'use lowercase letters, digits and underscores, starting with a letter (max 41 characters)');
+  if (!r.label?.trim()) bad('label', 'give the algorithm a name');
+  const kinds = new Set(MOCK_BLOCKS.steps.map((s) => s.kind));
+  if ((r.steps?.length ?? 0) > MOCK_BLOCKS.limits.max_steps) bad('steps', `at most ${MOCK_BLOCKS.limits.max_steps} steps`);
+  (r.steps ?? []).forEach((s, i) => { if (!kinds.has(s.kind)) bad(`steps[${i}].kind`, `unknown step ${s.kind}`); });
+  const members = new Set(MOCK_BLOCKS.members.map((m) => m.id));
+  const checkMember = (m: { algorithm: string }, path: string) => { if (!members.has(m?.algorithm)) bad(`${path}.algorithm`, `unknown algorithm ${m?.algorithm}`); };
+  let models = 0;
+  const model = r.model;
+  if (!model) bad('model', 'choose a model');
+  else if (model.kind === 'single') { checkMember(model, 'model'); models = 1; }
+  else if (model.kind === 'voting' || model.kind === 'stacking') {
+    const n = model.members?.length ?? 0;
+    if (n < MOCK_BLOCKS.limits.min_members || n > MOCK_BLOCKS.limits.max_members) bad('model.members', `use ${MOCK_BLOCKS.limits.min_members} to ${MOCK_BLOCKS.limits.max_members} models`);
+    (model.members ?? []).forEach((m, i) => checkMember(m, `model.members[${i}]`));
+    models = n;
+    if (model.kind === 'stacking') {
+      checkMember(model.final, 'model.final');
+      models += 1;
+      const [lo, hi] = MOCK_BLOCKS.limits.stacking_blocks;
+      if (!(model.blocks >= lo && model.blocks <= hi)) bad('model.blocks', `use ${lo} to ${hi} blocks`);
+    }
+    if (model.kind === 'voting' && model.voting === 'hard' && r.calibrate !== 'none') warnings.push('Hard voting has no probabilities to calibrate; the calibration is ignored.');
+  } else bad('model.kind', 'choose single, voting or stacking');
+  if (r.steps?.some((s) => s.kind === 'pca') && models > 0) warnings.push('PCA hides the original features, so feature importances are not available for this model.');
+  return { ok: errors.length === 0, errors, warnings, steps: r.steps?.length ?? 0, models, est_model_mb: models ? Math.round(models * 4) : null };
 }
 
 const num = (key: string, label: string, def: number, min: number, max: number, help: string, type = 'float'): ParamDefDto =>
@@ -299,6 +379,24 @@ function handleMlMockNow(cmd: string, args: Record<string, unknown> | undefined,
       return file;
     }
     case 'delete_estimator_file': return estimators.delete(String(args?.name));
+    case 'recipe_building_blocks': return MOCK_BLOCKS;
+    case 'list_recipes': return [...recipes.values()].sort((a, b) => a.name.localeCompare(b.name));
+    case 'validate_recipe': return checkMockRecipe(args?.recipe as RecipeDto);
+    case 'save_recipe': {
+      const r = args?.recipe as RecipeDto;
+      const check = checkMockRecipe(r);
+      if (!check.ok) throw new Error(check.errors.map((e) => `${e.path}: ${e.message}`).join('; '));
+      const now = new Date().toISOString();
+      const saved: RecipeDto = { ...r, created_at: recipes.get(r.name)?.created_at ?? now, updated_at: now };
+      recipes.set(r.name, saved);
+      recordMockActivity('user', 'recipe.save', 'system', r.name, `Saved algorithm ${r.label || r.name}`);
+      return saved;
+    }
+    case 'delete_recipe': {
+      const had = recipes.delete(String(args?.name));
+      if (had) recordMockActivity('user', 'recipe.delete', 'system', String(args?.name), `Deleted algorithm ${String(args?.name)}`);
+      return had;
+    }
     case 'list_datasets': return [...datasets];
     case 'build_dataset': {
       const r = args?.request as BuildDatasetRequestDto;
@@ -400,6 +498,8 @@ if (typeof window !== 'undefined') {
     },
     recordActivity: recordMockActivity,
     activity: mockActivity,
+    /** Put a recipe straight into the mock store, skipping validation (so specs can seed one the backend would reject). */
+    seedRecipe: (recipe: RecipeDto) => { recipes.set(recipe.name, recipe); },
   };
 }
 
