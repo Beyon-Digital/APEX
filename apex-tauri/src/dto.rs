@@ -305,6 +305,8 @@ pub struct AppSettingsDto {
     pub config_path: String,
     pub runtime_storage_backend: String,
     pub runtime_storage_target: String,
+    /// Set when the saved storage backend could not start and SQLite is in use instead.
+    pub runtime_storage_notice: Option<String>,
     pub general: GeneralSettingsDto,
     pub market_data: AdapterPreferenceDto,
     pub execution: AdapterPreferenceDto,

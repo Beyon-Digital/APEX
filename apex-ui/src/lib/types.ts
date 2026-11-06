@@ -136,6 +136,8 @@ export interface AppSettingsDto {
   config_path: string;
   runtime_storage_backend: string;
   runtime_storage_target: string;
+  /** Set when the saved storage backend could not start and SQLite is in use instead. */
+  runtime_storage_notice?: string | null;
   general: GeneralSettingsDto;
   market_data: AdapterPreferenceDto;
   execution: AdapterPreferenceDto;

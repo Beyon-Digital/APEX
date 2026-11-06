@@ -77,6 +77,7 @@ fn build_settings_dto(
         config_path: runtime_paths.config_file().display().to_string(),
         runtime_storage_backend: state.storage_backend.clone(),
         runtime_storage_target: state.storage_target.clone(),
+        runtime_storage_notice: state.storage_notice.clone(),
         general: GeneralSettingsDto {
             data_dir: config.general.data_dir.clone(),
         },

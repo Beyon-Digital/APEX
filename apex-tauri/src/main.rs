@@ -17,6 +17,16 @@ use commands::{
 };
 use tauri::Manager;
 
+/// Turn a startup failure into a returned error. A panic inside the macOS launch callback
+/// cannot unwind, so it shows up as an unexplained "abort" crash; returning an error lets
+/// Tauri exit with the message, which is also written to the log and to stderr.
+fn startup_error(stage: &str, detail: &str) -> Box<dyn std::error::Error> {
+    let message = format!("APEX Terminal could not {stage}: {detail}");
+    tracing::error!("{message}");
+    eprintln!("{message}");
+    message.into()
+}
+
 fn main() {
     tracing_setup::init();
 
@@ -25,14 +35,17 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let app_handle = app.handle().clone();
-            let runtime_paths = commands::python_runtime::RuntimePaths::resolve(&app_handle)
-                .expect("Runtime path resolution failed");
+            let runtime_paths = match commands::python_runtime::RuntimePaths::resolve(&app_handle) {
+                Ok(paths) => paths,
+                Err(error) => return Err(startup_error("find its folders", &error)),
+            };
             let app_state_paths = runtime_paths.clone();
 
-            tauri::async_runtime::block_on(async move {
-                let app_state = state::AppState::init(app_state_paths)
-                    .await
-                    .expect("App state initialization failed");
+            let init = tauri::async_runtime::block_on(async move {
+                let app_state = match state::AppState::init(app_state_paths).await {
+                    Ok(state) => state,
+                    Err(error) => return Err(format!("{error:#}")),
+                };
 
                 tracing::info!("App state initialized successfully");
                 tracing::info!(
@@ -46,7 +59,11 @@ fn main() {
 
                 let _ = app_state.app.set(app_handle.clone());
                 app_handle.manage(app_state);
+                Ok(())
             });
+            if let Err(error) = init {
+                return Err(startup_error("initialize", &error));
+            }
 
             app.manage(runtime_paths.clone());
 

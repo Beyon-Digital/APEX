@@ -49,6 +49,8 @@ pub struct AppState {
     pub storage: Arc<dyn StoragePort>,
     pub storage_backend: String,
     pub storage_target: String,
+    /// Why the configured storage backend was not used, if it fell back to SQLite.
+    pub storage_notice: Option<String>,
     pub metrics: Arc<Metrics>,
     pub news: Arc<NewsEngine>,
     pub graph: Arc<tokio::sync::RwLock<GraphEngine>>,
@@ -95,6 +97,37 @@ struct StorageBootstrap {
     storage: Arc<dyn StoragePort>,
     backend: &'static str,
     target: String,
+    /// Set when the configured backend could not start and local SQLite was used instead.
+    fallback_reason: Option<String>,
+}
+
+/// Open the configured storage. If the Postgres/Timescale backend cannot be reached or
+/// authenticated, run on local SQLite and say why, rather than refusing to start. A broken
+/// local SQLite file is NOT replaced: that would silently abandon the user's data.
+async fn build_storage_or_fallback(
+    runtime_paths: &RuntimePaths,
+    config: &AppConfig,
+) -> Result<StorageBootstrap> {
+    match build_storage(runtime_paths, config).await {
+        Ok(storage) => Ok(storage),
+        Err(error) if matches!(config.storage.backend_kind(), Ok(StorageBackendKind::Timescale)) => {
+            // The chain can mention the connection URL; it is redacted before it is kept.
+            let reason = format!("{error:#}");
+            let reason = match config.storage.postgres_url() {
+                Some(url) => reason.replace(&url, &redact_connection_url(&url)),
+                None => reason,
+            };
+            tracing::error!(%reason, "Configured Postgres/Timescale storage failed; falling back to local SQLite");
+            let mut sqlite_config = config.clone();
+            sqlite_config.storage.backend = "sqlite".to_string();
+            let mut bootstrap = build_storage(runtime_paths, &sqlite_config).await?;
+            bootstrap.fallback_reason = Some(format!(
+                "Postgres/Timescale storage is configured but could not start ({reason}). Running on local SQLite instead. Fix the connection in Settings > General > Storage, or switch the backend back to SQLite."
+            ));
+            Ok(bootstrap)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 impl AppState {
@@ -103,7 +136,7 @@ impl AppState {
         let bus = Arc::new(MessageBus::new());
         let config = AppConfig::load(&runtime_paths)?;
         let resolved_data_dir = config.resolved_data_dir(&runtime_paths)?;
-        let storage = build_storage(&runtime_paths, &config).await?;
+        let storage = build_storage_or_fallback(&runtime_paths, &config).await?;
         let cancelled = cancel_orphaned_paper_orders(storage.storage.as_ref()).await?;
         if cancelled > 0 { tracing::info!(cancelled, "Cancelled paper orders from the previous session"); }
 
@@ -286,6 +319,7 @@ impl AppState {
             storage: storage.storage,
             storage_backend: storage.backend.to_string(),
             storage_target: storage.target,
+            storage_notice: storage.fallback_reason,
             metrics,
             news: news_engine,
             graph,
@@ -824,6 +858,7 @@ async fn build_storage(
                 storage: Arc::new(sqlite),
                 backend: "sqlite",
                 target: sqlite_path.display().to_string(),
+                fallback_reason: None,
             })
         }
         StorageBackendKind::Timescale => {
@@ -840,6 +875,7 @@ async fn build_storage(
                 storage: Arc::new(timescale),
                 backend: "timescale",
                 target: redact_connection_url(&connection_url),
+                fallback_reason: None,
             })
         }
     }
@@ -852,4 +888,63 @@ fn redact_connection_url(connection_url: &str) -> String {
 
     let host_part = rest.rsplit('@').next().unwrap_or(rest);
     format!("{scheme}://{}", host_part)
+}
+
+#[cfg(test)]
+mod storage_fallback_tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("apex-storage-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn unreachable_postgres_falls_back_to_sqlite_without_leaking_the_password() {
+        let root = temp_root("fallback");
+        let paths = RuntimePaths::for_test(&root);
+        let mut config = AppConfig::default();
+        config.storage.backend = "timescale".into();
+        // Port 1 refuses connections immediately.
+        config.storage.postgres_url = Some("postgresql://apex:hunter2secret@127.0.0.1:1/apex".into());
+        config.storage.sqlite_path = root.join("fallback.db").to_string_lossy().into_owned();
+
+        let bootstrap = build_storage_or_fallback(&paths, &config).await.expect("falls back");
+        assert_eq!(bootstrap.backend, "sqlite");
+        let notice = bootstrap.fallback_reason.expect("fallback is reported");
+        assert!(notice.contains("local SQLite"), "{notice}");
+        assert!(!notice.contains("hunter2secret"), "password leaked: {notice}");
+        assert!(root.join("fallback.db").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn plain_sqlite_reports_no_fallback() {
+        let root = temp_root("plain");
+        let paths = RuntimePaths::for_test(&root);
+        let mut config = AppConfig::default();
+        config.storage.backend = "sqlite".into();
+        config.storage.sqlite_path = root.join("plain.db").to_string_lossy().into_owned();
+
+        let bootstrap = build_storage_or_fallback(&paths, &config).await.unwrap();
+        assert_eq!(bootstrap.backend, "sqlite");
+        assert!(bootstrap.fallback_reason.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn broken_sqlite_file_is_not_silently_replaced() {
+        let root = temp_root("broken");
+        let paths = RuntimePaths::for_test(&root);
+        let mut config = AppConfig::default();
+        config.storage.backend = "sqlite".into();
+        let blocker = root.join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        config.storage.sqlite_path = blocker.join("apex.db").to_string_lossy().into_owned();
+
+        assert!(build_storage_or_fallback(&paths, &config).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

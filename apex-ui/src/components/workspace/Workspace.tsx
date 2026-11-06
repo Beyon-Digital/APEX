@@ -1089,6 +1089,12 @@ export const Workspace: React.FC = () => {
               )}
                     <details className="border border-[var(--border-color)] bg-surface-0 p-3" data-testid="runtime-settings-section">
                       <summary className="cursor-pointer text-xs font-medium text-text-secondary">Storage &amp; runtime (advanced)</summary>
+                      {appSettings?.runtime_storage_notice && (
+                        <div role="alert" data-testid="storage-fallback-notice"
+                          className="mt-2 border border-[var(--color-warning,#d9a400)] bg-surface-1 p-2 text-xs text-text-primary">
+                          {appSettings.runtime_storage_notice}
+                        </div>
+                      )}
                       <div className="mt-2 flex items-start justify-between gap-4">
                         <p className="text-xs text-text-muted">
                           Saved to <code>{appSettings?.config_path ?? 'config/apex.toml'}</code>; applies after restart. Running on{' '}

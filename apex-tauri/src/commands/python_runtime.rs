@@ -64,6 +64,25 @@ impl RuntimePaths {
         })
     }
 
+    /// Paths rooted in one directory, for tests that need storage without a Tauri app.
+    #[cfg(test)]
+    pub fn for_test(root: &Path) -> Self {
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&data_dir).expect("create test data dir");
+        Self {
+            repo_root: root.to_path_buf(),
+            work_root: root.to_path_buf(),
+            config_dir: root.join("config"),
+            config_file: root.join("config").join("apex.toml"),
+            python_root: root.join("apex-python"),
+            data_dir,
+            models_dir: root.join("models"),
+            strategies_dir: root.join("strategies"),
+            resource_dir: None,
+            bundled: false,
+        }
+    }
+
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
     }
